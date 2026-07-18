@@ -20,9 +20,10 @@ use std::{
 };
 
 use reflink_forest_btrfs::{
-    initialize_loopback_image, initialize_native, native_layout, parse_blkid_export_identity,
-    probe_clone_domain, read_instance_marker, verify_btrfs_mount, BtrfsError, ImageAllocation,
-    InstanceMarker, PrivilegedExecutor, PrivilegedExecutorConfig, SystemCommandRunner,
+    initialize_loopback_image, initialize_native, native_layout, probe_clone_domain,
+    read_instance_marker, verify_btrfs_mount, BtrfsError, ImageAllocation,
+    LoopbackInitializationConfig, PrivilegedExecutor, PrivilegedExecutorConfig,
+    SystemCommandRunner,
 };
 
 const OPT_IN_ENV: &str = "REFLINK_FOREST_RUN_PRIVILEGED_BTRFS_TESTS";
@@ -37,25 +38,23 @@ fn loopback_initialization_survives_reattach_and_refuses_overwrite() {
     require_privileged_loopback_environment();
 
     let mut fixture = LoopbackFixture::new();
-    let image =
-        initialize_loopback_image(fixture.image_path(), IMAGE_SIZE, ImageAllocation::Sparse)
-            .expect("create the unique disposable backing image");
-
     let label = format!("rfs-privileged-{}", std::process::id());
-    let mut mkfs = Command::new("mkfs.btrfs");
-    mkfs.args(["--force", "--label"]).arg(&label).arg(&image);
-    run_checked(&mut mkfs, "format only the disposable Btrfs image");
-
-    let inspected = inspect_image_identity(&image);
-    assert_eq!(inspected.label, label);
-    let marker = InstanceMarker {
-        instance_uuid: [0x51; 16],
-        filesystem_uuid: inspected.filesystem_uuid,
-        label,
-    };
     let marker_path = fixture.root().join("instance.marker");
-    reflink_forest_btrfs::write_instance_marker(&marker_path, &marker)
-        .expect("write a create-new instance marker");
+    let initialization = LoopbackInitializationConfig::new(
+        fixture.image_path(),
+        fixture.root(),
+        &marker_path,
+        IMAGE_SIZE,
+        ImageAllocation::Sparse,
+        label,
+        [0x51; 16],
+    )
+    .expect("configure a create-new fixed-purpose loopback initialization");
+    let mut runner = SystemCommandRunner;
+    let initialized = PrivilegedExecutor::initialize_new_loopback(&initialization, &mut runner)
+        .expect("create, verify, and mark only the disposable Btrfs image");
+    let image = initialized.image().to_path_buf();
+    let marker = initialized.marker().clone();
     assert_eq!(
         read_instance_marker(&marker_path).expect("read back instance marker"),
         marker
@@ -124,38 +123,143 @@ fn loopback_initialization_survives_reattach_and_refuses_overwrite() {
     ));
 }
 
+#[test]
+#[ignore = "requires an isolated VM, loop devices, root, CAP_SYS_ADMIN, and REFLINK_FOREST_RUN_PRIVILEGED_BTRFS_TESTS=1"]
+fn loopback_mount_rejects_uuid_label_and_corrupt_marker_before_mount() {
+    require_explicit_opt_in();
+    require_privileged_loopback_environment();
+
+    let fixture = LoopbackFixture::new();
+    let marker_path = fixture.root().join("instance.marker");
+    let initialization = LoopbackInitializationConfig::new(
+        fixture.image_path(),
+        fixture.root(),
+        &marker_path,
+        IMAGE_SIZE,
+        ImageAllocation::Sparse,
+        format!("rfs-identity-{}", std::process::id()),
+        [0x52; 16],
+    )
+    .expect("configure a disposable fixed-purpose initializer");
+    let mut runner = SystemCommandRunner;
+    let initialized = PrivilegedExecutor::initialize_new_loopback(&initialization, &mut runner)
+        .expect("format and mark only the disposable image");
+    let image = initialized.image().to_path_buf();
+    assert_eq!(associated_loop_count(&image), 1);
+    assert_not_mounted(fixture.mount_root());
+
+    let mut wrong_uuid = initialized.marker().clone();
+    wrong_uuid.filesystem_uuid[0] ^= 0xff;
+    let uuid_config =
+        PrivilegedExecutorConfig::new(&image, fixture.root(), fixture.mount_root(), wrong_uuid)
+            .expect("a syntactically valid but wrong marker can reach identity verification");
+    assert!(matches!(
+        PrivilegedExecutor::new(uuid_config, SystemCommandRunner).mount(),
+        Err(BtrfsError::IdentityMismatch)
+    ));
+    assert_not_mounted(fixture.mount_root());
+    assert_eq!(associated_loop_count(&image), 1);
+
+    let mut wrong_label = initialized.marker().clone();
+    wrong_label.label.push_str("-wrong");
+    let label_config =
+        PrivilegedExecutorConfig::new(&image, fixture.root(), fixture.mount_root(), wrong_label)
+            .expect("a syntactically valid but wrong label can reach identity verification");
+    assert!(matches!(
+        PrivilegedExecutor::new(label_config, SystemCommandRunner).mount(),
+        Err(BtrfsError::IdentityMismatch)
+    ));
+    assert_not_mounted(fixture.mount_root());
+    assert_eq!(associated_loop_count(&image), 1);
+
+    // A damaged persisted marker fails before an executor can be constructed;
+    // in particular, it cannot cause a fresh attach, mount, or format attempt.
+    fs::write(&marker_path, b"corrupt marker must not select an image")
+        .expect("corrupt only the disposable marker");
+    assert!(matches!(
+        read_instance_marker(&marker_path),
+        Err(BtrfsError::InvalidMarker)
+    ));
+    assert_not_mounted(fixture.mount_root());
+    assert_eq!(associated_loop_count(&image), 1);
+    assert_eq!(
+        fs::metadata(&image).expect("read image metadata").len(),
+        IMAGE_SIZE
+    );
+}
+
+#[test]
+#[ignore = "requires an isolated VM, loop devices, root, CAP_SYS_ADMIN, and REFLINK_FOREST_RUN_PRIVILEGED_BTRFS_TESTS=1"]
+fn loopback_growth_refreshes_capacity_resizes_btrfs_and_never_shrinks() {
+    require_explicit_opt_in();
+    require_privileged_loopback_environment();
+
+    let mut fixture = LoopbackFixture::new();
+    let marker_path = fixture.root().join("instance.marker");
+    let initialization = LoopbackInitializationConfig::new(
+        fixture.image_path(),
+        fixture.root(),
+        &marker_path,
+        IMAGE_SIZE,
+        ImageAllocation::Sparse,
+        format!("rfs-grow-{}", std::process::id()),
+        [0x53; 16],
+    )
+    .expect("configure a disposable fixed-purpose initializer");
+    let mut runner = SystemCommandRunner;
+    let initialized = PrivilegedExecutor::initialize_new_loopback(&initialization, &mut runner)
+        .expect("format and mark only the disposable image");
+    let image = initialized.image().to_path_buf();
+    let marker = initialized.marker().clone();
+    let config =
+        PrivilegedExecutorConfig::new(&image, fixture.root(), fixture.mount_root(), marker)
+            .expect("create the fixed-purpose grow executor");
+
+    let mounted_device = mount_with_executor(config.clone());
+    fixture.set_attached_device(&mounted_device);
+    verify_btrfs_mount(fixture.mount_root()).expect("mount disposable Btrfs before growth");
+    let initial_size = fs::metadata(&image)
+        .expect("read initialized image length")
+        .len();
+    assert_eq!(initial_size, IMAGE_SIZE);
+    assert_eq!(loop_capacity_bytes(&mounted_device), initial_size);
+
+    // A successful call proves the production ordering reached all three
+    // external operations: grow file, refresh loop capacity, then resize the
+    // mounted Btrfs filesystem. Each later assertion observes the prior step.
+    let requested_size = initial_size + 64 * 1024 * 1024;
+    let mut executor = PrivilegedExecutor::new(config, SystemCommandRunner);
+    executor
+        .grow(requested_size)
+        .expect("grow image, refresh its loop capacity, and resize mounted Btrfs");
+    assert_eq!(
+        fs::metadata(&image).expect("read grown image length").len(),
+        requested_size
+    );
+    assert_eq!(loop_capacity_bytes(&mounted_device), requested_size);
+    verify_btrfs_mount(fixture.mount_root()).expect("grown filesystem remains mounted as Btrfs");
+
+    // The refused shrink path must run before any destructive operation. The
+    // backing file and loop capacity remain at the known grown value.
+    assert!(matches!(
+        executor.grow(initial_size),
+        Err(BtrfsError::ShrinkNotSupported { current, requested })
+            if current == requested_size && requested == initial_size
+    ));
+    assert_eq!(
+        fs::metadata(&image)
+            .expect("read image after refused shrink")
+            .len(),
+        requested_size
+    );
+    assert_eq!(loop_capacity_bytes(&mounted_device), requested_size);
+}
+
 fn mount_with_executor(config: PrivilegedExecutorConfig) -> String {
     let mut executor = PrivilegedExecutor::new(config, SystemCommandRunner);
     executor
         .mount()
         .expect("attach verified image and mount it at the fixed mount root")
-}
-
-fn inspect_image_identity(image: &Path) -> reflink_forest_btrfs::InspectedFilesystem {
-    let device = attach_for_inspection(image);
-    let result = {
-        let mut blkid = Command::new("blkid");
-        blkid
-            .args(["--output", "export", "--match-token", "TYPE=btrfs"])
-            .arg(&device);
-        let output = run_checked(&mut blkid, "inspect the newly formatted disposable image");
-        parse_blkid_export_identity(&output.stdout).expect("parse Btrfs UUID and label")
-    };
-    detach_loop_device(&device);
-    result
-}
-
-fn attach_for_inspection(image: &Path) -> String {
-    let mut attach = Command::new("losetup");
-    attach.args(["--find", "--show", "--nooverlap"]).arg(image);
-    let output = run_checked(
-        &mut attach,
-        "attach disposable image for identity inspection",
-    );
-    String::from_utf8(output.stdout)
-        .expect("losetup device name is UTF-8")
-        .trim()
-        .to_owned()
 }
 
 fn associated_loop_count(image: &Path) -> usize {
@@ -167,6 +271,30 @@ fn associated_loop_count(image: &Path) -> usize {
         .lines()
         .filter(|line| line.starts_with("/dev/loop") && line.contains(':'))
         .count()
+}
+
+fn loop_capacity_bytes(device: &str) -> u64 {
+    let mut capacity = Command::new("losetup");
+    capacity.args(["--getsize64", device]);
+    let output = run_checked(&mut capacity, "read disposable loop capacity");
+    String::from_utf8(output.stdout)
+        .expect("losetup capacity output is UTF-8")
+        .trim()
+        .parse()
+        .expect("losetup capacity is an unsigned byte count")
+}
+
+fn assert_not_mounted(path: &Path) {
+    let status = Command::new("mountpoint")
+        .args(["--quiet", path.to_str().expect("temporary path is UTF-8")])
+        .status()
+        .expect("run mountpoint for disposable directory");
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "identity failure must leave {} unmounted",
+        path.display()
+    );
 }
 
 fn require_explicit_opt_in() {

@@ -41,7 +41,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Run isolated loopback Btrfs integration test
+      - name: Run isolated loopback Btrfs integration suite
         env:
           REFLINK_FOREST_RUN_PRIVILEGED_BTRFS_TESTS: "1"
-        run: cargo test -p reflink-forest-btrfs --test privileged_loopback loopback_initialization_survives_reattach_and_refuses_overwrite -- --ignored --exact
+        run: cargo test -p reflink-forest-btrfs --test privileged_loopback -- --ignored
+      - name: Verify Btrfs raw checkout and restored cold-tier checkout
+        # The portable tests tolerate an unsupported FICLONE ioctl so that
+        # normal hosted CI can validate the cold-data and publication paths.
+        # This dedicated Btrfs runner is the required acceptance boundary:
+        # both tests must actually complete their FICLONE materialization.
+        run: |
+          cargo test -p reflink-forest-workspace --test checkout_acceptance
+          cargo test -p reflink-forest-workspace restored_cold_tier_materializes_a_workspace_without_the_original_tree -- --exact

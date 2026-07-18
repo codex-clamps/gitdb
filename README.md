@@ -37,6 +37,11 @@ are intentionally ordinary unit tests so every CI runner can execute them;
 each decoder also applies a format-specific input and allocation bound before
 constructing decoded collections.
 
+For coverage-guided fuzzing, the opt-in [`fuzz`](fuzz/README.md) project has
+`cargo-fuzz` targets for the record, snapshot-manifest, backup-manifest, and
+cold-tier-descriptor decoders. It is excluded from normal workspace builds and
+keeps its deliberately malformed seed corpus under version control.
+
 The runtime clone-domain probe must be run against the planned Btrfs cache and
 workspace directories, not merely any two paths:
 

@@ -515,7 +515,7 @@ pub fn read_snapshot_manifest(
             "snapshot manifest changed while being read",
         ));
     }
-    decode_snapshot_manifest(&bytes)
+    decode_snapshot_manifest_bytes(&bytes)
 }
 
 fn encode_snapshot_manifest(manifest: &SnapshotManifest) -> Result<Vec<u8>, SnapshotManifestError> {
@@ -576,7 +576,15 @@ fn encode_snapshot_manifest(manifest: &SnapshotManifest) -> Result<Vec<u8>, Snap
     Ok(bytes)
 }
 
-fn decode_snapshot_manifest(bytes: &[u8]) -> Result<SnapshotManifest, SnapshotManifestError> {
+/// Decodes a bounded snapshot-manifest byte string without filesystem I/O.
+///
+/// This is the same fail-closed decoder used by [`read_snapshot_manifest`].
+/// It accepts at most [`MAX_SNAPSHOT_MANIFEST_BYTES`] and is useful when a
+/// caller has already obtained the exact manifest bytes from a verified
+/// transport or archive.
+pub fn decode_snapshot_manifest_bytes(
+    bytes: &[u8],
+) -> Result<SnapshotManifest, SnapshotManifestError> {
     if bytes.len() > MAX_SNAPSHOT_MANIFEST_BYTES {
         return Err(SnapshotManifestError::Invalid(
             "snapshot manifest exceeds the maximum size",
@@ -1327,7 +1335,7 @@ mod tests {
             for len in lengths {
                 let bytes = corpus_bytes(seed, len);
                 assert!(std::panic::catch_unwind(|| {
-                    let _ = decode_snapshot_manifest(&bytes);
+                    let _ = decode_snapshot_manifest_bytes(&bytes);
                 })
                 .is_ok());
             }
@@ -1339,7 +1347,7 @@ mod tests {
         put_u32(&mut impossible_refs, u32::MAX);
         put_u32(&mut impossible_refs, 0);
         assert!(matches!(
-            decode_snapshot_manifest(&impossible_refs),
+            decode_snapshot_manifest_bytes(&impossible_refs),
             Err(SnapshotManifestError::Invalid(_))
         ));
 
@@ -1347,7 +1355,7 @@ mod tests {
         put_u32(&mut impossible_extensions, 0);
         put_u32(&mut impossible_extensions, u32::MAX);
         assert!(matches!(
-            decode_snapshot_manifest(&impossible_extensions),
+            decode_snapshot_manifest_bytes(&impossible_extensions),
             Err(SnapshotManifestError::Invalid(_))
         ));
     }

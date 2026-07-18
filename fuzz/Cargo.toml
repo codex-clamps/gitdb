@@ -1,0 +1,35 @@
+[package]
+name = "reflink-forest-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+reflink-forest-backup = { path = "../crates/reflink-forest-backup" }
+reflink-forest-format = { path = "../crates/reflink-forest-format" }
+reflink-forest-import = { path = "../crates/reflink-forest-import" }
+
+[[bin]]
+name = "format_decode"
+path = "fuzz_targets/format_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "snapshot_manifest_decode"
+path = "fuzz_targets/snapshot_manifest_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "backup_decode"
+path = "fuzz_targets/backup_decode.rs"
+test = false
+doc = false
+bench = false

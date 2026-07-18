@@ -127,6 +127,7 @@ pub struct InstanceMarker {
 const MARKER_MAGIC: &[u8; 8] = b"RFSINST\0";
 const MARKER_VERSION: u16 = 1;
 const MARKER_FIXED_LEN: usize = 8 + 2 + 16 + 16 + 2;
+const MAX_BTRFS_LABEL_BYTES: usize = 255;
 const FICLONE: std::ffi::c_ulong = 0x4004_9409;
 
 unsafe extern "C" {
@@ -175,9 +176,7 @@ pub fn write_instance_marker(
     path: impl AsRef<Path>,
     marker: &InstanceMarker,
 ) -> Result<PathBuf, BtrfsError> {
-    if marker.label.is_empty() || marker.label.len() > u16::MAX as usize {
-        return Err(BtrfsError::InvalidMarker);
-    }
+    validate_btrfs_label(&marker.label)?;
     let path = checked_new_file_path(path.as_ref())?;
     use std::os::unix::fs::OpenOptionsExt;
     let mut file = fs::OpenOptions::new()
@@ -384,6 +383,45 @@ fn checked_new_file_path(path: &Path) -> Result<PathBuf, BtrfsError> {
     Ok(result)
 }
 
+/// Resolves one create-new file path beneath the exact configured parent.
+///
+/// Initialization is intentionally stricter than opening an existing backing
+/// image: accepting only direct children makes both the image and marker
+/// identities independent of an attacker-controlled directory hierarchy.
+fn checked_new_file_path_in_parent(
+    path: &Path,
+    configured_parent: &Path,
+) -> Result<PathBuf, BtrfsError> {
+    let configured_parent = configured_parent.canonicalize()?;
+    if !configured_parent.is_dir() {
+        return Err(BtrfsError::UnsafeImagePath(configured_parent.to_path_buf()));
+    }
+    let candidate_parent = path
+        .parent()
+        .ok_or_else(|| BtrfsError::UnsafeImagePath(path.to_path_buf()))?
+        .canonicalize()?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| BtrfsError::UnsafeImagePath(path.to_path_buf()))?;
+    if candidate_parent != configured_parent {
+        return Err(BtrfsError::UnsafeImagePath(path.to_path_buf()));
+    }
+    let candidate = configured_parent.join(name);
+    match fs::symlink_metadata(&candidate) {
+        Ok(_) => Err(BtrfsError::ExistingPath(candidate)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(candidate),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn validate_btrfs_label(label: &str) -> Result<(), BtrfsError> {
+    if label.is_empty() || label.len() > MAX_BTRFS_LABEL_BYTES || label.contains(['\0', '\n', '\r'])
+    {
+        return Err(BtrfsError::InvalidMarker);
+    }
+    Ok(())
+}
+
 /// Returns the canonical configured image after rejecting symlinks and images
 /// outside its configured canonical parent.
 pub fn validate_backing_image(
@@ -417,6 +455,14 @@ pub enum PrivilegedPlan {
     },
     InspectFilesystem {
         device: String,
+    },
+    /// Formats only the loop device that a fixed-purpose initializer just
+    /// attached and canonically verified against its newly-created image.
+    /// This variant deliberately carries neither a pathname nor arbitrary
+    /// mkfs arguments.
+    FormatBtrfs {
+        device: String,
+        label: String,
     },
     Mount {
         device: String,
@@ -522,6 +568,11 @@ impl PrivilegedPlan {
                     .arg(device);
                 command
             }
+            Self::FormatBtrfs { device, label } => {
+                let mut command = Command::new("mkfs.btrfs");
+                command.args(["--force", "--label"]).arg(label).arg(device);
+                command
+            }
             Self::Mount { device, mount_root } => {
                 let mut command = Command::new("mount");
                 command
@@ -567,6 +618,7 @@ impl PrivilegedPlan {
             | Self::InspectLoopBacking { .. }
             | Self::RefreshLoopCapacity { .. } => "losetup",
             Self::InspectFilesystem { .. } => "blkid",
+            Self::FormatBtrfs { .. } => "mkfs.btrfs",
             Self::Mount { .. } => "mount",
             Self::GrowImage { .. } => "truncate",
             Self::ResizeFilesystem { .. } => "btrfs filesystem resize",
@@ -589,6 +641,115 @@ pub fn parse_loop_association(output: &str) -> Option<String> {
     })
 }
 
+/// Immutable inputs for one create-new loopback initialization.
+///
+/// Unlike [`PrivilegedExecutorConfig`], this configuration is valid only
+/// before an image and its marker exist. Both files are constrained to direct
+/// children of the configured canonical parent, so an initialization request
+/// cannot turn a client-controlled path into a formatting target.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LoopbackInitializationConfig {
+    image: PathBuf,
+    marker_path: PathBuf,
+    size: u64,
+    allocation: ImageAllocation,
+    label: String,
+    instance_uuid: [u8; 16],
+}
+
+impl LoopbackInitializationConfig {
+    /// Validates a fixed, create-new initialization layout without creating
+    /// any files. The executor repeats the image create-new check immediately
+    /// before it can issue an attach or format command, closing the gap
+    /// between configuration load and initialization.
+    pub fn new(
+        image: impl AsRef<Path>,
+        configured_parent: impl AsRef<Path>,
+        marker_path: impl AsRef<Path>,
+        size: u64,
+        allocation: ImageAllocation,
+        label: impl Into<String>,
+        instance_uuid: [u8; 16],
+    ) -> Result<Self, BtrfsError> {
+        if size == 0 {
+            return Err(BtrfsError::InvalidSize);
+        }
+        let label = label.into();
+        validate_btrfs_label(&label)?;
+        let image = checked_new_file_path_in_parent(image.as_ref(), configured_parent.as_ref())?;
+        let marker_path =
+            checked_new_file_path_in_parent(marker_path.as_ref(), configured_parent.as_ref())?;
+        if image == marker_path {
+            return Err(BtrfsError::UnsafeImagePath(image));
+        }
+        Ok(Self {
+            image,
+            marker_path,
+            size,
+            allocation,
+            label,
+            instance_uuid,
+        })
+    }
+
+    /// Newly-created backing image path, fixed by trusted instance
+    /// configuration rather than supplied by a client request.
+    pub fn image(&self) -> &Path {
+        &self.image
+    }
+
+    /// Marker path to be atomically created only after format verification.
+    pub fn marker_path(&self) -> &Path {
+        &self.marker_path
+    }
+
+    pub const fn size(&self) -> u64 {
+        self.size
+    }
+
+    pub const fn allocation(&self) -> ImageAllocation {
+        self.allocation
+    }
+
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    pub const fn instance_uuid(&self) -> [u8; 16] {
+        self.instance_uuid
+    }
+}
+
+/// Verified state produced by [`PrivilegedExecutor::initialize_new_loopback`].
+///
+/// The device is transient and intentionally is not written into the instance
+/// marker. A later mount must derive a fresh loop association from `image`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InitializedLoopback {
+    image: PathBuf,
+    marker_path: PathBuf,
+    marker: InstanceMarker,
+    device: String,
+}
+
+impl InitializedLoopback {
+    pub fn image(&self) -> &Path {
+        &self.image
+    }
+
+    pub fn marker_path(&self) -> &Path {
+        &self.marker_path
+    }
+
+    pub fn marker(&self) -> &InstanceMarker {
+        &self.marker
+    }
+
+    pub fn device(&self) -> &str {
+        &self.device
+    }
+}
+
 /// The only immutable inputs accepted by the privileged loop/mount helper.
 /// The helper never receives a client-selected device, backing image,
 /// mountpoint, or mount options. `new` canonicalizes and validates both paths
@@ -607,12 +768,7 @@ impl PrivilegedExecutorConfig {
         mount_root: impl AsRef<Path>,
         marker: InstanceMarker,
     ) -> Result<Self, BtrfsError> {
-        if marker.label.is_empty()
-            || marker.label.len() > usize::from(u16::MAX)
-            || marker.label.contains(['\n', '\r'])
-        {
-            return Err(BtrfsError::InvalidMarker);
-        }
+        validate_btrfs_label(&marker.label).map_err(|_| BtrfsError::InvalidMarker)?;
         let image = validate_backing_image(image, configured_parent)?;
         // The command output protocol is line-delimited. Newlines in a
         // configured path would make it impossible to identify the exact
@@ -718,6 +874,64 @@ impl<R: CommandRunner> PrivilegedExecutor<R> {
 
     pub fn into_runner(self) -> R {
         self.runner
+    }
+
+    /// Creates and formats a new loopback Btrfs image through the closed
+    /// privileged command vocabulary.
+    ///
+    /// The only possible format target is the loop device returned by
+    /// `losetup --nooverlap` for an image created with create-new semantics in
+    /// this invocation. Before `mkfs.btrfs` runs, its backing path is queried
+    /// and canonically compared with that new image. The resulting UUID and
+    /// label are then inspected and the instance marker is atomically written
+    /// last. Any failure before the marker leaves no Ready identity; the
+    /// create-new image is deliberately not reformatted on a retry.
+    pub fn initialize_new_loopback(
+        initialization: &LoopbackInitializationConfig,
+        runner: &mut R,
+    ) -> Result<InitializedLoopback, BtrfsError> {
+        let image = initialize_loopback_image(
+            initialization.image(),
+            initialization.size(),
+            initialization.allocation(),
+        )?;
+        let output = runner.run(&PrivilegedPlan::AttachLoop {
+            image: image.clone(),
+        })?;
+        let device = parse_attached_loop_device(&output.stdout)?;
+        let output = runner.run(&PrivilegedPlan::InspectLoopBacking {
+            device: device.clone(),
+        })?;
+        let backing = parse_single_backing_path(&output.stdout)?
+            .canonicalize()
+            .map_err(BtrfsError::Io)?;
+        if backing != image {
+            return Err(BtrfsError::LoopBackingMismatch { device, backing });
+        }
+
+        runner.run(&PrivilegedPlan::FormatBtrfs {
+            device: device.clone(),
+            label: initialization.label().to_owned(),
+        })?;
+        let output = runner.run(&PrivilegedPlan::InspectFilesystem {
+            device: device.clone(),
+        })?;
+        let inspected = parse_blkid_export_identity(&output.stdout)?;
+        if inspected.label != initialization.label() {
+            return Err(BtrfsError::IdentityMismatch);
+        }
+        let marker = InstanceMarker {
+            instance_uuid: initialization.instance_uuid(),
+            filesystem_uuid: inspected.filesystem_uuid,
+            label: inspected.label,
+        };
+        write_instance_marker(initialization.marker_path(), &marker)?;
+        Ok(InitializedLoopback {
+            image,
+            marker_path: initialization.marker_path().to_path_buf(),
+            marker,
+            device,
+        })
     }
 
     /// Finds a pre-existing canonical association, or attaches the configured
@@ -1597,6 +1811,164 @@ mod tests {
         let mut output = image.as_os_str().as_bytes().to_vec();
         output.push(b'\n');
         CommandOutput::success(output)
+    }
+
+    fn initialization_fixture(
+        name: &str,
+    ) -> (PathBuf, LoopbackInitializationConfig, PathBuf, PathBuf) {
+        let parent = temp_path(name);
+        fs::create_dir(&parent).unwrap();
+        let image = parent.join("new-hot.btrfs");
+        let marker = parent.join("new-instance.marker");
+        let config = LoopbackInitializationConfig::new(
+            &image,
+            &parent,
+            &marker,
+            4096,
+            ImageAllocation::Sparse,
+            "new-test-instance",
+            [0x71; 16],
+        )
+        .unwrap();
+        (parent, config, image, marker)
+    }
+
+    #[test]
+    fn initializer_formats_only_the_verified_new_loop_and_commits_marker_last() {
+        let (parent, config, image, marker_path) =
+            initialization_fixture("reflink-forest-new-loopback");
+        let mut runner = RecordedRunner::new([
+            (
+                PrivilegedPlan::AttachLoop {
+                    image: image.clone(),
+                },
+                CommandOutput::success("/dev/loop7\n"),
+            ),
+            (
+                PrivilegedPlan::InspectLoopBacking {
+                    device: "/dev/loop7".into(),
+                },
+                backing_output(&image),
+            ),
+            (
+                PrivilegedPlan::FormatBtrfs {
+                    device: "/dev/loop7".into(),
+                    label: "new-test-instance".into(),
+                },
+                CommandOutput::success(Vec::new()),
+            ),
+            (
+                PrivilegedPlan::InspectFilesystem {
+                    device: "/dev/loop7".into(),
+                },
+                btrfs_identity("new-test-instance"),
+            ),
+        ]);
+
+        let initialized =
+            PrivilegedExecutor::initialize_new_loopback(&config, &mut runner).unwrap();
+        assert_eq!(initialized.image(), image);
+        assert_eq!(initialized.marker_path(), marker_path);
+        assert_eq!(initialized.device(), "/dev/loop7");
+        assert_eq!(
+            initialized.marker(),
+            &InstanceMarker {
+                instance_uuid: [0x71; 16],
+                filesystem_uuid: [5; 16],
+                label: "new-test-instance".into(),
+            }
+        );
+        assert_eq!(
+            read_instance_marker(&marker_path).unwrap(),
+            initialized.marker().clone()
+        );
+        assert!(runner.expected.is_empty());
+        assert!(matches!(
+            runner.seen.as_slice(),
+            [
+                PrivilegedPlan::AttachLoop { .. },
+                PrivilegedPlan::InspectLoopBacking { .. },
+                PrivilegedPlan::FormatBtrfs { .. },
+                PrivilegedPlan::InspectFilesystem { .. },
+            ]
+        ));
+        let format = runner.seen[2].command();
+        assert_eq!(format.get_program(), OsStr::new("mkfs.btrfs"));
+        assert_eq!(
+            format
+                .get_args()
+                .map(|argument| argument.as_bytes().to_vec())
+                .collect::<Vec<_>>(),
+            vec![
+                b"--force".to_vec(),
+                b"--label".to_vec(),
+                b"new-test-instance".to_vec(),
+                b"/dev/loop7".to_vec(),
+            ]
+        );
+        assert_eq!(fs::metadata(&image).unwrap().len(), 4096);
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn initializer_never_formats_a_path_that_appears_after_configuration() {
+        let (parent, config, image, marker_path) =
+            initialization_fixture("reflink-forest-raced-new-loopback");
+        fs::write(&image, b"unmarked image must remain untouched").unwrap();
+        let mut runner = RecordedRunner::new([]);
+
+        assert!(matches!(
+            PrivilegedExecutor::initialize_new_loopback(&config, &mut runner),
+            Err(BtrfsError::ExistingPath(path)) if path == image
+        ));
+        assert_eq!(
+            fs::read(&image).unwrap(),
+            b"unmarked image must remain untouched"
+        );
+        assert!(!marker_path.exists());
+        assert!(runner.seen.is_empty(), "no privileged plan may run");
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn initializer_refuses_to_publish_a_marker_when_format_or_identity_fails() {
+        let (parent, config, image, marker_path) =
+            initialization_fixture("reflink-forest-unverified-loopback");
+        let mut runner = RecordedRunner::new([
+            (
+                PrivilegedPlan::AttachLoop {
+                    image: image.clone(),
+                },
+                CommandOutput::success("/dev/loop7\n"),
+            ),
+            (
+                PrivilegedPlan::InspectLoopBacking {
+                    device: "/dev/loop7".into(),
+                },
+                backing_output(&image),
+            ),
+            (
+                PrivilegedPlan::FormatBtrfs {
+                    device: "/dev/loop7".into(),
+                    label: "new-test-instance".into(),
+                },
+                CommandOutput::success(Vec::new()),
+            ),
+            (
+                PrivilegedPlan::InspectFilesystem {
+                    device: "/dev/loop7".into(),
+                },
+                btrfs_identity("unexpected-label"),
+            ),
+        ]);
+
+        assert!(matches!(
+            PrivilegedExecutor::initialize_new_loopback(&config, &mut runner),
+            Err(BtrfsError::IdentityMismatch)
+        ));
+        assert!(!marker_path.exists());
+        assert!(runner.expected.is_empty());
+        fs::remove_dir_all(parent).unwrap();
     }
 
     #[test]

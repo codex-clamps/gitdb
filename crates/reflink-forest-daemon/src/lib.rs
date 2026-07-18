@@ -4,11 +4,24 @@
 //! Unix UID. It intentionally exposes no mount or ownership-changing action;
 //! those remain a fixed-purpose privileged-helper concern.
 
+use reflink_forest_cache::{
+    Cache, CacheCapacityCoordinator, CacheError, CacheEviction, CacheReconciliation,
+    CapacityAdmission, CapacityAdmissionError, CapacityMeter, ReservePolicy,
+};
 use reflink_forest_format::crc32c;
 use reflink_forest_index::{Catalog, CatalogBatch, CatalogError};
+use reflink_forest_maintenance::{
+    compact_completed_mark_set, completed_mark_set, reconcile_active_generation,
+    retire_compacted_generation, CompactionOutcome, CompactionReader, CompactionWriter,
+    GenerationManager, MaintenanceError, MarkError, MarkLimits, RetainedObjectRef,
+    SnapshotManifestSource,
+};
+use reflink_forest_store::{verify_chunk, StoreError};
 use std::{
+    collections::{BTreeMap, VecDeque},
     fs::{self, File, OpenOptions},
     io::{self, BufRead, BufReader, Read, Write},
+    marker::PhantomData,
     os::{
         fd::AsRawFd,
         unix::{
@@ -193,6 +206,965 @@ where
 
     fn handle(&mut self, job: &JobRecord) -> Result<(), Self::Error> {
         self(job)
+    }
+}
+
+/// A payload-free summary of a durable job record for operation telemetry. It
+/// intentionally excludes the job kind and stored error because those fields
+/// can contain client-provided paths or unbounded diagnostic text. The opaque
+/// daemon-generated [`JobId`] is retained only for correlation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OperationJobMetadata {
+    pub id: JobId,
+    pub state: JobState,
+    pub attempts: u32,
+}
+
+impl From<&JobRecord> for OperationJobMetadata {
+    fn from(record: &JobRecord) -> Self {
+        Self {
+            id: record.id,
+            state: record.state,
+            attempts: record.attempts,
+        }
+    }
+}
+
+/// A fixed vocabulary for the daemon-maintenance actions known by this
+/// release. Unknown job kinds are deliberately collapsed rather than emitted
+/// as client-controlled strings.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MaintenanceOperationKind {
+    CacheReconcile,
+    CacheEvict,
+    VerifyColdChunk,
+    Unsupported,
+}
+
+/// A compact snapshot of one scrub schedule transition. It contains only
+/// durable scheduling counters and timestamps, never a mount path or verifier
+/// diagnostic.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ScrubOperationMetadata {
+    pub interval_seconds: u64,
+    pub next_due_unix_seconds: u64,
+    pub run_state: ScrubRunState,
+    pub consecutive_failures: u32,
+    pub recovered_interrupted_runs: u64,
+}
+
+impl From<&ScrubScheduleState> for ScrubOperationMetadata {
+    fn from(schedule: &ScrubScheduleState) -> Self {
+        Self {
+            interval_seconds: schedule.interval_seconds,
+            next_due_unix_seconds: schedule.next_due_unix_seconds,
+            run_state: schedule.run_state,
+            consecutive_failures: schedule.consecutive_failures,
+            recovered_interrupted_runs: schedule.recovered_interrupted_runs,
+        }
+    }
+}
+
+/// A compact snapshot of one durable migration checkpoint. No external target
+/// path or handler diagnostic is represented here.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MigrationOperationMetadata {
+    pub id: MigrationId,
+    pub from_format_version: u16,
+    pub to_format_version: u16,
+    pub state: MigrationState,
+    pub transition_count: u64,
+}
+
+impl From<&MigrationRecord> for MigrationOperationMetadata {
+    fn from(record: &MigrationRecord) -> Self {
+        Self {
+            id: record.id,
+            from_format_version: record.from_format_version,
+            to_format_version: record.to_format_version,
+            state: record.state,
+            transition_count: record.transition_count,
+        }
+    }
+}
+
+/// Bounded failure classification retained by operation telemetry. The source
+/// error remains only in the existing durable record when applicable; it is
+/// never copied into a log event.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OperationEventFailure {
+    HandlerError,
+    HandlerPanic,
+}
+
+/// Terminal classification for one daemon worker turn.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OperationEventOutcome {
+    Idle,
+    Succeeded,
+    Failed(OperationEventFailure),
+    /// The daemon could not claim or persist durable state. No raw I/O or
+    /// handler error is exposed through this event.
+    PersistenceFailure,
+}
+
+/// One structured daemon operation event.
+///
+/// Every variant intentionally omits arbitrary request payloads, filesystem
+/// paths, raw handler diagnostics, and `JobRecord::last_error`. This makes it
+/// safe for a caller to retain events in a process-local buffer or forward
+/// them to a structured logger without treating logs as durable authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OperationEvent {
+    Job {
+        job: Option<OperationJobMetadata>,
+        outcome: OperationEventOutcome,
+    },
+    Maintenance {
+        job: Option<OperationJobMetadata>,
+        kind: MaintenanceOperationKind,
+        outcome: OperationEventOutcome,
+    },
+    Scrub {
+        schedule: Option<ScrubOperationMetadata>,
+        outcome: OperationEventOutcome,
+    },
+    Migration {
+        migration: Option<MigrationOperationMetadata>,
+        outcome: OperationEventOutcome,
+    },
+}
+
+/// An observer for structured operation events. Implementations must not use
+/// emitted events as a source of durable state; all authority remains in the
+/// job, scrub, and migration records.
+pub trait OperationEventSink {
+    fn record(&mut self, event: OperationEvent);
+}
+
+impl<F> OperationEventSink for F
+where
+    F: FnMut(OperationEvent),
+{
+    fn record(&mut self, event: OperationEvent) {
+        self(event);
+    }
+}
+
+/// Configuration error for [`BoundedOperationEvents`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OperationEventBufferError {
+    ZeroCapacity,
+    CapacityTooLarge { requested: usize, maximum: usize },
+}
+
+impl std::fmt::Display for OperationEventBufferError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ZeroCapacity => write!(formatter, "operation event capacity must be non-zero"),
+            Self::CapacityTooLarge { requested, maximum } => write!(
+                formatter,
+                "operation event capacity {requested} exceeds the maximum {maximum}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for OperationEventBufferError {}
+
+/// Default in-memory event retention bound. Events contain no user payloads,
+/// but the buffer itself is still deliberately fixed to avoid log-induced
+/// memory growth in a long-running daemon.
+pub const DEFAULT_OPERATION_EVENT_CAPACITY: usize = 256;
+/// Largest accepted process-local event retention bound. Keeping this small
+/// prevents configuration from turning logging into an unbounded allocation.
+pub const MAX_OPERATION_EVENT_CAPACITY: usize = 4096;
+
+/// A bounded, process-local event sink. On overflow it drops the oldest event
+/// and increments [`Self::dropped_events`]; it performs no filesystem write.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BoundedOperationEvents {
+    capacity: usize,
+    events: VecDeque<OperationEvent>,
+    dropped_events: u64,
+}
+
+impl BoundedOperationEvents {
+    pub fn new(capacity: usize) -> Result<Self, OperationEventBufferError> {
+        if capacity == 0 {
+            return Err(OperationEventBufferError::ZeroCapacity);
+        }
+        if capacity > MAX_OPERATION_EVENT_CAPACITY {
+            return Err(OperationEventBufferError::CapacityTooLarge {
+                requested: capacity,
+                maximum: MAX_OPERATION_EVENT_CAPACITY,
+            });
+        }
+        Ok(Self {
+            capacity,
+            events: VecDeque::with_capacity(capacity),
+            dropped_events: 0,
+        })
+    }
+
+    pub fn events(&self) -> &VecDeque<OperationEvent> {
+        &self.events
+    }
+
+    pub const fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    pub const fn dropped_events(&self) -> u64 {
+        self.dropped_events
+    }
+}
+
+impl Default for BoundedOperationEvents {
+    fn default() -> Self {
+        Self::new(DEFAULT_OPERATION_EVENT_CAPACITY)
+            .expect("the default operation event capacity is non-zero")
+    }
+}
+
+impl OperationEventSink for BoundedOperationEvents {
+    fn record(&mut self, event: OperationEvent) {
+        if self.events.len() == self.capacity {
+            let _ = self.events.pop_front();
+            self.dropped_events = self.dropped_events.saturating_add(1);
+        }
+        self.events.push_back(event);
+    }
+}
+
+/// Counters that can be scraped without retaining individual events or their
+/// metadata. All increments saturate rather than overflowing daemon metrics.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct OperationEventMetricsSnapshot {
+    pub total: u64,
+    pub jobs: u64,
+    pub maintenance: u64,
+    pub scrubs: u64,
+    pub migrations: u64,
+    pub idle: u64,
+    pub succeeded: u64,
+    pub handler_errors: u64,
+    pub handler_panics: u64,
+    pub persistence_failures: u64,
+}
+
+/// An in-memory metric sink for [`OperationEvent`].
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct OperationEventMetrics {
+    snapshot: OperationEventMetricsSnapshot,
+}
+
+impl OperationEventMetrics {
+    pub const fn snapshot(&self) -> OperationEventMetricsSnapshot {
+        self.snapshot
+    }
+}
+
+impl OperationEventSink for OperationEventMetrics {
+    fn record(&mut self, event: OperationEvent) {
+        self.snapshot.total = self.snapshot.total.saturating_add(1);
+        match event {
+            OperationEvent::Job { outcome, .. } => {
+                self.snapshot.jobs = self.snapshot.jobs.saturating_add(1);
+                self.record_outcome(outcome);
+            }
+            OperationEvent::Maintenance { outcome, .. } => {
+                self.snapshot.maintenance = self.snapshot.maintenance.saturating_add(1);
+                self.record_outcome(outcome);
+            }
+            OperationEvent::Scrub { outcome, .. } => {
+                self.snapshot.scrubs = self.snapshot.scrubs.saturating_add(1);
+                self.record_outcome(outcome);
+            }
+            OperationEvent::Migration { outcome, .. } => {
+                self.snapshot.migrations = self.snapshot.migrations.saturating_add(1);
+                self.record_outcome(outcome);
+            }
+        }
+    }
+}
+
+impl OperationEventMetrics {
+    fn record_outcome(&mut self, outcome: OperationEventOutcome) {
+        match outcome {
+            OperationEventOutcome::Idle => {
+                self.snapshot.idle = self.snapshot.idle.saturating_add(1)
+            }
+            OperationEventOutcome::Succeeded => {
+                self.snapshot.succeeded = self.snapshot.succeeded.saturating_add(1)
+            }
+            OperationEventOutcome::Failed(OperationEventFailure::HandlerError) => {
+                self.snapshot.handler_errors = self.snapshot.handler_errors.saturating_add(1)
+            }
+            OperationEventOutcome::Failed(OperationEventFailure::HandlerPanic) => {
+                self.snapshot.handler_panics = self.snapshot.handler_panics.saturating_add(1)
+            }
+            OperationEventOutcome::PersistenceFailure => {
+                self.snapshot.persistence_failures =
+                    self.snapshot.persistence_failures.saturating_add(1)
+            }
+        }
+    }
+}
+
+/// A ready-to-use in-memory telemetry sink that retains both a bounded recent
+/// event window and aggregate counters. It is purely derived state and never
+/// writes another daemon record.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct InMemoryOperationTelemetry {
+    events: BoundedOperationEvents,
+    metrics: OperationEventMetrics,
+}
+
+impl InMemoryOperationTelemetry {
+    pub fn new(event_capacity: usize) -> Result<Self, OperationEventBufferError> {
+        Ok(Self {
+            events: BoundedOperationEvents::new(event_capacity)?,
+            metrics: OperationEventMetrics::default(),
+        })
+    }
+
+    pub fn events(&self) -> &BoundedOperationEvents {
+        &self.events
+    }
+
+    pub const fn metrics(&self) -> OperationEventMetricsSnapshot {
+        self.metrics.snapshot()
+    }
+}
+
+impl OperationEventSink for InMemoryOperationTelemetry {
+    fn record(&mut self, event: OperationEvent) {
+        self.events.record(event);
+        self.metrics.record(event);
+    }
+}
+
+fn emit_operation_event<S: OperationEventSink>(sink: &mut S, event: OperationEvent) {
+    // Telemetry must not make a completed durable operation look failed. A
+    // broken custom sink is ignored after the job/schedule/migration method
+    // has reached its own durable outcome.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sink.record(event)));
+}
+
+/// Stable job kind for cache reconciliation. Its payload is always empty.
+///
+/// Reconciliation is safe to retry: it only validates derived cache entries
+/// and moves invalid candidates into the cache-local quarantine area.
+pub const CACHE_RECONCILE_JOB_KIND: &[u8] = b"cache-reconcile-v1";
+
+/// Stable job kind for deterministic cache eviction. Its payload is one
+/// big-endian `u64` target for logical cache bytes.
+pub const CACHE_EVICT_JOB_KIND: &[u8] = b"cache-evict-v1";
+
+/// Stable job kind for structurally verifying one configured cold chunk. Its
+/// payload is a big-endian `(u32 generation, u64 chunk_id)` pair.
+pub const VERIFY_COLD_CHUNK_JOB_KIND: &[u8] = b"verify-cold-chunk-v1";
+
+const VERIFY_COLD_CHUNK_PAYLOAD_LEN: usize = 12;
+
+/// One daemon-configured cold chunk that a maintenance worker may inspect.
+///
+/// A job carries only [`Self::generation`] and [`Self::chunk_id`]. It never
+/// carries a path, so a local client cannot turn a verification request into
+/// an arbitrary filesystem read. The daemon deployment supplies and owns the
+/// chunk-path inventory when it constructs [`MaintenanceJobHandler`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ColdChunkTarget {
+    pub generation: u32,
+    pub chunk_id: u64,
+    pub path: PathBuf,
+}
+
+impl ColdChunkTarget {
+    pub fn new(generation: u32, chunk_id: u64, path: impl AsRef<Path>) -> Self {
+        Self {
+            generation,
+            chunk_id,
+            path: path.as_ref().to_path_buf(),
+        }
+    }
+}
+
+/// Rejects an ambiguous configured cold-chunk inventory before it can accept
+/// maintenance work.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MaintenanceConfigurationError {
+    DuplicateColdChunk { generation: u32, chunk_id: u64 },
+}
+
+impl std::fmt::Display for MaintenanceConfigurationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DuplicateColdChunk {
+                generation,
+                chunk_id,
+            } => write!(
+                formatter,
+                "cold chunk inventory duplicates generation {generation}, chunk {chunk_id}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MaintenanceConfigurationError {}
+
+/// Result reported by a concrete, idempotent maintenance job.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MaintenanceJobOutcome {
+    CacheReconciled(CacheReconciliation),
+    CacheEvicted(CacheEviction),
+    ColdChunkVerified {
+        generation: u32,
+        chunk_id: u64,
+        records: u64,
+    },
+}
+
+/// Failure while decoding or executing a concrete maintenance job.
+#[derive(Debug)]
+pub enum MaintenanceJobError {
+    InvalidJobState(JobState),
+    InvalidPayload(&'static str),
+    UnsupportedKind(Vec<u8>),
+    UnconfiguredColdChunk { generation: u32, chunk_id: u64 },
+    Cache(CacheError),
+    Store(StoreError),
+}
+
+impl std::fmt::Display for MaintenanceJobError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidJobState(state) => write!(
+                formatter,
+                "maintenance job must be running before execution, found {state:?}"
+            ),
+            Self::InvalidPayload(reason) => {
+                write!(formatter, "invalid maintenance job payload: {reason}")
+            }
+            Self::UnsupportedKind(kind) => {
+                write!(
+                    formatter,
+                    "unsupported maintenance job kind: {} bytes",
+                    kind.len()
+                )
+            }
+            Self::UnconfiguredColdChunk {
+                generation,
+                chunk_id,
+            } => write!(
+                formatter,
+                "cold chunk generation {generation}, chunk {chunk_id} is not configured"
+            ),
+            Self::Cache(error) => write!(formatter, "cache maintenance failed: {error}"),
+            Self::Store(error) => write!(formatter, "cold-store maintenance failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for MaintenanceJobError {}
+
+impl From<CacheError> for MaintenanceJobError {
+    fn from(value: CacheError) -> Self {
+        Self::Cache(value)
+    }
+}
+
+impl From<StoreError> for MaintenanceJobError {
+    fn from(value: StoreError) -> Self {
+        Self::Store(value)
+    }
+}
+
+/// Bridges durable daemon jobs to the concrete derived-cache and cold-store
+/// operations available in the MVP.
+///
+/// The handler is intentionally bounded: it knows no import, checkout, or
+/// arbitrary path protocol. Cache jobs operate on the daemon-owned [`Cache`],
+/// while cold verification looks up a fixed generation/chunk identity in the
+/// constructor-provided inventory. Each supported operation is idempotent, so
+/// a `Running` job recovered as `Queued` after a process crash may execute
+/// again without making authoritative data less durable.
+pub struct MaintenanceJobHandler<'a> {
+    cache: &'a Cache,
+    cold_chunks: BTreeMap<(u32, u64), PathBuf>,
+}
+
+impl<'a> MaintenanceJobHandler<'a> {
+    /// Builds a handler from the daemon's trusted cold chunk inventory.
+    pub fn new(
+        cache: &'a Cache,
+        chunks: impl IntoIterator<Item = ColdChunkTarget>,
+    ) -> Result<Self, MaintenanceConfigurationError> {
+        let mut cold_chunks = BTreeMap::new();
+        for chunk in chunks {
+            let key = (chunk.generation, chunk.chunk_id);
+            if cold_chunks.insert(key, chunk.path).is_some() {
+                return Err(MaintenanceConfigurationError::DuplicateColdChunk {
+                    generation: key.0,
+                    chunk_id: key.1,
+                });
+            }
+        }
+        Ok(Self { cache, cold_chunks })
+    }
+
+    /// Executes one already-claimed maintenance job and returns its concrete
+    /// operation result. [`JobStore::execute_next`] uses this through the
+    /// [`JobHandler`] implementation to durably record success or failure.
+    pub fn execute(&self, job: &JobRecord) -> Result<MaintenanceJobOutcome, MaintenanceJobError> {
+        if job.state != JobState::Running {
+            return Err(MaintenanceJobError::InvalidJobState(job.state));
+        }
+        match job.kind.as_slice() {
+            CACHE_RECONCILE_JOB_KIND => {
+                if !job.payload.is_empty() {
+                    return Err(MaintenanceJobError::InvalidPayload(
+                        "cache reconciliation payload must be empty",
+                    ));
+                }
+                Ok(MaintenanceJobOutcome::CacheReconciled(
+                    self.cache.reconcile()?,
+                ))
+            }
+            CACHE_EVICT_JOB_KIND => {
+                let target_logical_bytes = decode_cache_evict_payload(&job.payload)?;
+                Ok(MaintenanceJobOutcome::CacheEvicted(
+                    self.cache.evict_to(target_logical_bytes)?,
+                ))
+            }
+            VERIFY_COLD_CHUNK_JOB_KIND => {
+                let (generation, chunk_id) = decode_cold_chunk_payload(&job.payload)?;
+                let path = self.cold_chunks.get(&(generation, chunk_id)).ok_or(
+                    MaintenanceJobError::UnconfiguredColdChunk {
+                        generation,
+                        chunk_id,
+                    },
+                )?;
+                Ok(MaintenanceJobOutcome::ColdChunkVerified {
+                    generation,
+                    chunk_id,
+                    records: verify_chunk(path)?,
+                })
+            }
+            _ => Err(MaintenanceJobError::UnsupportedKind(job.kind.clone())),
+        }
+    }
+
+    /// Claims and executes at most one queued maintenance job. Job terminal
+    /// state is persisted by [`JobStore`] before this method returns.
+    pub fn execute_next(&mut self, jobs: &JobStore) -> Result<JobExecutionOutcome, JobError> {
+        jobs.execute_next(self)
+    }
+
+    /// Equivalent to [`Self::execute_next`], with a bounded structured event
+    /// emitted after the durable terminal state is known. The event contains
+    /// no cold path, cache target, or client payload.
+    pub fn execute_next_with_events<S: OperationEventSink>(
+        &mut self,
+        jobs: &JobStore,
+        sink: &mut S,
+    ) -> Result<JobExecutionOutcome, JobError> {
+        let result = jobs.execute_next(self);
+        emit_operation_event(sink, maintenance_operation_event(&result));
+        result
+    }
+}
+
+impl JobHandler for MaintenanceJobHandler<'_> {
+    type Error = MaintenanceJobError;
+
+    fn handle(&mut self, job: &JobRecord) -> Result<(), Self::Error> {
+        self.execute(job).map(|_| ())
+    }
+}
+
+/// Enqueues an idempotent cache reconciliation job.
+pub fn enqueue_cache_reconcile(jobs: &JobStore) -> Result<JobRecord, JobError> {
+    jobs.enqueue(CACHE_RECONCILE_JOB_KIND, [])
+}
+
+/// Enqueues deterministic cache eviction to a logical-byte target.
+pub fn enqueue_cache_eviction(
+    jobs: &JobStore,
+    target_logical_bytes: u64,
+) -> Result<JobRecord, JobError> {
+    jobs.enqueue(CACHE_EVICT_JOB_KIND, target_logical_bytes.to_be_bytes())
+}
+
+/// Enqueues verification of one trusted-inventory cold chunk.
+pub fn enqueue_cold_chunk_verification(
+    jobs: &JobStore,
+    generation: u32,
+    chunk_id: u64,
+) -> Result<JobRecord, JobError> {
+    jobs.enqueue(
+        VERIFY_COLD_CHUNK_JOB_KIND,
+        encode_cold_chunk_payload(generation, chunk_id),
+    )
+}
+
+fn decode_cache_evict_payload(payload: &[u8]) -> Result<u64, MaintenanceJobError> {
+    let bytes: [u8; 8] = payload.try_into().map_err(|_| {
+        MaintenanceJobError::InvalidPayload("cache eviction payload must be exactly 8 bytes")
+    })?;
+    Ok(u64::from_be_bytes(bytes))
+}
+
+fn encode_cold_chunk_payload(
+    generation: u32,
+    chunk_id: u64,
+) -> [u8; VERIFY_COLD_CHUNK_PAYLOAD_LEN] {
+    let mut payload = [0_u8; VERIFY_COLD_CHUNK_PAYLOAD_LEN];
+    payload[..4].copy_from_slice(&generation.to_be_bytes());
+    payload[4..].copy_from_slice(&chunk_id.to_be_bytes());
+    payload
+}
+
+fn decode_cold_chunk_payload(payload: &[u8]) -> Result<(u32, u64), MaintenanceJobError> {
+    let bytes: [u8; VERIFY_COLD_CHUNK_PAYLOAD_LEN] = payload.try_into().map_err(|_| {
+        MaintenanceJobError::InvalidPayload(
+            "cold chunk verification payload must be exactly 12 bytes",
+        )
+    })?;
+    let generation = u32::from_be_bytes(bytes[..4].try_into().expect("fixed-width slice"));
+    let chunk_id = u64::from_be_bytes(bytes[4..].try_into().expect("fixed-width slice"));
+    Ok((generation, chunk_id))
+}
+
+/// Trusted daemon configuration for operational maintenance.
+///
+/// These roots come from the daemon deployment, never from a socket request.
+/// Generation names are derived by [`Self::generation_path`] so a maintenance
+/// caller cannot select an arbitrary source directory for retirement.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OperationalMaintenanceConfig {
+    cache_root: PathBuf,
+    generation_state_root: PathBuf,
+    generations_root: PathBuf,
+    trash_root: PathBuf,
+}
+
+impl OperationalMaintenanceConfig {
+    pub fn new(
+        cache_root: impl AsRef<Path>,
+        generation_state_root: impl AsRef<Path>,
+        generations_root: impl AsRef<Path>,
+        trash_root: impl AsRef<Path>,
+    ) -> Self {
+        Self {
+            cache_root: cache_root.as_ref().to_path_buf(),
+            generation_state_root: generation_state_root.as_ref().to_path_buf(),
+            generations_root: generations_root.as_ref().to_path_buf(),
+            trash_root: trash_root.as_ref().to_path_buf(),
+        }
+    }
+
+    pub fn cache_root(&self) -> &Path {
+        &self.cache_root
+    }
+
+    pub fn generation_state_root(&self) -> &Path {
+        &self.generation_state_root
+    }
+
+    pub fn generations_root(&self) -> &Path {
+        &self.generations_root
+    }
+
+    pub fn trash_root(&self) -> &Path {
+        &self.trash_root
+    }
+
+    /// The only source-generation path usable by the coordinator.
+    pub fn generation_path(&self, generation: u32) -> PathBuf {
+        self.generations_root
+            .join(format!("generation-{generation}"))
+    }
+}
+
+/// State repaired before the daemon accepts operational maintenance work.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OperationalMaintenanceStartup {
+    /// Derived cache entries retained or quarantined during startup.
+    pub cache: CacheReconciliation,
+    /// The catalog-authoritative generation that was written to the derived
+    /// active-generation pointer after stale leases were reconciled.
+    pub active_generation: Option<u32>,
+}
+
+/// A successful GC cycle may publish a new generation before old readers or
+/// durable pins permit retirement. That case is a completed bounded cycle,
+/// not a failed compaction.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GenerationRetirement {
+    Retired(PathBuf),
+    DeferredByPin { generation: u32 },
+    DeferredByActiveReaders { generation: u32 },
+}
+
+/// Result of one bounded mark → compact → publish → retire cycle.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OperationalGcOutcome {
+    pub marked_objects: usize,
+    pub compaction: CompactionOutcome,
+    pub retirement: GenerationRetirement,
+}
+
+/// Failure while opening or operating daemon-owned maintenance state.
+#[derive(Debug)]
+pub enum OperationalMaintenanceError {
+    Cache(CacheError),
+    Capacity(CapacityAdmissionError),
+    Maintenance(MaintenanceError),
+    Mark(MarkError),
+    AllocationTooLarge(usize),
+    GenerationExhausted(u32),
+}
+
+impl std::fmt::Display for OperationalMaintenanceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cache(error) => write!(formatter, "operational cache failure: {error}"),
+            Self::Capacity(error) => write!(formatter, "cache admission refused: {error}"),
+            Self::Maintenance(error) => write!(formatter, "maintenance failure: {error}"),
+            Self::Mark(error) => write!(formatter, "GC mark failure: {error}"),
+            Self::AllocationTooLarge(bytes) => write!(
+                formatter,
+                "cache allocation of {bytes} bytes cannot be represented in the capacity policy"
+            ),
+            Self::GenerationExhausted(generation) => write!(
+                formatter,
+                "cannot compact generation {generation}: no higher generation number remains"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for OperationalMaintenanceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Cache(error) => Some(error),
+            Self::Capacity(error) => Some(error),
+            Self::Maintenance(error) => Some(error),
+            Self::Mark(error) => Some(error),
+            Self::AllocationTooLarge(_) => None,
+            Self::GenerationExhausted(_) => None,
+        }
+    }
+}
+
+impl From<CacheError> for OperationalMaintenanceError {
+    fn from(value: CacheError) -> Self {
+        Self::Cache(value)
+    }
+}
+
+impl From<CapacityAdmissionError> for OperationalMaintenanceError {
+    fn from(value: CapacityAdmissionError) -> Self {
+        Self::Capacity(value)
+    }
+}
+
+impl From<MaintenanceError> for OperationalMaintenanceError {
+    fn from(value: MaintenanceError) -> Self {
+        Self::Maintenance(value)
+    }
+}
+
+impl From<MarkError> for OperationalMaintenanceError {
+    fn from(value: MarkError) -> Self {
+        Self::Mark(value)
+    }
+}
+
+/// Daemon-owned coordinator for derived-cache and cold-generation work.
+///
+/// The supplied catalog has already been opened by trusted daemon bootstrap.
+/// This coordinator opens the cache and generation state itself; opening the
+/// generation manager removes abandoned leases, and then the catalog repairs
+/// the derived active-generation pointer. It deliberately has no socket
+/// command or client-provided path API.
+pub struct OperationalMaintenanceCoordinator<'daemon, C, M> {
+    // Binds the coordinator to the service that holds the instance lock. The
+    // coordinator owns no independent lock, so it may not outlive that
+    // service and reopen/reconcile generation state concurrently.
+    _daemon: PhantomData<&'daemon DaemonService>,
+    config: OperationalMaintenanceConfig,
+    catalog: Mutex<C>,
+    cache: CacheCapacityCoordinator<M>,
+    generations: GenerationManager,
+}
+
+impl<'daemon, C, M> OperationalMaintenanceCoordinator<'daemon, C, M>
+where
+    C: Catalog,
+    M: CapacityMeter,
+{
+    /// Opens and reconciles all daemon-owned maintenance state.
+    ///
+    /// Call this only after the daemon has acquired its per-instance lock.
+    /// [`DaemonService::open_operational_maintenance`] provides that boundary
+    /// for the normal service lifecycle.
+    fn open(
+        catalog: C,
+        config: OperationalMaintenanceConfig,
+        meter: M,
+        reserve_policy: ReservePolicy,
+    ) -> Result<(Self, OperationalMaintenanceStartup), OperationalMaintenanceError> {
+        let cache = Cache::open(config.cache_root())?;
+        let cache_reconciliation = cache.reconcile()?;
+        // GenerationManager::open removes crash-left leases before this
+        // coordinator can issue new reader leases or attempt retirement.
+        let generations = GenerationManager::open(config.generation_state_root())?;
+        let active_generation = reconcile_active_generation(&catalog, &generations)?;
+        let coordinator = Self {
+            _daemon: PhantomData,
+            config,
+            catalog: Mutex::new(catalog),
+            cache: CacheCapacityCoordinator::new(cache, meter, reserve_policy),
+            generations,
+        };
+        Ok((
+            coordinator,
+            OperationalMaintenanceStartup {
+                cache: cache_reconciliation,
+                active_generation,
+            },
+        ))
+    }
+
+    pub fn config(&self) -> &OperationalMaintenanceConfig {
+        &self.config
+    }
+
+    pub fn generation_manager(&self) -> &GenerationManager {
+        &self.generations
+    }
+
+    /// Reads the daemon-held catalog under the coordinator mutex.
+    pub fn with_catalog<T>(&self, read: impl FnOnce(&C) -> T) -> T {
+        let catalog = lock_unpoisoned(&self.catalog);
+        read(&catalog)
+    }
+
+    /// Runs a derived-cache allocation while the reserve-admission lock is
+    /// held. The closure has access only to this coordinator's cache, and is
+    /// not reachable by any local control-socket request.
+    pub fn with_cache_admission<T>(
+        &self,
+        projected_allocation_bytes: u64,
+        allocate: impl FnOnce(&Cache) -> Result<T, CacheError>,
+    ) -> Result<(CapacityAdmission, T), OperationalMaintenanceError> {
+        Ok(self
+            .cache
+            .with_admission(projected_allocation_bytes, allocate)?)
+    }
+
+    /// Publishes a verified blob only after reserving space for its complete
+    /// payload. This is the standard daemon cache-publication path.
+    pub fn publish_cache_blob(
+        &self,
+        content_id: reflink_forest_core::ContentId,
+        bytes: &[u8],
+    ) -> Result<(CapacityAdmission, PathBuf), OperationalMaintenanceError> {
+        let projected_allocation_bytes = u64::try_from(bytes.len())
+            .map_err(|_| OperationalMaintenanceError::AllocationTooLarge(bytes.len()))?;
+        self.with_cache_admission(projected_allocation_bytes, |cache| {
+            cache.publish_blob(content_id, bytes)
+        })
+    }
+
+    /// Retries retirement of a generation already published over by a prior
+    /// compaction. Both generation numbers are durable identifiers; the
+    /// source path is still derived exclusively from daemon configuration.
+    ///
+    /// This is the bounded follow-up operation for a previous
+    /// [`GenerationRetirement::DeferredByPin`] or
+    /// [`GenerationRetirement::DeferredByActiveReaders`] result. It never
+    /// copies data or changes the current generation.
+    pub fn retry_generation_retirement(
+        &self,
+        source_generation: u32,
+        target_generation: u32,
+    ) -> Result<GenerationRetirement, OperationalMaintenanceError> {
+        let catalog = lock_unpoisoned(&self.catalog);
+        self.retire_published_generation(&catalog, source_generation, target_generation)
+    }
+
+    /// Performs one bounded GC cycle using daemon-injected manifest, reader,
+    /// and writer implementations. `MarkLimits` bounds discovery; this method
+    /// compacts exactly one current generation and never accepts a path from a
+    /// client. The caller may enqueue another trusted worker invocation later
+    /// if retirement was deferred by a pin or active reader.
+    pub fn run_gc_once<S, R, W, I>(
+        &self,
+        manifests: &S,
+        reader: &mut R,
+        writer: &mut W,
+        retained: I,
+        limits: MarkLimits,
+    ) -> Result<OperationalGcOutcome, OperationalMaintenanceError>
+    where
+        S: SnapshotManifestSource,
+        R: CompactionReader,
+        W: CompactionWriter,
+        I: IntoIterator<Item = RetainedObjectRef>,
+    {
+        let mut catalog = lock_unpoisoned(&self.catalog);
+        let source_generation = catalog
+            .current_generation()
+            .ok_or(MarkError::NoCurrentGeneration)?;
+        let target_generation = source_generation.checked_add(1).ok_or(
+            OperationalMaintenanceError::GenerationExhausted(source_generation),
+        )?;
+        let marked = completed_mark_set(&*catalog, manifests, reader, retained, limits)?;
+        let compaction = compact_completed_mark_set(
+            &mut *catalog,
+            &self.generations,
+            source_generation,
+            target_generation,
+            &marked,
+            reader,
+            writer,
+        )?;
+        let retirement =
+            self.retire_published_generation(&catalog, source_generation, target_generation)?;
+        Ok(OperationalGcOutcome {
+            marked_objects: marked.len(),
+            compaction,
+            retirement,
+        })
+    }
+
+    fn retire_published_generation(
+        &self,
+        catalog: &C,
+        source_generation: u32,
+        target_generation: u32,
+    ) -> Result<GenerationRetirement, OperationalMaintenanceError> {
+        match retire_compacted_generation(
+            catalog,
+            &self.generations,
+            source_generation,
+            target_generation,
+            self.config.generation_path(source_generation),
+            self.config.trash_root(),
+        ) {
+            Ok(path) => Ok(GenerationRetirement::Retired(path)),
+            Err(MaintenanceError::PinnedGeneration(generation)) => {
+                Ok(GenerationRetirement::DeferredByPin { generation })
+            }
+            Err(MaintenanceError::ActiveReaders(generation)) => {
+                Ok(GenerationRetirement::DeferredByActiveReaders { generation })
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 }
 
@@ -469,6 +1441,19 @@ impl JobStore {
         }
     }
 
+    /// Equivalent to [`Self::execute_next`], with a structured event emitted
+    /// only after the durable result is available. A sink panic is contained
+    /// so telemetry cannot alter a completed job transition.
+    pub fn execute_next_with_events<H: JobHandler, S: OperationEventSink>(
+        &self,
+        handler: &mut H,
+        sink: &mut S,
+    ) -> Result<JobExecutionOutcome, JobError> {
+        let result = self.execute_next(handler);
+        emit_operation_event(sink, job_operation_event(&result));
+        result
+    }
+
     pub fn start(&self, id: JobId) -> Result<JobRecord, JobError> {
         self.update(id, |record| {
             require_transition(record, JobState::Queued, JobState::Running)?;
@@ -665,6 +1650,67 @@ impl JobStore {
         self.jobs_dir.join(format!(
             "{JOB_TEMP_PREFIX}{id}-{nonce:016x}{JOB_TEMP_SUFFIX}"
         ))
+    }
+}
+
+fn job_operation_event(result: &Result<JobExecutionOutcome, JobError>) -> OperationEvent {
+    match result {
+        Ok(JobExecutionOutcome::Idle) => OperationEvent::Job {
+            job: None,
+            outcome: OperationEventOutcome::Idle,
+        },
+        Ok(JobExecutionOutcome::Succeeded(job)) => OperationEvent::Job {
+            job: Some(job.into()),
+            outcome: OperationEventOutcome::Succeeded,
+        },
+        Ok(JobExecutionOutcome::Failed { job, failure }) => OperationEvent::Job {
+            job: Some(job.into()),
+            outcome: OperationEventOutcome::Failed(match failure {
+                JobExecutionFailure::HandlerError => OperationEventFailure::HandlerError,
+                JobExecutionFailure::HandlerPanic => OperationEventFailure::HandlerPanic,
+            }),
+        },
+        Err(_) => OperationEvent::Job {
+            job: None,
+            outcome: OperationEventOutcome::PersistenceFailure,
+        },
+    }
+}
+
+fn maintenance_operation_kind(record: &JobRecord) -> MaintenanceOperationKind {
+    match record.kind.as_slice() {
+        CACHE_RECONCILE_JOB_KIND => MaintenanceOperationKind::CacheReconcile,
+        CACHE_EVICT_JOB_KIND => MaintenanceOperationKind::CacheEvict,
+        VERIFY_COLD_CHUNK_JOB_KIND => MaintenanceOperationKind::VerifyColdChunk,
+        _ => MaintenanceOperationKind::Unsupported,
+    }
+}
+
+fn maintenance_operation_event(result: &Result<JobExecutionOutcome, JobError>) -> OperationEvent {
+    match result {
+        Ok(JobExecutionOutcome::Idle) => OperationEvent::Maintenance {
+            job: None,
+            kind: MaintenanceOperationKind::Unsupported,
+            outcome: OperationEventOutcome::Idle,
+        },
+        Ok(JobExecutionOutcome::Succeeded(job)) => OperationEvent::Maintenance {
+            job: Some(job.into()),
+            kind: maintenance_operation_kind(job),
+            outcome: OperationEventOutcome::Succeeded,
+        },
+        Ok(JobExecutionOutcome::Failed { job, failure }) => OperationEvent::Maintenance {
+            job: Some(job.into()),
+            kind: maintenance_operation_kind(job),
+            outcome: OperationEventOutcome::Failed(match failure {
+                JobExecutionFailure::HandlerError => OperationEventFailure::HandlerError,
+                JobExecutionFailure::HandlerPanic => OperationEventFailure::HandlerPanic,
+            }),
+        },
+        Err(_) => OperationEvent::Maintenance {
+            job: None,
+            kind: MaintenanceOperationKind::Unsupported,
+            outcome: OperationEventOutcome::PersistenceFailure,
+        },
     }
 }
 
@@ -1023,6 +2069,55 @@ impl From<io::Error> for ScrubScheduleError {
     }
 }
 
+/// The verified operation performed for one due cold-store scrub.
+///
+/// A handler receives the durable `Running` checkpoint, rather than an
+/// inferred timer value. Implementations should use that checkpoint as their
+/// idempotency key and must verify the records they inspect (including raw
+/// payload and [`reflink_forest_format::ContentId`] checks where applicable).
+/// The scheduler intentionally owns no cold-store handle itself, so callers
+/// can inject the exact verifier for their deployment.
+pub trait ScrubHandler {
+    type Error;
+
+    fn scrub(&mut self, schedule: &ScrubScheduleState) -> Result<(), Self::Error>;
+}
+
+impl<F, E> ScrubHandler for F
+where
+    F: FnMut(&ScrubScheduleState) -> Result<(), E>,
+{
+    type Error = E;
+
+    fn scrub(&mut self, schedule: &ScrubScheduleState) -> Result<(), Self::Error> {
+        self(schedule)
+    }
+}
+
+/// Why a due scrub did not complete. The durable schedule preserves the
+/// failure count and next due time; detailed verifier diagnostics belong to
+/// the verifier's own bounded log rather than this fixed-size timer record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScrubExecutionFailure {
+    HandlerError,
+    HandlerPanic,
+}
+
+/// Result of attempting at most one scheduled scrub.
+///
+/// No polling loop is hidden here: a caller receives `NotDue` when the
+/// durable cadence has not elapsed and must invoke the method again later.
+/// This keeps each daemon worker turn bounded to one verifier call.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ScrubExecutionOutcome {
+    NotDue,
+    Succeeded(ScrubScheduleState),
+    Failed {
+        schedule: ScrubScheduleState,
+        failure: ScrubExecutionFailure,
+    },
+}
+
 /// File-backed durable state for the internal scrub scheduler.
 ///
 /// The record is a fixed-size, versioned, checksummed binary value. Every
@@ -1105,6 +2200,52 @@ impl ScrubScheduleStore {
         schedule.last_started_unix_seconds = Some(now_unix_seconds);
         self.write_locked(schedule)?;
         Ok(Some(schedule.clone()))
+    }
+
+    /// Claims and executes at most one due scrub through `handler`.
+    ///
+    /// The `Idle -> Running` checkpoint is synchronized before the handler is
+    /// called. A completed handler is followed by a synchronized success
+    /// checkpoint; an error or panic is followed by a synchronized failure
+    /// checkpoint. A process crash between those boundaries is recovered by
+    /// [`Self::open`] as immediately-due idle work, so handlers must be
+    /// idempotent for the durable run they receive.
+    pub fn execute_if_due_at<H: ScrubHandler>(
+        &self,
+        now_unix_seconds: u64,
+        handler: &mut H,
+    ) -> Result<ScrubExecutionOutcome, ScrubScheduleError> {
+        let Some(running) = self.begin_if_due_at(now_unix_seconds)? else {
+            return Ok(ScrubExecutionOutcome::NotDue);
+        };
+
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler.scrub(&running))) {
+            Ok(Ok(())) => Ok(ScrubExecutionOutcome::Succeeded(
+                self.complete_success_at(now_unix_seconds)?,
+            )),
+            Ok(Err(_)) => Ok(ScrubExecutionOutcome::Failed {
+                schedule: self.complete_failure_at(now_unix_seconds)?,
+                failure: ScrubExecutionFailure::HandlerError,
+            }),
+            Err(_) => Ok(ScrubExecutionOutcome::Failed {
+                schedule: self.complete_failure_at(now_unix_seconds)?,
+                failure: ScrubExecutionFailure::HandlerPanic,
+            }),
+        }
+    }
+
+    /// Equivalent to [`Self::execute_if_due_at`], with a bounded structured
+    /// event emitted after the schedule transition has completed. The event
+    /// has no verifier diagnostic or mount-path field.
+    pub fn execute_if_due_at_with_events<H: ScrubHandler, S: OperationEventSink>(
+        &self,
+        now_unix_seconds: u64,
+        handler: &mut H,
+        sink: &mut S,
+    ) -> Result<ScrubExecutionOutcome, ScrubScheduleError> {
+        let result = self.execute_if_due_at(now_unix_seconds, handler);
+        emit_operation_event(sink, scrub_operation_event(&result));
+        result
     }
 
     /// Persists a successful scrub and schedules the following run from its
@@ -1236,6 +2377,32 @@ impl ScrubScheduleStore {
             sync_directory(&self.state_root)?;
         }
         Ok(())
+    }
+}
+
+fn scrub_operation_event(
+    result: &Result<ScrubExecutionOutcome, ScrubScheduleError>,
+) -> OperationEvent {
+    match result {
+        Ok(ScrubExecutionOutcome::NotDue) => OperationEvent::Scrub {
+            schedule: None,
+            outcome: OperationEventOutcome::Idle,
+        },
+        Ok(ScrubExecutionOutcome::Succeeded(schedule)) => OperationEvent::Scrub {
+            schedule: Some(schedule.into()),
+            outcome: OperationEventOutcome::Succeeded,
+        },
+        Ok(ScrubExecutionOutcome::Failed { schedule, failure }) => OperationEvent::Scrub {
+            schedule: Some(schedule.into()),
+            outcome: OperationEventOutcome::Failed(match failure {
+                ScrubExecutionFailure::HandlerError => OperationEventFailure::HandlerError,
+                ScrubExecutionFailure::HandlerPanic => OperationEventFailure::HandlerPanic,
+            }),
+        },
+        Err(_) => OperationEvent::Scrub {
+            schedule: None,
+            outcome: OperationEventOutcome::PersistenceFailure,
+        },
     }
 }
 
@@ -1459,6 +2626,61 @@ pub struct MigrationStatus {
     pub resumable: bool,
 }
 
+/// The externally-owned work needed to finish a format migration.
+///
+/// Both methods must be idempotent for `migration.id`: a crash after a
+/// callback returns but before the following durable state transition causes
+/// the callback to be invoked again after restart. `verify_and_publish` must
+/// structurally verify the target generation and atomically make it active
+/// before returning success. Only then will [`MigrationStore`] persist its
+/// final `Published` marker.
+pub trait MigrationHandler {
+    type Error;
+
+    /// Creates or resumes the target files/generation for a copying
+    /// checkpoint. This method must not make the target authoritative.
+    fn copy(&mut self, migration: &MigrationRecord) -> Result<(), Self::Error>;
+
+    /// Verifies the completed target and atomically publishes the external
+    /// catalog/generation switch. It may be retried after that switch has
+    /// succeeded but before the migration marker was persisted.
+    fn verify_and_publish(&mut self, migration: &MigrationRecord) -> Result<(), Self::Error>;
+}
+
+/// The bounded phase attempted by [`MigrationStore::execute_once`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MigrationExecutionPhase {
+    Copying,
+    VerifyingAndPublishing,
+}
+
+/// Why one external migration phase did not complete.
+///
+/// The durable migration checkpoint remains unchanged after this outcome, so
+/// the same idempotent phase is available to a later worker or restart.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MigrationExecutionFailure {
+    HandlerError,
+    HandlerPanic,
+}
+
+/// Result of one bounded migration worker turn.
+///
+/// Each invocation runs at most one external handler method. Copying output
+/// advances only to `Validating`; verification and external publication run
+/// only from that durable checkpoint and are followed by the final marker.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MigrationExecutionOutcome {
+    Idle,
+    Advanced(MigrationRecord),
+    Published(MigrationRecord),
+    Failed {
+        migration: MigrationRecord,
+        phase: MigrationExecutionPhase,
+        failure: MigrationExecutionFailure,
+    },
+}
+
 #[derive(Debug)]
 pub enum MigrationError {
     Io(io::Error),
@@ -1540,6 +2762,9 @@ pub struct MigrationStore {
     record_path: PathBuf,
     configured_active_format_version: u16,
     state: Mutex<Option<MigrationRecord>>,
+    /// Serializes in-process worker turns without holding the state mutex
+    /// across externally supplied callbacks.
+    execution_lock: Mutex<()>,
 }
 
 impl MigrationStore {
@@ -1562,6 +2787,7 @@ impl MigrationStore {
             state_root,
             configured_active_format_version,
             state: Mutex::new(None),
+            execution_lock: Mutex::new(()),
         };
         store.remove_stale_temporaries()?;
         let record = read_migration_record(&store.record_path)?;
@@ -1675,6 +2901,78 @@ impl MigrationStore {
         self.transition(MigrationState::Validating, MigrationState::Published)
     }
 
+    /// Executes at most one durable migration phase through `handler`.
+    ///
+    /// There is no implicit loop or state guessing: a copying checkpoint runs
+    /// only `MigrationHandler::copy` and then durably advances to validation.
+    /// A validating checkpoint runs only `verify_and_publish`; its external
+    /// publication must succeed before the durable marker is written. The
+    /// process-local worker lock prevents duplicate simultaneous callbacks,
+    /// while the on-disk checkpoint makes a crash safe to retry after restart.
+    pub fn execute_once<H: MigrationHandler>(
+        &self,
+        handler: &mut H,
+    ) -> Result<MigrationExecutionOutcome, MigrationError> {
+        let _execution = lock_unpoisoned(&self.execution_lock);
+        let Some(migration) = self.record() else {
+            return Ok(MigrationExecutionOutcome::Idle);
+        };
+
+        match migration.state {
+            MigrationState::NotStarted => Ok(MigrationExecutionOutcome::Idle),
+            MigrationState::Published => Ok(MigrationExecutionOutcome::Published(migration)),
+            MigrationState::Copying => {
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    handler.copy(&migration)
+                })) {
+                    Ok(Ok(())) => Ok(MigrationExecutionOutcome::Advanced(
+                        self.begin_validation()?,
+                    )),
+                    Ok(Err(_)) => Ok(MigrationExecutionOutcome::Failed {
+                        migration,
+                        phase: MigrationExecutionPhase::Copying,
+                        failure: MigrationExecutionFailure::HandlerError,
+                    }),
+                    Err(_) => Ok(MigrationExecutionOutcome::Failed {
+                        migration,
+                        phase: MigrationExecutionPhase::Copying,
+                        failure: MigrationExecutionFailure::HandlerPanic,
+                    }),
+                }
+            }
+            MigrationState::Validating => {
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    handler.verify_and_publish(&migration)
+                })) {
+                    Ok(Ok(())) => Ok(MigrationExecutionOutcome::Published(self.publish()?)),
+                    Ok(Err(_)) => Ok(MigrationExecutionOutcome::Failed {
+                        migration,
+                        phase: MigrationExecutionPhase::VerifyingAndPublishing,
+                        failure: MigrationExecutionFailure::HandlerError,
+                    }),
+                    Err(_) => Ok(MigrationExecutionOutcome::Failed {
+                        migration,
+                        phase: MigrationExecutionPhase::VerifyingAndPublishing,
+                        failure: MigrationExecutionFailure::HandlerPanic,
+                    }),
+                }
+            }
+        }
+    }
+
+    /// Equivalent to [`Self::execute_once`], with a bounded structured event
+    /// emitted after the durable phase result is known. It never exposes an
+    /// external migration path or handler diagnostic.
+    pub fn execute_once_with_events<H: MigrationHandler, S: OperationEventSink>(
+        &self,
+        handler: &mut H,
+        sink: &mut S,
+    ) -> Result<MigrationExecutionOutcome, MigrationError> {
+        let result = self.execute_once(handler);
+        emit_operation_event(sink, migration_operation_event(&result));
+        result
+    }
+
     fn transition(
         &self,
         expected: MigrationState,
@@ -1758,6 +3056,35 @@ impl MigrationStore {
             sync_directory(&self.state_root)?;
         }
         Ok(())
+    }
+}
+
+fn migration_operation_event(
+    result: &Result<MigrationExecutionOutcome, MigrationError>,
+) -> OperationEvent {
+    match result {
+        Ok(MigrationExecutionOutcome::Idle) => OperationEvent::Migration {
+            migration: None,
+            outcome: OperationEventOutcome::Idle,
+        },
+        Ok(MigrationExecutionOutcome::Advanced(migration))
+        | Ok(MigrationExecutionOutcome::Published(migration)) => OperationEvent::Migration {
+            migration: Some(migration.into()),
+            outcome: OperationEventOutcome::Succeeded,
+        },
+        Ok(MigrationExecutionOutcome::Failed {
+            migration, failure, ..
+        }) => OperationEvent::Migration {
+            migration: Some(migration.into()),
+            outcome: OperationEventOutcome::Failed(match failure {
+                MigrationExecutionFailure::HandlerError => OperationEventFailure::HandlerError,
+                MigrationExecutionFailure::HandlerPanic => OperationEventFailure::HandlerPanic,
+            }),
+        },
+        Err(_) => OperationEvent::Migration {
+            migration: None,
+            outcome: OperationEventOutcome::PersistenceFailure,
+        },
     }
 }
 
@@ -2576,6 +3903,52 @@ impl DaemonService {
             .configure_at(interval_seconds, current_unix_seconds()?)?)
     }
 
+    /// Runs at most one due scrub through the daemon-owned durable scheduler.
+    /// The injected handler is responsible for the actual cold-store record
+    /// verification; this service method supplies the daemon clock and
+    /// durable crash-recovery boundary.
+    pub fn execute_due_scrub<H: ScrubHandler>(
+        &self,
+        handler: &mut H,
+    ) -> Result<ScrubExecutionOutcome, DaemonServiceError> {
+        Ok(self
+            .scrubs
+            .execute_if_due_at(current_unix_seconds()?, handler)?)
+    }
+
+    /// Runs at most one migration phase. The handler owns construction,
+    /// verification, and atomic external publication of the new generation;
+    /// the daemon owns only the durable phase checkpoint and restart policy.
+    pub fn execute_migration_once<H: MigrationHandler>(
+        &self,
+        handler: &mut H,
+    ) -> Result<MigrationExecutionOutcome, DaemonServiceError> {
+        Ok(self.migrations.execute_once(handler)?)
+    }
+
+    /// Opens the trusted operational-maintenance coordinator while this
+    /// daemon service owns the instance lock. No socket command constructs
+    /// this coordinator or supplies any of its filesystem roots.
+    pub fn open_operational_maintenance<'daemon, C, M>(
+        &'daemon self,
+        catalog: C,
+        config: OperationalMaintenanceConfig,
+        meter: M,
+        reserve_policy: ReservePolicy,
+    ) -> Result<
+        (
+            OperationalMaintenanceCoordinator<'daemon, C, M>,
+            OperationalMaintenanceStartup,
+        ),
+        OperationalMaintenanceError,
+    >
+    where
+        C: Catalog,
+        M: CapacityMeter,
+    {
+        OperationalMaintenanceCoordinator::open(catalog, config, meter, reserve_policy)
+    }
+
     pub fn status(&self) -> Result<DaemonStatus, DaemonServiceError> {
         Ok(DaemonStatus {
             runtime_dir: self.config.runtime_dir.clone(),
@@ -2795,6 +4168,56 @@ mod tests {
         MigrationId::from_bytes([value; 16])
     }
 
+    #[derive(Default)]
+    struct RecordingScrubHandler {
+        runs: Vec<ScrubScheduleState>,
+        fail: bool,
+        panic: bool,
+    }
+
+    impl ScrubHandler for RecordingScrubHandler {
+        type Error = &'static str;
+
+        fn scrub(&mut self, schedule: &ScrubScheduleState) -> Result<(), Self::Error> {
+            self.runs.push(schedule.clone());
+            if self.panic {
+                panic!("injected scrub verifier panic");
+            }
+            if self.fail {
+                return Err("injected scrub verification failure");
+            }
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingMigrationHandler {
+        copy_calls: Vec<MigrationId>,
+        verify_calls: Vec<MigrationId>,
+        fail_copy: bool,
+        panic_verify: bool,
+    }
+
+    impl MigrationHandler for RecordingMigrationHandler {
+        type Error = &'static str;
+
+        fn copy(&mut self, migration: &MigrationRecord) -> Result<(), Self::Error> {
+            self.copy_calls.push(migration.id);
+            if self.fail_copy {
+                return Err("injected copying failure");
+            }
+            Ok(())
+        }
+
+        fn verify_and_publish(&mut self, migration: &MigrationRecord) -> Result<(), Self::Error> {
+            self.verify_calls.push(migration.id);
+            if self.panic_verify {
+                panic!("injected migration verifier panic");
+            }
+            Ok(())
+        }
+    }
+
     #[test]
     fn migration_is_resumable_and_never_selects_a_partial_target_after_restart() {
         let root = dir();
@@ -2929,6 +4352,77 @@ mod tests {
     }
 
     #[test]
+    fn migration_executor_is_phase_bounded_and_retries_durable_checkpoints() {
+        let root = dir();
+        fs::create_dir_all(&root).unwrap();
+        let store = MigrationStore::open(&root, 1).unwrap();
+        let migration = store.begin_with_id(migration_id(0xa6), 2).unwrap();
+        let mut handler = RecordingMigrationHandler {
+            fail_copy: true,
+            ..RecordingMigrationHandler::default()
+        };
+
+        assert!(matches!(
+            store.execute_once(&mut handler).unwrap(),
+            MigrationExecutionOutcome::Failed {
+                migration: ref found,
+                phase: MigrationExecutionPhase::Copying,
+                failure: MigrationExecutionFailure::HandlerError,
+            } if found == &migration
+        ));
+        assert_eq!(handler.copy_calls, vec![migration.id]);
+        assert_eq!(store.status().state, MigrationState::Copying);
+
+        handler.fail_copy = false;
+        let validating = match store.execute_once(&mut handler).unwrap() {
+            MigrationExecutionOutcome::Advanced(record) => record,
+            outcome => panic!("expected copying to advance, got {outcome:?}"),
+        };
+        assert_eq!(validating.state, MigrationState::Validating);
+        assert_eq!(validating.transition_count, 2);
+        assert_eq!(handler.copy_calls, vec![migration.id, migration.id]);
+        drop(store);
+
+        let restarted = MigrationStore::open(&root, 1).unwrap();
+        let mut panicking = RecordingMigrationHandler {
+            panic_verify: true,
+            ..RecordingMigrationHandler::default()
+        };
+        assert!(matches!(
+            restarted.execute_once(&mut panicking).unwrap(),
+            MigrationExecutionOutcome::Failed {
+                migration: ref found,
+                phase: MigrationExecutionPhase::VerifyingAndPublishing,
+                failure: MigrationExecutionFailure::HandlerPanic,
+            } if found == &validating
+        ));
+        assert_eq!(panicking.verify_calls, vec![migration.id]);
+        assert_eq!(restarted.status().state, MigrationState::Validating);
+        drop(restarted);
+
+        let restarted = MigrationStore::open(&root, 1).unwrap();
+        let mut publishing = RecordingMigrationHandler::default();
+        let published = match restarted.execute_once(&mut publishing).unwrap() {
+            MigrationExecutionOutcome::Published(record) => record,
+            outcome => panic!("expected validation to publish, got {outcome:?}"),
+        };
+        assert_eq!(published.state, MigrationState::Published);
+        assert_eq!(published.transition_count, 3);
+        assert_eq!(publishing.verify_calls, vec![migration.id]);
+        assert_eq!(
+            restarted.execute_once(&mut publishing).unwrap(),
+            MigrationExecutionOutcome::Published(published.clone())
+        );
+        assert_eq!(publishing.verify_calls, vec![migration.id]);
+        drop(restarted);
+
+        let published_store = MigrationStore::open(&root, 2).unwrap();
+        assert_eq!(published_store.status().migration, Some(published));
+        drop(published_store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn scrub_schedule_is_versioned_bounded_and_recovers_interrupted_work() {
         let root = dir();
         fs::create_dir_all(&root).unwrap();
@@ -2973,6 +4467,69 @@ mod tests {
 
         let reloaded = ScrubScheduleStore::open(&root, 202).unwrap();
         assert_eq!(reloaded.state().unwrap(), completed);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scrub_executor_is_due_bounded_and_persists_verifier_outcomes() {
+        let root = dir();
+        fs::create_dir_all(&root).unwrap();
+        let store = ScrubScheduleStore::open(&root, 100).unwrap();
+        store.configure_at(MIN_SCRUB_INTERVAL_SECONDS, 100).unwrap();
+        let mut handler = RecordingScrubHandler::default();
+
+        assert_eq!(
+            store.execute_if_due_at(159, &mut handler).unwrap(),
+            ScrubExecutionOutcome::NotDue
+        );
+        assert!(handler.runs.is_empty());
+
+        let succeeded = match store.execute_if_due_at(160, &mut handler).unwrap() {
+            ScrubExecutionOutcome::Succeeded(schedule) => schedule,
+            outcome => panic!("expected successful scrub, got {outcome:?}"),
+        };
+        assert_eq!(handler.runs.len(), 1);
+        assert_eq!(handler.runs[0].run_state, ScrubRunState::Running);
+        assert_eq!(handler.runs[0].last_started_unix_seconds, Some(160));
+        assert_eq!(succeeded.run_state, ScrubRunState::Idle);
+        assert_eq!(succeeded.next_due_unix_seconds, 220);
+        assert_eq!(succeeded.consecutive_failures, 0);
+
+        handler.fail = true;
+        assert!(matches!(
+            store.execute_if_due_at(220, &mut handler).unwrap(),
+            ScrubExecutionOutcome::Failed {
+                schedule: ScrubScheduleState {
+                    run_state: ScrubRunState::Idle,
+                    next_due_unix_seconds: 280,
+                    consecutive_failures: 1,
+                    ..
+                },
+                failure: ScrubExecutionFailure::HandlerError,
+            }
+        ));
+
+        handler.fail = false;
+        handler.panic = true;
+        assert!(matches!(
+            store.execute_if_due_at(280, &mut handler).unwrap(),
+            ScrubExecutionOutcome::Failed {
+                schedule: ScrubScheduleState {
+                    run_state: ScrubRunState::Idle,
+                    next_due_unix_seconds: 340,
+                    consecutive_failures: 2,
+                    ..
+                },
+                failure: ScrubExecutionFailure::HandlerPanic,
+            }
+        ));
+        assert_eq!(handler.runs.len(), 3);
+        let expected = store.state().unwrap();
+        drop(store);
+
+        let restarted = ScrubScheduleStore::open(&root, 281).unwrap();
+        assert_eq!(restarted.state(), Some(expected));
+        drop(restarted);
         fs::remove_dir_all(root).unwrap();
     }
 

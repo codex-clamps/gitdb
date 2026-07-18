@@ -18,6 +18,9 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(feature = "rocksdb-catalog")]
+use reflink_forest_index::{Catalog, RocksDbCatalog, CATALOG_VERSION};
+
 #[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
@@ -83,6 +86,26 @@ pub struct ColdTierCheckpointDescriptor {
     pub catalog_digest: [u8; 32],
     pub config_digest: [u8; 32],
     pub pins_manifest_digest: [u8; 32],
+}
+
+/// The caller-supplied logical portion of a cold-tier checkpoint descriptor.
+///
+/// A RocksDB checkpoint has a newly-created physical catalog tree, so its
+/// digest cannot safely be guessed from a live database directory. The
+/// RocksDB-aware checkpoint API accepts this plan and derives all three
+/// authoritative digests only after it has constructed the staged snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ColdTierCheckpointPlan {
+    pub catalog_schema_version: u32,
+    pub active_generation: u32,
+    pub chunks: Vec<ColdChunkDescriptor>,
+}
+
+/// The authenticated result of creating a cold-tier checkpoint.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ColdTierCheckpoint {
+    pub manifest: BackupManifest,
+    pub descriptor: ColdTierCheckpointDescriptor,
 }
 
 /// One explicit cold chunk filename associated with a descriptor identity.
@@ -242,8 +265,15 @@ impl ColdTierAuthoritativePaths {
     }
 }
 
-/// The daemon supplies this guard to pause writers and force the catalog/chunk
+/// The daemon supplies this guard to freeze writers at the catalog/chunk
 /// durability boundary before authoritative cold-tier paths are copied.
+///
+/// `quiesce_and_sync` is not merely an fsync hook: the implementation must
+/// retain exclusive access to every authoritative writer until the enclosing
+/// checkpoint function returns. A guard that resumes writers after this method
+/// returns is not safe for [`checkpoint_cold_tier`], because the generic
+/// fallback copies ordinary files rather than a database-engine snapshot.
+/// Use [`checkpoint_cold_tier_rocksdb`] for a live RocksDB catalog.
 pub trait CheckpointGuard {
     fn quiesce_and_sync(&self) -> Result<(), BackupError>;
 }
@@ -254,6 +284,7 @@ pub enum BackupError {
     InvalidManifest,
     InvalidColdTierLayout,
     VerificationFailed(PathBuf),
+    CatalogCheckpoint(String),
     DestinationExists,
     UnsafeDestination(PathBuf),
 }
@@ -272,6 +303,9 @@ impl std::fmt::Display for BackupError {
             }
             Self::VerificationFailed(path) => {
                 write!(f, "backup verification failed: {}", path.display())
+            }
+            Self::CatalogCheckpoint(error) => {
+                write!(f, "RocksDB catalog checkpoint failed: {error}")
             }
             Self::DestinationExists => write!(f, "backup destination already exists"),
             Self::UnsafeDestination(path) => write!(
@@ -293,6 +327,11 @@ impl std::fmt::Display for BackupError {
 /// validated before publication. The generic file inventory remains backward
 /// compatible; consumers requiring cold-tier recovery must also supply these
 /// same explicit layouts to [`restore_cold_tier`].
+///
+/// This is a fallback for a regular-file catalog or for a caller that keeps
+/// the full authoritative writer set exclusively frozen for this entire call,
+/// as required by [`CheckpointGuard`]. It must not be used to copy a live
+/// RocksDB directory; use [`checkpoint_cold_tier_rocksdb`] instead.
 pub fn checkpoint_cold_tier<G: CheckpointGuard>(
     guard: &G,
     source: impl AsRef<Path>,
@@ -326,7 +365,7 @@ pub fn load_cold_tier_descriptor(
     File::open(root.as_ref().join(COLD_DESCRIPTOR_FILE_NAME))?
         .take((MAX_COLD_DESCRIPTOR_BYTES + 1) as u64)
         .read_to_end(&mut bytes)?;
-    decode_cold_descriptor(&bytes)
+    decode_cold_tier_checkpoint_descriptor_bytes(&bytes)
 }
 /// Requires generic inventory verification, a valid cold-tier descriptor, and
 /// descriptor-digest and chunk-inventory matches for the supplied explicit
@@ -349,9 +388,176 @@ pub fn restore_cold_tier(
     verify_cold_descriptor_authority(backup_root, &descriptor, authoritative_paths)?;
     verify_cold_descriptor_chunks(backup_root, &descriptor, chunk_paths, Some(manifest))?;
     let destination = destination.as_ref();
-    restore(backup_root, manifest, destination)?;
-    verify_cold_descriptor_authority(destination, &descriptor, authoritative_paths)?;
-    verify_cold_descriptor_chunks(destination, &descriptor, chunk_paths, Some(manifest))
+    restore_with_verification(backup_root, manifest, destination, |temporary| {
+        verify_cold_descriptor_authority(temporary, &descriptor, authoritative_paths)?;
+        verify_cold_descriptor_chunks(temporary, &descriptor, chunk_paths, Some(manifest))
+    })
+}
+
+/// Creates a cold-tier checkpoint using RocksDB's native checkpoint API for
+/// its authoritative catalog tree.
+///
+/// Unlike [`checkpoint_cold_tier`], this never copies a live RocksDB directory
+/// as ordinary files. It creates a database-engine-consistent checkpoint in a
+/// private staging tree, opens and schema-validates that fresh checkpoint,
+/// derives the descriptor digests from the staged bytes, then publishes the
+/// complete backup atomically. The supplied [`CheckpointGuard`] must still
+/// retain the cold-store writer freeze through this call so chunk prefixes,
+/// configuration, pins, and the catalog checkpoint share one boundary.
+#[cfg(feature = "rocksdb-catalog")]
+pub fn checkpoint_cold_tier_rocksdb<G: CheckpointGuard>(
+    guard: &G,
+    catalog: &RocksDbCatalog,
+    source: impl AsRef<Path>,
+    destination: impl AsRef<Path>,
+    plan: &ColdTierCheckpointPlan,
+    authoritative_paths: &ColdTierAuthoritativePaths,
+    chunk_paths: &ColdTierChunkPaths,
+) -> Result<ColdTierCheckpoint, BackupError> {
+    guard.quiesce_and_sync()?;
+    if plan.catalog_schema_version != u32::from(CATALOG_VERSION) {
+        return Err(BackupError::CatalogCheckpoint(format!(
+            "descriptor schema {} does not match RocksDB catalog schema {}",
+            plan.catalog_schema_version, CATALOG_VERSION
+        )));
+    }
+    if catalog.current_generation() != Some(plan.active_generation) {
+        return Err(BackupError::CatalogCheckpoint(format!(
+            "descriptor active generation {} does not match the live catalog",
+            plan.active_generation
+        )));
+    }
+    let template = ColdTierCheckpointDescriptor {
+        catalog_schema_version: plan.catalog_schema_version,
+        active_generation: plan.active_generation,
+        chunks: plan.chunks.clone(),
+        catalog_digest: [0; 32],
+        config_digest: [0; 32],
+        pins_manifest_digest: [0; 32],
+    };
+    validate_cold_descriptor(&template)?;
+    validate_cold_tier_layout(&template, authoritative_paths, chunk_paths)?;
+
+    let source = source.as_ref();
+    require_catalog_directory(source, authoritative_paths.catalog())?;
+    let destination = destination.as_ref();
+    if destination.exists() {
+        return Err(BackupError::DestinationExists);
+    }
+    let parent = destination.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "backup destination has no parent",
+        )
+    })?;
+    if fs::symlink_metadata(parent)?.file_type().is_symlink() || !parent.is_dir() {
+        return Err(BackupError::UnsafeDestination(parent.to_path_buf()));
+    }
+    let temporary = parent.join(format!(".checkpoint-{}-{}", process::id(), nonce()));
+    fs::create_dir(&temporary)?;
+    let result = (|| {
+        copy_tree_except(source, source, &temporary, authoritative_paths.catalog())?;
+        let staged_catalog = temporary.join(authoritative_paths.catalog());
+        if let Some(catalog_parent) = staged_catalog.parent() {
+            fs::create_dir_all(catalog_parent)?;
+        }
+        catalog
+            .create_checkpoint(&staged_catalog)
+            .map_err(|error| BackupError::CatalogCheckpoint(error.to_string()))?;
+        let checkpoint_generation = RocksDbCatalog::validate_checkpoint(&staged_catalog)
+            .map_err(|error| BackupError::CatalogCheckpoint(error.to_string()))?;
+        if checkpoint_generation != Some(plan.active_generation) {
+            return Err(BackupError::CatalogCheckpoint(format!(
+                "staged catalog generation does not match descriptor generation {}",
+                plan.active_generation
+            )));
+        }
+
+        let digests = authoritative_paths.digests(&temporary)?;
+        let descriptor = ColdTierCheckpointDescriptor {
+            catalog_schema_version: plan.catalog_schema_version,
+            active_generation: plan.active_generation,
+            chunks: plan.chunks.clone(),
+            catalog_digest: digests.catalog_digest,
+            config_digest: digests.config_digest,
+            pins_manifest_digest: digests.pins_manifest_digest,
+        };
+        verify_cold_descriptor_authority(&temporary, &descriptor, authoritative_paths)?;
+        verify_cold_descriptor_chunks(&temporary, &descriptor, chunk_paths, None)?;
+
+        let mut files = Vec::new();
+        inventory_tree(&temporary, &temporary, &mut files)?;
+        files.sort_by(|left, right| left.relative.cmp(&right.relative));
+        let manifest = BackupManifest { files };
+        write_manifest(&temporary, &manifest)?;
+        verify_tree(&temporary, &manifest)?;
+
+        let descriptor_path = temporary.join(COLD_DESCRIPTOR_FILE_NAME);
+        let descriptor_bytes = encode_cold_descriptor(&descriptor)?;
+        let mut descriptor_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(descriptor_path)?;
+        descriptor_file.write_all(&descriptor_bytes)?;
+        descriptor_file.sync_all()?;
+        File::open(&temporary)?.sync_all()?;
+        fs::rename(&temporary, destination)?;
+        File::open(parent)?.sync_all()?;
+        Ok(ColdTierCheckpoint {
+            manifest,
+            descriptor,
+        })
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&temporary);
+    }
+    result
+}
+
+/// Restores a RocksDB-backed cold-tier checkpoint only after a fresh read-only
+/// catalog open and complete catalog-v1 schema validation succeed in the
+/// private restore tree. That short-lived validation handle is dropped before
+/// the helper renames the staging tree; the writable catalog returned here is
+/// opened only after publication. The destination is never published when
+/// catalog validation fails.
+#[cfg(feature = "rocksdb-catalog")]
+pub fn restore_cold_tier_rocksdb(
+    backup_root: impl AsRef<Path>,
+    manifest: &BackupManifest,
+    destination: impl AsRef<Path>,
+    authoritative_paths: &ColdTierAuthoritativePaths,
+    chunk_paths: &ColdTierChunkPaths,
+) -> Result<RocksDbCatalog, BackupError> {
+    let backup_root = backup_root.as_ref();
+    let descriptor = load_cold_tier_descriptor(backup_root)?;
+    if descriptor.catalog_schema_version != u32::from(CATALOG_VERSION) {
+        return Err(BackupError::CatalogCheckpoint(format!(
+            "checkpoint schema {} does not match RocksDB catalog schema {}",
+            descriptor.catalog_schema_version, CATALOG_VERSION
+        )));
+    }
+    validate_cold_tier_layout(&descriptor, authoritative_paths, chunk_paths)?;
+    verify_tree(backup_root, manifest)?;
+    verify_cold_descriptor_authority(backup_root, &descriptor, authoritative_paths)?;
+    verify_cold_descriptor_chunks(backup_root, &descriptor, chunk_paths, Some(manifest))?;
+
+    let destination = destination.as_ref();
+    restore_with_verification(backup_root, manifest, destination, |temporary| {
+        verify_cold_descriptor_authority(temporary, &descriptor, authoritative_paths)?;
+        verify_cold_descriptor_chunks(temporary, &descriptor, chunk_paths, Some(manifest))?;
+        let checkpoint_generation =
+            RocksDbCatalog::validate_checkpoint(temporary.join(authoritative_paths.catalog()))
+                .map_err(|error| BackupError::CatalogCheckpoint(error.to_string()))?;
+        if checkpoint_generation != Some(descriptor.active_generation) {
+            return Err(BackupError::CatalogCheckpoint(format!(
+                "restored catalog generation does not match descriptor generation {}",
+                descriptor.active_generation
+            )));
+        }
+        Ok(())
+    })?;
+    RocksDbCatalog::open_existing(destination.join(authoritative_paths.catalog()))
+        .map_err(|error| BackupError::CatalogCheckpoint(error.to_string()))
 }
 impl std::error::Error for BackupError {}
 impl From<io::Error> for BackupError {
@@ -420,7 +626,7 @@ pub fn read_manifest(path: impl AsRef<Path>) -> Result<BackupManifest, BackupErr
     File::open(path)?
         .take(MAX_MANIFEST_BYTES + 1)
         .read_to_end(&mut bytes)?;
-    decode_manifest(&bytes)
+    decode_backup_manifest_bytes(&bytes)
 }
 
 /// Verifies copied data against the manifest before accepting a restore point.
@@ -444,8 +650,23 @@ pub fn restore(
     manifest: &BackupManifest,
     destination: impl AsRef<Path>,
 ) -> Result<(), BackupError> {
-    let backup_root = backup_root.as_ref();
-    let destination = destination.as_ref();
+    restore_with_verification(backup_root.as_ref(), manifest, destination.as_ref(), |_| {
+        Ok(())
+    })
+}
+
+/// Restores into a private directory and runs `verify` before atomically
+/// publishing the destination. Cold-tier restore uses this to reject an
+/// invalid catalog or chunk inventory before it becomes visible.
+fn restore_with_verification<F>(
+    backup_root: &Path,
+    manifest: &BackupManifest,
+    destination: &Path,
+    verify: F,
+) -> Result<(), BackupError>
+where
+    F: FnOnce(&Path) -> Result<(), BackupError>,
+{
     if destination.exists() {
         return Err(BackupError::DestinationExists);
     }
@@ -485,6 +706,7 @@ pub fn restore(
             output.sync_all()?;
         }
         verify_tree(&temporary, manifest)?;
+        verify(&temporary)?;
         File::open(&temporary)?.sync_all()?;
         fs::rename(&temporary, destination)?;
         File::open(parent)?.sync_all()?;
@@ -536,6 +758,97 @@ fn copy_tree(
         }
     }
     Ok(())
+}
+
+/// Copies a trusted cold-tier source while omitting exactly one authoritative
+/// catalog directory. The RocksDB checkpoint API replaces that omitted tree;
+/// copying the live directory as normal files would not be a consistent
+/// database snapshot.
+#[cfg(feature = "rocksdb-catalog")]
+fn copy_tree_except(
+    source_root: &Path,
+    current: &Path,
+    destination: &Path,
+    excluded: &Path,
+) -> Result<(), BackupError> {
+    for entry in fs::read_dir(current)? {
+        let entry = entry?;
+        let source = entry.path();
+        let metadata = fs::symlink_metadata(&source)?;
+        let relative = source
+            .strip_prefix(source_root)
+            .expect("source remains beneath root");
+        if relative == excluded {
+            if !metadata.file_type().is_dir() {
+                return Err(BackupError::VerificationFailed(relative.to_path_buf()));
+            }
+            continue;
+        }
+        let target = destination.join(relative);
+        if metadata.is_dir() {
+            fs::create_dir(&target)?;
+            copy_tree_except(source_root, &source, destination, excluded)?;
+            File::open(&target)?.sync_all()?;
+        } else if metadata.is_file() {
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let mut input = File::open(&source)?;
+            let mut output = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(target)?;
+            io::copy(&mut input, &mut output)?;
+            output.sync_all()?;
+        } else {
+            return Err(BackupError::UnsafeSource(relative.to_path_buf()));
+        }
+    }
+    Ok(())
+}
+
+/// Collects an authenticated generic-file inventory after every staging input
+/// (including a database-engine checkpoint) has been written.
+#[cfg(feature = "rocksdb-catalog")]
+fn inventory_tree(
+    root: &Path,
+    current: &Path,
+    files: &mut Vec<BackupFile>,
+) -> Result<(), BackupError> {
+    for entry in fs::read_dir(current)? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        let relative = path
+            .strip_prefix(root)
+            .expect("inventory path remains beneath root");
+        if metadata.is_dir() {
+            inventory_tree(root, &path, files)?;
+        } else if metadata.is_file() {
+            let (bytes, sha256) = hash_file(&path)?;
+            files.push(BackupFile {
+                relative: relative.to_path_buf(),
+                bytes,
+                sha256,
+            });
+        } else {
+            return Err(BackupError::UnsafeSource(relative.to_path_buf()));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "rocksdb-catalog")]
+fn require_catalog_directory(root: &Path, relative: &Path) -> Result<(), BackupError> {
+    let path = root.join(relative);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
+        Ok(_) => Err(BackupError::VerificationFailed(relative.to_path_buf())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            Err(BackupError::VerificationFailed(relative.to_path_buf()))
+        }
+        Err(error) => Err(BackupError::Io(error)),
+    }
 }
 fn hash_file(path: &Path) -> Result<(u64, [u8; 32]), BackupError> {
     let mut file = File::open(path)?;
@@ -773,7 +1086,11 @@ fn encode_manifest(manifest: &BackupManifest) -> Result<Vec<u8>, BackupError> {
     Ok(bytes)
 }
 
-fn decode_manifest(bytes: &[u8]) -> Result<BackupManifest, BackupError> {
+/// Decodes one bounded binary backup-manifest value without filesystem I/O.
+///
+/// This is the same checksum and canonical-path validation used by
+/// [`read_manifest`]. Inputs over the v1 maximum are rejected before parsing.
+pub fn decode_backup_manifest_bytes(bytes: &[u8]) -> Result<BackupManifest, BackupError> {
     if bytes.len() < MANIFEST_HEADER_LEN + MANIFEST_DIGEST_LEN
         || bytes.len() as u64 > MAX_MANIFEST_BYTES
     {
@@ -1156,7 +1473,13 @@ fn encode_cold_descriptor(
     out.extend_from_slice(&digest);
     Ok(out)
 }
-fn decode_cold_descriptor(bytes: &[u8]) -> Result<ColdTierCheckpointDescriptor, BackupError> {
+/// Decodes one bounded cold-tier checkpoint descriptor without filesystem I/O.
+///
+/// This is the same checksum, version, count, and ordering validation used by
+/// [`load_cold_tier_descriptor`].
+pub fn decode_cold_tier_checkpoint_descriptor_bytes(
+    bytes: &[u8],
+) -> Result<ColdTierCheckpointDescriptor, BackupError> {
     if bytes.len()
         < COLD_DESCRIPTOR_HEADER_LEN + COLD_DESCRIPTOR_DIGESTS_LEN + COLD_DESCRIPTOR_CHECKSUM_LEN
         || bytes.len() > MAX_COLD_DESCRIPTOR_BYTES
@@ -1232,6 +1555,8 @@ fn decode_cold_descriptor(bytes: &[u8]) -> Result<ColdTierCheckpointDescriptor, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "rocksdb-catalog")]
+    use reflink_forest_index::{Catalog, CatalogBatch};
     fn dir(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!("reflink-forest-backup-{label}-{}", nonce()))
     }
@@ -1260,6 +1585,16 @@ mod tests {
     fn authoritative_paths() -> ColdTierAuthoritativePaths {
         ColdTierAuthoritativePaths::new(
             "metadata/catalog.bin",
+            "metadata/config.bin",
+            "metadata/pins.bin",
+        )
+        .unwrap()
+    }
+
+    #[cfg(feature = "rocksdb-catalog")]
+    fn rocksdb_authoritative_paths() -> ColdTierAuthoritativePaths {
+        ColdTierAuthoritativePaths::new(
+            "metadata/catalog",
             "metadata/config.bin",
             "metadata/pins.bin",
         )
@@ -1325,11 +1660,14 @@ mod tests {
     #[test]
     fn cold_descriptor_round_trips_and_rejects_corruption() {
         let encoded = encode_cold_descriptor(&descriptor()).unwrap();
-        assert_eq!(decode_cold_descriptor(&encoded).unwrap(), descriptor());
+        assert_eq!(
+            decode_cold_tier_checkpoint_descriptor_bytes(&encoded).unwrap(),
+            descriptor()
+        );
         let mut corrupt = encoded;
         corrupt[15] ^= 1;
         assert!(matches!(
-            decode_cold_descriptor(&corrupt),
+            decode_cold_tier_checkpoint_descriptor_bytes(&corrupt),
             Err(BackupError::InvalidManifest)
         ));
     }
@@ -1373,6 +1711,105 @@ mod tests {
             fs::read(restore.join(paths.pins_manifest())).unwrap(),
             b"pin bytes"
         );
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(feature = "rocksdb-catalog")]
+    #[test]
+    fn rocksdb_checkpoint_restores_a_fresh_validated_catalog_before_publication() {
+        let source = dir("rocksdb-source");
+        let parent = dir("rocksdb-parent");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&parent).unwrap();
+        let paths = rocksdb_authoritative_paths();
+        fs::create_dir_all(source.join("metadata")).unwrap();
+        let mut catalog = RocksDbCatalog::open(source.join(paths.catalog())).unwrap();
+        let mut batch = CatalogBatch::new();
+        batch.put_meta(b"checkpointed", b"before");
+        batch.put_current_generation(7);
+        catalog.apply(batch).unwrap();
+        fs::write(source.join(paths.config()), b"config bytes").unwrap();
+        fs::write(source.join(paths.pins_manifest()), b"pin bytes").unwrap();
+        let chunk_paths = chunk_paths();
+        write_chunk(&source, 7, 1);
+        let plan = ColdTierCheckpointPlan {
+            catalog_schema_version: 1,
+            active_generation: 7,
+            chunks: vec![ColdChunkDescriptor {
+                generation: 7,
+                chunk_id: 1,
+                classification: ChunkClassification::Open,
+                valid_prefix: fs::metadata(source.join(&chunk_paths.entries()[0].relative))
+                    .unwrap()
+                    .len(),
+            }],
+        };
+        let checkpoint_root = parent.join("checkpoint");
+        let checkpoint = checkpoint_cold_tier_rocksdb(
+            &Guard,
+            &catalog,
+            &source,
+            &checkpoint_root,
+            &plan,
+            &paths,
+            &chunk_paths,
+        )
+        .unwrap();
+        assert_eq!(
+            load_cold_tier_descriptor(&checkpoint_root).unwrap(),
+            checkpoint.descriptor
+        );
+
+        let mut later = CatalogBatch::new();
+        later.put_meta(b"after-checkpoint", b"not in backup");
+        catalog.apply(later).unwrap();
+        drop(catalog);
+        fs::remove_dir_all(&source).unwrap();
+
+        let restore = parent.join("restore");
+        let restored = restore_cold_tier_rocksdb(
+            &checkpoint_root,
+            &checkpoint.manifest,
+            &restore,
+            &paths,
+            &chunk_paths,
+        )
+        .unwrap();
+        assert_eq!(restored.meta(b"checkpointed"), Some(b"before".to_vec()));
+        assert_eq!(restored.current_generation(), Some(7));
+        assert_eq!(restored.meta(b"after-checkpoint"), None);
+        restored.validate().unwrap();
+        drop(restored);
+
+        // Re-authenticate a deliberately incomplete checkpoint to show that
+        // catalog opening/schema validation, not just the generic manifest,
+        // prevents publication of a broken database tree.
+        let current = paths.catalog().join("CURRENT");
+        fs::remove_file(checkpoint_root.join(&current)).unwrap();
+        let mut tampered_manifest = checkpoint.manifest.clone();
+        tampered_manifest
+            .files
+            .retain(|file| file.relative != current);
+        let mut tampered_descriptor = checkpoint.descriptor.clone();
+        tampered_descriptor.catalog_digest =
+            paths.digests(&checkpoint_root).unwrap().catalog_digest;
+        fs::write(
+            checkpoint_root.join(COLD_DESCRIPTOR_FILE_NAME),
+            encode_cold_descriptor(&tampered_descriptor).unwrap(),
+        )
+        .unwrap();
+        let rejected = parent.join("rejected");
+        assert!(matches!(
+            restore_cold_tier_rocksdb(
+                &checkpoint_root,
+                &tampered_manifest,
+                &rejected,
+                &paths,
+                &chunk_paths,
+            ),
+            Err(BackupError::CatalogCheckpoint(_))
+        ));
+        assert!(!rejected.exists());
         fs::remove_dir_all(parent).unwrap();
     }
 
@@ -1771,8 +2208,8 @@ mod tests {
             for len in lengths {
                 let bytes = corpus_bytes(seed, len);
                 assert!(std::panic::catch_unwind(|| {
-                    let _ = decode_manifest(&bytes);
-                    let _ = decode_cold_descriptor(&bytes);
+                    let _ = decode_backup_manifest_bytes(&bytes);
+                    let _ = decode_cold_tier_checkpoint_descriptor_bytes(&bytes);
                 })
                 .is_ok());
             }
@@ -1783,7 +2220,7 @@ mod tests {
         impossible_manifest.extend_from_slice(&u64::MAX.to_be_bytes());
         let impossible_manifest = with_digest(impossible_manifest);
         assert!(matches!(
-            decode_manifest(&impossible_manifest),
+            decode_backup_manifest_bytes(&impossible_manifest),
             Err(BackupError::InvalidManifest)
         ));
 
@@ -1796,7 +2233,7 @@ mod tests {
         impossible_descriptor.extend_from_slice(&[0; COLD_DESCRIPTOR_DIGESTS_LEN]);
         let impossible_descriptor = with_digest(impossible_descriptor);
         assert!(matches!(
-            decode_cold_descriptor(&impossible_descriptor),
+            decode_cold_tier_checkpoint_descriptor_bytes(&impossible_descriptor),
             Err(BackupError::InvalidManifest)
         ));
     }

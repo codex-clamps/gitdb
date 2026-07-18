@@ -28,7 +28,7 @@ updated with every persistent-format or privilege-boundary change.
 | Daemon | Runtime/state roots require owner-only permissions; sockets check peer UID; command parsing is strict and byte fields are hex encoded. | `reflink-forest-daemon` |
 | Durable metadata | Snapshot, workspace, job, backup, and catalog records are versioned and fail closed for malformed/unknown required data. | crate-level tests |
 | Backup/restore | Manifests and cold-tier descriptors are checksummed; restoration verifies before publication and never overwrites a destination. | `reflink-forest-backup` |
-| Decoder hardening | The record, snapshot-manifest, backup-manifest, and cold-descriptor decoders run a deterministic malformed-byte corpus in normal CI; length/count fields are bounded before decoded collection allocation. | `untrusted_*_fuzz_corpus_*` tests |
+| Decoder hardening | The record, snapshot-manifest, backup-manifest, and cold-descriptor decoders run a deterministic malformed-byte corpus in normal CI; opt-in `cargo-fuzz` targets mutate checked-in malformed seeds without burdening ordinary builds. Length/count fields are bounded before decoded collection allocation. | `untrusted_*_fuzz_corpus_*` tests; [`fuzz/`](../fuzz/README.md) |
 
 ## Residual risks and operational requirements
 

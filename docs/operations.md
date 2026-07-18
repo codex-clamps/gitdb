@@ -11,6 +11,15 @@ loopback Btrfs image. It must use create-new semantics, reject symlinks and
 non-regular image files, write a generated instance marker, and record the
 expected Btrfs UUID and label. A mount failure must never trigger formatting.
 
+Loopback initialization uses a separate closed command sequence: validate that
+the configured image and marker paths are both new direct children of the
+configured canonical parent; create the image with `O_CREAT|O_EXCL`; attach it
+with `losetup --nooverlap`; verify the returned loop device's canonical backing
+path; format only that verified loop device with the configured label; inspect
+the new Btrfs UUID and label; then create and sync the marker last. A failed
+initialization leaves any created image unmarked and therefore ineligible for
+another formatting attempt; no pre-existing or unmarked path is reformatted.
+
 At startup, the mount helper must hold the instance lock, identify an existing
 loop association by canonical backing file, or attach one with overlap
 prevention. It verifies the backing file, Btrfs UUID, label, instance marker,
@@ -80,12 +89,16 @@ pins, configuration, and schema metadata. The hot cache, parsed metadata,
 temporary jobs, and ephemeral workspaces are derived state and are not
 required for restore.
 
-A checkpoint pauses only the append writer long enough to finish and
-synchronize its active batch, records the open chunk's valid length, creates a
-RocksDB checkpoint, and writes a synchronized backup manifest. The manifest
-names chunk generations, sealed chunk sizes, the open valid prefix, checkpoint
-identity, schema version, and manifest digests. Writers may resume before
-immutable chunks are copied.
+A checkpoint holds the append/catalog writer freeze through the complete
+checkpoint boundary, records the open chunk's valid length, creates a native
+RocksDB checkpoint in a private staging tree, and writes a synchronized backup
+manifest. The RocksDB catalog is never copied as an ordinary live directory:
+the staged checkpoint is opened read-only and schema-validated before backup
+publication. The manifest names chunk generations, sealed chunk sizes, the
+open valid prefix, checkpoint identity, schema version, and manifest digests.
+The generic file-copy fallback is only valid for a regular-file catalog or
+when its guard retains exclusive access to every authoritative writer until the
+copy returns.
 
 The checkpoint descriptor stores chunk identities (generation, chunk ID,
 open/sealed class, and exact durable size), not deployment-specific filenames.
@@ -96,12 +109,13 @@ have exactly the recorded size, and pass a full record-boundary scan before a
 cold checkpoint is published or restored. Filenames are never inferred from a
 chunk ID by the backup layer.
 
-Restore copies the recorded chunks and catalog/checkpoint, validates their
-schema, performs full structural verification, and either restores the catalog
-or rebuilds it from chunks. It initializes a fresh verified Btrfs image and
-lazily recreates cache objects. Persistent mutable workspaces are restored only
-from a separate workspace snapshot/export policy; they are never implied by a
-cold-tier backup.
+Restore copies the recorded chunks and catalog/checkpoint into a private
+destination, validates their schema and full structure (including a fresh
+read-only RocksDB catalog open), and only then publishes the destination. It
+either restores the catalog or rebuilds it from chunks, initializes a fresh
+verified Btrfs image, and lazily recreates cache objects. Persistent mutable
+workspaces are restored only from a separate workspace snapshot/export policy;
+they are never implied by a cold-tier backup.
 
 Any failed backup or restore leaves its target marked incomplete and unusable
 until verification passes. Operators must test restoration on a separate

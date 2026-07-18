@@ -8,4 +8,9 @@ description = "Verified checkpoint, backup, and restore primitives for Reflink F
 
 [dependencies]
 reflink-forest-format = { path = "../reflink-forest-format" }
+reflink-forest-index = { path = "../reflink-forest-index", default-features = false, features = ["rocksdb-backend"], optional = true }
 sha2 = "0.10"
+
+[features]
+default = []
+rocksdb-catalog = ["dep:reflink-forest-index"]

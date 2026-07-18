@@ -157,6 +157,30 @@ pub enum CatalogError {
     Backend(String),
 }
 
+impl std::fmt::Display for CatalogError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidEncoding => write!(formatter, "invalid catalog-v1 encoding"),
+            Self::UnsupportedVersion(version) => {
+                write!(formatter, "unsupported catalog-v1 version {version}")
+            }
+            Self::AliasConflict {
+                repo,
+                oid,
+                existing,
+                requested,
+            } => write!(
+                formatter,
+                "repository {:?} alias {:?} already names {:?}, not {:?}",
+                repo, oid, existing, requested
+            ),
+            Self::Backend(error) => write!(formatter, "catalog backend error: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for CatalogError {}
+
 /// Versioned `object_locations` key: version then ContentId.
 pub fn encode_object_location_key(id: ContentId) -> [u8; 33] {
     let mut result = [0_u8; 33];
@@ -944,10 +968,158 @@ impl RocksDbCatalog {
         })
     }
 
+    /// Opens an already-published catalog for normal read/write service use,
+    /// without creating a missing database or column family.
+    ///
+    /// This can acquire RocksDB's normal writable database lock. Recovery
+    /// validation must use [`Self::validate_checkpoint`] instead, which opens
+    /// the checkpoint read-only and drops that handle before returning.
+    pub fn open_existing(path: impl AsRef<std::path::Path>) -> Result<Self, rocksdb::Error> {
+        let options = rocksdb::Options::default();
+        let descriptors: Vec<_> = ROCKSDB_COLUMN_FAMILIES
+            .into_iter()
+            .map(|name| rocksdb::ColumnFamilyDescriptor::new(name, rocksdb::Options::default()))
+            .collect();
+        Ok(Self {
+            db: rocksdb::DB::open_cf_descriptors(&options, path, descriptors)?,
+        })
+    }
+
+    fn open_read_only(path: impl AsRef<std::path::Path>) -> Result<Self, rocksdb::Error> {
+        let options = rocksdb::Options::default();
+        let descriptors: Vec<_> = ROCKSDB_COLUMN_FAMILIES
+            .into_iter()
+            .map(|name| rocksdb::ColumnFamilyDescriptor::new(name, rocksdb::Options::default()))
+            .collect();
+        Ok(Self {
+            db: rocksdb::DB::open_cf_descriptors_read_only(&options, path, descriptors, false)?,
+        })
+    }
+
+    /// Creates a RocksDB-engine-consistent checkpoint at a new destination.
+    ///
+    /// The checkpoint API captures a coherent set of manifest, table, and WAL
+    /// files even when the database has files that are unsafe to copy as an
+    /// arbitrary live directory. The caller is responsible for supplying a
+    /// new, trusted destination below its checkpoint staging directory.
+    pub fn create_checkpoint(
+        &self,
+        destination: impl AsRef<std::path::Path>,
+    ) -> Result<(), rocksdb::Error> {
+        rocksdb::checkpoint::Checkpoint::new(&self.db)?.create_checkpoint(destination)
+    }
+
+    /// Validates every v1 column family and entry in this open catalog.
+    ///
+    /// This performs schema decoding rather than merely opening RocksDB, which
+    /// prevents an intact-looking but foreign or partially corrupt checkpoint
+    /// from being accepted during restore.
+    pub fn validate(&self) -> Result<(), CatalogError> {
+        self.validate_entries(CF_OBJECT_LOCATIONS, |key, value| {
+            decode_object_location_key(key)?;
+            decode_object_location_value(value)?;
+            Ok(())
+        })?;
+        self.validate_entries(CF_OID_ALIASES, |key, value| {
+            decode_oid_alias_key(key)?;
+            decode_content_id_value(value)?;
+            Ok(())
+        })?;
+        self.validate_entries(CF_REPOSITORIES, |key, value| {
+            decode_repository_key(key)?;
+            decode_opaque_value(value)?;
+            Ok(())
+        })?;
+        self.validate_entries(CF_REPO_SNAPSHOTS, |key, value| {
+            decode_repository_snapshot_key(key)?;
+            decode_snapshot_visibility_value(value)?;
+            Ok(())
+        })?;
+        self.validate_entries(CF_REFS, |key, value| {
+            decode_opaque_key(key)?;
+            decode_opaque_value(value)?;
+            Ok(())
+        })?;
+        self.validate_entries(CF_CHUNKS, |key, value| {
+            decode_chunk_key(key)?;
+            decode_chunk_value(value)?;
+            Ok(())
+        })?;
+        self.validate_entries(CF_CACHE_OBJECTS, |key, value| {
+            decode_opaque_key(key)?;
+            decode_opaque_value(value)?;
+            Ok(())
+        })?;
+        self.validate_entries(CF_WORKSPACES, |key, value| {
+            decode_workspace_key(key)?;
+            decode_opaque_value(value)?;
+            Ok(())
+        })?;
+        self.validate_entries(CF_WORKSPACE_NAMES, |key, value| {
+            decode_workspace_name_key(key)?;
+            decode_workspace_id_value(value)?;
+            Ok(())
+        })?;
+        self.validate_entries(CF_PINS, |key, value| {
+            decode_workspace_pin_key(key)?;
+            decode_workspace_pin_value(value)?;
+            Ok(())
+        })?;
+        self.validate_entries(CF_JOBS, |key, value| {
+            decode_job_key(key)?;
+            decode_opaque_value(value)?;
+            Ok(())
+        })?;
+        self.validate_entries(CF_META, |key, value| {
+            let key = decode_meta_key(key)?;
+            if key == CURRENT_GENERATION_META_KEY {
+                decode_current_generation_value(value)?;
+            } else {
+                decode_opaque_value(value)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Opens and schema-validates a checkpoint that must already exist.
+    ///
+    /// The returned generation is read only after every catalog-v1 entry has
+    /// decoded successfully, so checkpoint consumers can bind it to their own
+    /// generation descriptor without accepting an invalid metadata value.
+    pub fn validate_checkpoint(
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<Option<u32>, CatalogError> {
+        // Keep the read-only DB lifetime entirely within this block. In
+        // particular, restore validation must release its handle before the
+        // caller publishes the verified staging directory by rename.
+        let generation = {
+            let catalog = Self::open_read_only(path)
+                .map_err(|error| CatalogError::Backend(error.to_string()))?;
+            catalog.validate()?;
+            catalog.current_generation()
+        };
+        Ok(generation)
+    }
+
     fn cf(&self, name: &str) -> Result<&rocksdb::ColumnFamily, CatalogError> {
         self.db
             .cf_handle(name)
             .ok_or_else(|| CatalogError::Backend(format!("missing RocksDB column family {name}")))
+    }
+
+    fn validate_entries<F>(&self, column_family: &str, mut validate: F) -> Result<(), CatalogError>
+    where
+        F: FnMut(&[u8], &[u8]) -> Result<(), CatalogError>,
+    {
+        let column_family = self.cf(column_family)?;
+        for entry in self
+            .db
+            .iterator_cf(column_family, rocksdb::IteratorMode::Start)
+        {
+            let (key, value) = entry.map_err(|error| CatalogError::Backend(error.to_string()))?;
+            validate(key.as_ref(), value.as_ref())?;
+        }
+        Ok(())
     }
 }
 
@@ -1626,6 +1798,43 @@ mod tests {
         assert_eq!(catalog.job(&[4, 5, 6]), Some(b"opaque job record".to_vec()));
         drop(catalog);
         std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[cfg(feature = "rocksdb-backend")]
+    #[test]
+    fn rocksdb_checkpoint_is_freshly_openable_and_excludes_later_writes() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let root = std::env::temp_dir().join(format!(
+            "reflink-forest-index-checkpoint-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let live = root.join("live");
+        let checkpoint = root.join("checkpoint");
+        {
+            let mut catalog = RocksDbCatalog::open(&live).unwrap();
+            let mut before = CatalogBatch::new();
+            before.put_meta(b"checkpointed", b"before");
+            before.put_current_generation(17);
+            catalog.apply(before).unwrap();
+            catalog.create_checkpoint(&checkpoint).unwrap();
+
+            let mut after = CatalogBatch::new();
+            after.put_meta(b"after-checkpoint", b"not in snapshot");
+            catalog.apply(after).unwrap();
+            catalog.validate().unwrap();
+        }
+
+        RocksDbCatalog::validate_checkpoint(&checkpoint).unwrap();
+        let restored = RocksDbCatalog::open_existing(&checkpoint).unwrap();
+        assert_eq!(restored.meta(b"checkpointed"), Some(b"before".to_vec()));
+        assert_eq!(restored.current_generation(), Some(17));
+        assert_eq!(restored.meta(b"after-checkpoint"), None);
+        drop(restored);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(feature = "rocksdb-backend")]

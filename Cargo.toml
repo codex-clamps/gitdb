@@ -1,3 +1,4 @@
 [workspace]
 members = ["crates/reflink-forest-core", "crates/reflink-forest-probe", "crates/reflink-forest-format", "crates/reflink-forest-store", "crates/reflink-forest-index", "crates/reflink-forest-cache", "crates/reflink-forest-btrfs", "crates/reflink-forest-maintenance", "crates/reflink-forest-git", "crates/reflink-forest-daemon", "crates/reflink-forest-checkout", "crates/reflink-forest-backup", "crates/reflink-forest-import", "crates/reflink-forest-workspace"]
+exclude = ["fuzz"]
 resolver = "2"

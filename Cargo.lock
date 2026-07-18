@@ -319,6 +319,7 @@ name = "reflink-forest-backup"
 version = "0.1.0"
 dependencies = [
  "reflink-forest-format",
+ "reflink-forest-index",
  "sha2",
 ]
 
@@ -362,8 +363,13 @@ dependencies = [
 name = "reflink-forest-daemon"
 version = "0.1.0"
 dependencies = [
+ "reflink-forest-cache",
+ "reflink-forest-core",
  "reflink-forest-format",
+ "reflink-forest-import",
  "reflink-forest-index",
+ "reflink-forest-maintenance",
+ "reflink-forest-store",
 ]
 
 [[package]]
