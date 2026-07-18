@@ -7,17 +7,39 @@
 
 use core::fmt;
 use reflink_forest_core::{ContentId, GitOid, HashAlgorithm, ObjectKind};
+use std::io::{self, BufReader, Cursor, Read, Write};
 
 pub const FORMAT_VERSION: u16 = 1;
 pub const CHUNK_HEADER_LEN: usize = 64;
+/// Fixed trailer appended only to an immutable `.sealed` chunk.
+///
+/// `final_length` includes this trailer. `records_crc32c` covers the exact
+/// encoded record byte stream (including each record's alignment padding),
+/// but excludes the chunk header and this footer.
+pub const SEALED_CHUNK_FOOTER_LEN: usize = 64;
 pub const RECORD_HEADER_LEN: usize = 128;
 pub const RECORD_FOOTER_LEN: usize = 20;
 pub const RECORD_ALIGNMENT: usize = 8;
+/// Maximum decoded bytes processed in one codec I/O operation.
+///
+/// Object readers must stream through this buffer instead of materializing an
+/// attacker-controlled decompressed payload in one allocation.
+pub const CODEC_STREAM_BUFFER_BYTES: usize = 64 * 1024;
+/// The bounded Zstd history window accepted and emitted by the v1 codec.
+///
+/// Keeping the encoder and decoder at the same ceiling prevents an otherwise
+/// small stored frame from forcing an unbounded decoder window allocation.
+pub const ZSTD_WINDOW_LOG_MAX: u32 = 23;
+/// Fixed v1 Zstd compression level. The codec is self-describing; this is a
+/// writer policy, not part of a record's persistent interpretation.
+pub const ZSTD_COMPRESSION_LEVEL: i32 = 3;
 
 const CHUNK_MAGIC: &[u8; 8] = b"RFSCHNK\0";
+const SEALED_CHUNK_FOOTER_MAGIC: &[u8; 8] = b"RFSSEAL\0";
 const RECORD_MAGIC: &[u8; 4] = b"ROBJ";
 const RECORD_END_MAGIC: &[u8; 8] = b"RENDOBJ\0";
 const CHUNK_CRC_OFFSET: usize = 36;
+const SEALED_CHUNK_FOOTER_CRC_OFFSET: usize = 32;
 const RECORD_CRC_OFFSET: usize = 94;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -26,6 +48,59 @@ pub struct ChunkHeader {
     pub chunk_id: u64,
     pub created_unix_secs: u64,
     pub flags: u32,
+}
+
+/// Durable footer of an immutable sealed chunk.
+///
+/// The footer is written and synchronized before an `.open` chunk is renamed
+/// to `.sealed`; readers can therefore reject a stale footer or an
+/// interrupted seal without guessing whether its bytes are object records.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SealedChunkFooter {
+    pub record_count: u64,
+    /// Exact file length, including this footer.
+    pub final_length: u64,
+    pub records_crc32c: u32,
+}
+
+impl SealedChunkFooter {
+    pub fn encode(&self) -> [u8; SEALED_CHUNK_FOOTER_LEN] {
+        let mut bytes = [0_u8; SEALED_CHUNK_FOOTER_LEN];
+        bytes[..8].copy_from_slice(SEALED_CHUNK_FOOTER_MAGIC);
+        put_u16(&mut bytes, 8, FORMAT_VERSION);
+        put_u16(&mut bytes, 10, SEALED_CHUNK_FOOTER_LEN as u16);
+        put_u64(&mut bytes, 12, self.record_count);
+        put_u64(&mut bytes, 20, self.final_length);
+        put_u32(&mut bytes, 28, self.records_crc32c);
+        let crc = crc32c_with_zeroed_field(&bytes, SEALED_CHUNK_FOOTER_CRC_OFFSET, 4);
+        put_u32(&mut bytes, SEALED_CHUNK_FOOTER_CRC_OFFSET, crc);
+        bytes
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, FormatError> {
+        if bytes.len() < SEALED_CHUNK_FOOTER_LEN {
+            return Err(FormatError::Truncated);
+        }
+        let bytes = &bytes[..SEALED_CHUNK_FOOTER_LEN];
+        if &bytes[..8] != SEALED_CHUNK_FOOTER_MAGIC {
+            return Err(FormatError::BadMagic);
+        }
+        check_version(read_u16(bytes, 8))?;
+        check_header_len(read_u16(bytes, 10) as usize, SEALED_CHUNK_FOOTER_LEN)?;
+        if read_u32(bytes, SEALED_CHUNK_FOOTER_CRC_OFFSET)
+            != crc32c_with_zeroed_field(bytes, SEALED_CHUNK_FOOTER_CRC_OFFSET, 4)
+        {
+            return Err(FormatError::HeaderCrcMismatch);
+        }
+        if bytes[36..].iter().any(|&byte| byte != 0) {
+            return Err(FormatError::NonZeroReserved);
+        }
+        Ok(Self {
+            record_count: read_u64(bytes, 12),
+            final_length: read_u64(bytes, 20),
+            records_crc32c: read_u32(bytes, 28),
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -42,6 +117,59 @@ impl Codec {
             1 => Some(Self::Zstd),
             _ => None,
         }
+    }
+}
+
+/// Failure while encoding, decoding, or fully verifying an object's stored
+/// payload.  Structural record decoding intentionally does not perform this
+/// work so open-chunk recovery can remain bounded; consumers that expose raw
+/// object bytes must call one of the helpers below.
+#[derive(Debug)]
+pub enum CodecError {
+    Io(io::Error),
+    RawLengthMismatch {
+        expected: u64,
+        actual: u64,
+    },
+    ContentMismatch {
+        expected: ContentId,
+        actual: ContentId,
+    },
+    /// A v1 `Codec::Zstd` payload must contain exactly one independent frame.
+    TrailingZstdData,
+}
+
+impl fmt::Display for CodecError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(error) => write!(f, "object codec I/O failed: {error}"),
+            Self::RawLengthMismatch { expected, actual } => write!(
+                f,
+                "object codec produced {actual} raw bytes, expected {expected}"
+            ),
+            Self::ContentMismatch { .. } => {
+                write!(f, "decoded object bytes do not match their ContentId")
+            }
+            Self::TrailingZstdData => {
+                write!(
+                    f,
+                    "zstd object payload contains bytes after its first frame"
+                )
+            }
+        }
+    }
+}
+impl std::error::Error for CodecError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+impl From<io::Error> for CodecError {
+    fn from(value: io::Error) -> Self {
+        Self::Io(value)
     }
 }
 
@@ -300,6 +428,174 @@ pub fn validate_record_footer(
     Ok(())
 }
 
+/// Encodes one raw object payload using the requested v1 storage codec.
+///
+/// Zstd frames are deliberately independent (no dictionaries) and have a
+/// bounded history window, so any reader can decode exactly one record
+/// without retaining another record's data or accepting an unbounded window.
+pub fn encode_object_payload(codec: Codec, raw: &[u8]) -> Result<Vec<u8>, CodecError> {
+    match codec {
+        Codec::Raw => Ok(raw.to_vec()),
+        Codec::Zstd => {
+            let mut encoder =
+                zstd::stream::write::Encoder::new(Vec::new(), ZSTD_COMPRESSION_LEVEL)?;
+            encoder.window_log(ZSTD_WINDOW_LOG_MAX)?;
+            // The frame checksum is redundant with the record CRC and
+            // ContentId, but cheaply detects malformed compressed content
+            // before it is exposed as raw object bytes.
+            encoder.include_checksum(true)?;
+            encoder.write_all(raw)?;
+            encoder.finish().map_err(CodecError::Io)
+        }
+    }
+}
+
+/// Decodes a record's stored payload into `writer` in fixed-size buffers and
+/// verifies its declared raw length and internal ContentId.
+///
+/// `source` must expose exactly the stored payload bytes for this one record.
+/// For `Codec::Zstd`, this rejects concatenated frames and trailing data. The
+/// output never exceeds `raw_length`, even if a malicious frame claims a much
+/// larger size.
+pub fn decode_object_payload_to_writer<R: Read, W: Write>(
+    kind: ObjectKind,
+    codec: Codec,
+    raw_length: u64,
+    expected_content_id: ContentId,
+    source: &mut R,
+    writer: &mut W,
+) -> Result<(), CodecError> {
+    let mut validated = ValidatingObjectWriter::new(writer, kind, raw_length);
+    match codec {
+        Codec::Raw => copy_decoded(source, &mut validated)?,
+        Codec::Zstd => {
+            // A one-byte buffer prevents a successful first frame from
+            // hiding a second frame in a large internal read-ahead buffer.
+            let buffered = BufReader::with_capacity(1, source);
+            let mut decoder = zstd::stream::read::Decoder::with_buffer(buffered)?.single_frame();
+            decoder.window_log_max(ZSTD_WINDOW_LOG_MAX)?;
+            copy_decoded(&mut decoder, &mut validated)?;
+            let buffered = decoder.finish();
+            if !buffered.buffer().is_empty() {
+                return Err(CodecError::TrailingZstdData);
+            }
+            let source = buffered.into_inner();
+            let mut trailing = [0_u8; 1];
+            if source.read(&mut trailing)? != 0 {
+                return Err(CodecError::TrailingZstdData);
+            }
+        }
+    }
+    validated.finish(expected_content_id)
+}
+
+/// Decodes a complete in-memory record payload after enforcing all raw-object
+/// invariants. Callers that need an owned Git object use this helper; cold
+/// hydration should instead use [`decode_object_payload_to_writer`] directly.
+pub fn decode_object_payload(record: &ObjectRecord) -> Result<Vec<u8>, CodecError> {
+    let mut raw = Vec::new();
+    decode_object_payload_to_writer(
+        record.kind,
+        record.codec,
+        record.raw_length,
+        record.content_id,
+        &mut Cursor::new(&record.payload),
+        &mut raw,
+    )?;
+    Ok(raw)
+}
+
+/// Fully validates a record's stored codec payload without retaining its raw
+/// bytes. This is the required verification before compaction republishes a
+/// stored record into a different cold generation.
+pub fn verify_object_record(record: &ObjectRecord) -> Result<(), CodecError> {
+    decode_object_payload_to_writer(
+        record.kind,
+        record.codec,
+        record.raw_length,
+        record.content_id,
+        &mut Cursor::new(&record.payload),
+        &mut io::sink(),
+    )
+}
+
+fn copy_decoded<R: Read, W: Write>(source: &mut R, writer: &mut W) -> Result<(), CodecError> {
+    let mut buffer = [0_u8; CODEC_STREAM_BUFFER_BYTES];
+    loop {
+        let count = source.read(&mut buffer)?;
+        if count == 0 {
+            return Ok(());
+        }
+        writer.write_all(&buffer[..count])?;
+    }
+}
+
+struct ValidatingObjectWriter<'a, W> {
+    writer: &'a mut W,
+    expected_length: u64,
+    written: u64,
+    hasher: reflink_forest_core::ContentHasher,
+}
+
+impl<'a, W: Write> ValidatingObjectWriter<'a, W> {
+    fn new(writer: &'a mut W, kind: ObjectKind, expected_length: u64) -> Self {
+        Self {
+            writer,
+            expected_length,
+            written: 0,
+            hasher: reflink_forest_core::ContentHasher::new(kind, expected_length),
+        }
+    }
+
+    fn finish(self, expected_content_id: ContentId) -> Result<(), CodecError> {
+        if self.written != self.expected_length {
+            return Err(CodecError::RawLengthMismatch {
+                expected: self.expected_length,
+                actual: self.written,
+            });
+        }
+        let actual = self.hasher.finalize();
+        if actual != expected_content_id {
+            return Err(CodecError::ContentMismatch {
+                expected: expected_content_id,
+                actual,
+            });
+        }
+        Ok(())
+    }
+}
+
+impl<W: Write> Write for ValidatingObjectWriter<'_, W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let additional = u64::try_from(bytes.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "decoded object write length does not fit in u64",
+            )
+        })?;
+        let next = self.written.checked_add(additional).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "decoded object length overflowed u64",
+            )
+        })?;
+        if next > self.expected_length {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "decoded object exceeds its declared raw length",
+            ));
+        }
+        let written = self.writer.write(bytes)?;
+        self.hasher.update(&bytes[..written]);
+        self.written += written as u64;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.writer.flush()
+    }
+}
+
 fn encode_oid_fixed(oid: &GitOid, output: &mut [u8]) {
     output[0] = oid.algorithm().tag();
     output[1] = oid.len();
@@ -383,7 +679,7 @@ pub fn crc32c(bytes: &[u8]) -> u32 {
 }
 
 /// Incremental Castagnoli CRC-32C calculator for bounded streaming I/O.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Crc32c(u32);
 
 impl Default for Crc32c {
@@ -430,6 +726,13 @@ mod tests {
             payload: payload.to_vec(),
         }
     }
+
+    fn zstd_record(payload: &[u8]) -> ObjectRecord {
+        let mut record = record(payload);
+        record.codec = Codec::Zstd;
+        record.payload = encode_object_payload(Codec::Zstd, payload).unwrap();
+        record
+    }
     #[test]
     fn crc32c_matches_known_vector() {
         assert_eq!(crc32c(b"123456789"), 0xe306_9283);
@@ -452,13 +755,37 @@ mod tests {
         );
     }
     #[test]
-    fn record_round_trips_with_alignment() {
-        let original = record(b"hello");
-        let encoded = encode_record(&original).unwrap();
-        assert_eq!(encoded.len() % 8, 0);
-        let (decoded, consumed) = decode_record(&encoded).unwrap();
-        assert_eq!(consumed, encoded.len());
-        assert_eq!(decoded, original);
+    fn sealed_chunk_footer_round_trips_and_checks_crc() {
+        let footer = SealedChunkFooter {
+            record_count: 17,
+            final_length: 4_096,
+            records_crc32c: 0x1234_5678,
+        };
+        let encoded = footer.encode();
+        assert_eq!(SealedChunkFooter::decode(&encoded).unwrap(), footer);
+        let mut corrupt = encoded;
+        corrupt[20] ^= 1;
+        assert_eq!(
+            SealedChunkFooter::decode(&corrupt),
+            Err(FormatError::HeaderCrcMismatch)
+        );
+        assert_eq!(
+            SealedChunkFooter::decode(&encoded[..SEALED_CHUNK_FOOTER_LEN - 1]),
+            Err(FormatError::Truncated)
+        );
+    }
+    #[test]
+    fn record_round_trip_raw_and_zstd() {
+        let raw = b"one canonical payload repeated one canonical payload repeated";
+        for original in [record(raw), zstd_record(raw)] {
+            let encoded = encode_record(&original).unwrap();
+            assert_eq!(encoded.len() % 8, 0);
+            let (decoded, consumed) = decode_record(&encoded).unwrap();
+            assert_eq!(consumed, encoded.len());
+            assert_eq!(decoded, original);
+            assert_eq!(decode_object_payload(&decoded).unwrap(), raw);
+            verify_object_record(&decoded).unwrap();
+        }
     }
     #[test]
     fn record_rejects_corrupt_payload_footer_and_padding() {
@@ -479,6 +806,41 @@ mod tests {
         assert_eq!(
             decode_record(&encoded[..encoded.len() - 1]),
             Err(FormatError::Truncated)
+        );
+    }
+
+    #[test]
+    fn decompression_corruption_length_and_content_id_fail_closed() {
+        let payload = b"zstd corruption must never become a cache blob";
+        let mut corrupted = zstd_record(payload);
+        let last = corrupted.payload.len() - 1;
+        corrupted.payload[last] ^= 0x80;
+        assert!(decode_object_payload(&corrupted).is_err());
+
+        let mut wrong_length = zstd_record(payload);
+        wrong_length.raw_length += 1;
+        assert!(matches!(
+            decode_object_payload(&wrong_length),
+            Err(CodecError::RawLengthMismatch { .. })
+        ));
+
+        let mut wrong_id = zstd_record(payload);
+        wrong_id.content_id = ContentId::for_object(ObjectKind::Blob, b"different payload");
+        assert!(matches!(
+            decode_object_payload(&wrong_id),
+            Err(CodecError::ContentMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn unknown_codec_tag_is_rejected_before_decompression() {
+        let mut encoded = encode_record(&record(b"unknown codec")).unwrap();
+        encoded[9] = 0xff;
+        let crc = crc32c_with_zeroed_field(&encoded[..RECORD_HEADER_LEN], RECORD_CRC_OFFSET, 4);
+        put_u32(&mut encoded, RECORD_CRC_OFFSET, crc);
+        assert_eq!(
+            decode_record(&encoded),
+            Err(FormatError::InvalidCodec(0xff))
         );
     }
 

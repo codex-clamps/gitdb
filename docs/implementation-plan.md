@@ -86,6 +86,14 @@ main/nightly or before a release. Full verification succeeds after every
 fault-injection scenario. No catalog location references a partial, invalid, or
 unsynchronized record.
 
+The concrete soak gate is the ignored
+`reflink-forest-store/tests/million_record_soak.rs` integration test. It only
+runs in release mode with `REFLINK_FOREST_RUN_MILLION_RECORD_SOAK=1`; invoke it
+locally with `cargo test --release -p reflink-forest-store --test
+million_record_soak million_record_soak -- --ignored --exact`. CI enables that
+environment only for protected `main` pushes, the nightly schedule, and
+published releases.
+
 ## Phase M2 — Git import and immutable snapshots
 
 Implement the backend trait, local libgit2 backend, ref snapshot, reachability
@@ -157,4 +165,3 @@ These are deferred because they add independent persistence, privilege,
 compatibility, or operational contracts. They may be prototyped only behind
 test-only interfaces that do not alter the M1 durable format or acceptance
 criteria.
-

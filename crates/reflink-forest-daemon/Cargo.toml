@@ -6,7 +6,21 @@ rust-version = "1.70"
 license = "MIT OR Apache-2.0"
 description = "Per-user local daemon primitives for Reflink Forest"
 
+[features]
+default = []
+# Production startup owns only unprivileged validation, recovery, and the
+# local service lifecycle. Loop attachment, mounting, and formatting remain
+# in the separately authorized helper.
+production = [
+    "dep:reflink-forest-backup",
+    "dep:reflink-forest-btrfs",
+    "reflink-forest-backup/rocksdb-catalog",
+    "reflink-forest-index/rocksdb-backend",
+]
+
 [dependencies]
+reflink-forest-backup = { path = "../reflink-forest-backup", optional = true }
+reflink-forest-btrfs = { path = "../reflink-forest-btrfs", optional = true }
 reflink-forest-cache = { path = "../reflink-forest-cache" }
 reflink-forest-core = { path = "../reflink-forest-core" }
 reflink-forest-format = { path = "../reflink-forest-format" }

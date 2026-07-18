@@ -21,7 +21,7 @@ use reflink_forest_checkout::{
     ReplacePolicy, TreeEntry, TreeName, WorkspaceName, WorkspacePublishError,
 };
 use reflink_forest_core::{ContentId, GitOid, HashAlgorithm, ObjectKind};
-use reflink_forest_format::{Codec, ObjectRecord};
+use reflink_forest_format::{decode_object_payload, Codec, CodecError, ObjectRecord};
 use reflink_forest_git::{commit_tree_oid, parse_tree_entries, GitObject, GitTreeEntry};
 use reflink_forest_index::{Catalog, CatalogBatch, CatalogError, RepoId, WorkspaceId};
 use reflink_forest_maintenance::{GenerationManager, MaintenanceError};
@@ -48,6 +48,7 @@ pub enum WorkspaceError {
         expected: ObjectKind,
         actual: ObjectKind,
     },
+    Codec(CodecError),
     UnsupportedCodec(Codec),
     ContentMismatch {
         expected: ContentId,
@@ -69,6 +70,7 @@ impl std::fmt::Display for WorkspaceError {
             Self::WrongKind { expected, actual } => {
                 write!(f, "expected {expected:?} but found {actual:?}")
             }
+            Self::Codec(error) => write!(f, "cold object codec failed: {error}"),
             Self::UnsupportedCodec(codec) => {
                 write!(f, "raw workspace requires raw objects, found {codec:?}")
             }
@@ -87,6 +89,11 @@ impl From<StoreError> for WorkspaceError {
 impl From<HydrationError> for WorkspaceError {
     fn from(value: HydrationError) -> Self {
         Self::Hydration(value)
+    }
+}
+impl From<CodecError> for WorkspaceError {
+    fn from(value: CodecError) -> Self {
+        Self::Codec(value)
     }
 }
 impl From<MaintenanceError> for WorkspaceError {
@@ -305,6 +312,8 @@ pub enum WorkspacePersistenceError {
     Manifest(WorkspaceManifestError),
     Catalog(CatalogError),
     NameAlreadyPublished(WorkspaceId),
+    ExistingWorkspaceMismatch,
+    ExistingWorkspaceIncomplete,
 }
 impl std::fmt::Display for WorkspacePersistenceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -313,6 +322,18 @@ impl std::fmt::Display for WorkspacePersistenceError {
             Self::Catalog(error) => write!(f, "workspace catalog persistence failed: {error:?}"),
             Self::NameAlreadyPublished(id) => {
                 write!(f, "workspace name is already associated with {id:?}")
+            }
+            Self::ExistingWorkspaceMismatch => {
+                write!(
+                    f,
+                    "workspace ID is already associated with different durable metadata"
+                )
+            }
+            Self::ExistingWorkspaceIncomplete => {
+                write!(
+                    f,
+                    "workspace ID has an incomplete durable catalog publication"
+                )
             }
         }
     }
@@ -369,6 +390,29 @@ pub fn write_workspace_manifest(
     Ok(destination)
 }
 
+/// Ensures that the durable external manifest for `manifest` exists and is
+/// byte-for-byte identical to the requested publication.
+///
+/// A crash after the manifest rename but before the catalog batch leaves this
+/// exact reusable state. Reopening it rather than overwriting it makes retry
+/// safe and prevents one workspace ID from silently changing checkout
+/// identity, generation, or pin data.
+pub fn ensure_workspace_manifest(
+    root: impl AsRef<Path>,
+    manifest: &WorkspaceManifest,
+) -> Result<PathBuf, WorkspaceManifestError> {
+    let root = root.as_ref();
+    let path = workspace_manifest_path(root, manifest.workspace_id);
+    match read_workspace_manifest(&path) {
+        Ok(existing) if existing == *manifest => Ok(path),
+        Ok(_) => Err(WorkspaceManifestError::Invalid),
+        Err(WorkspaceManifestError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+            write_workspace_manifest(root, manifest)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// Loads and completely validates a workspace manifest, retaining unknown
 /// optional fields so a subsequent write does not silently discard them.
 pub fn read_workspace_manifest(
@@ -402,8 +446,19 @@ pub fn persist_ready_workspace<C: Catalog>(
             return Err(WorkspacePersistenceError::NameAlreadyPublished(existing));
         }
     }
-    let path = write_workspace_manifest(manifests_root, manifest)?;
+    let path = ensure_workspace_manifest(manifests_root, manifest)?;
     let bytes = encode_workspace_manifest(manifest)?;
+    if let Some(existing) = catalog.workspace(manifest.workspace_id) {
+        if existing != bytes {
+            return Err(WorkspacePersistenceError::ExistingWorkspaceMismatch);
+        }
+        if catalog.workspace_name(&manifest.name) != Some(manifest.workspace_id)
+            || catalog.workspace_pin(manifest.workspace_id) != Some(manifest.generation)
+        {
+            return Err(WorkspacePersistenceError::ExistingWorkspaceIncomplete);
+        }
+        return Ok(path);
+    }
     let mut batch = CatalogBatch::new();
     batch.put_workspace(manifest.workspace_id, bytes);
     batch.put_workspace_name(&manifest.name, manifest.workspace_id);
@@ -424,11 +479,339 @@ pub fn load_ready_workspace<C: Catalog>(
     let Some(record) = catalog.workspace(id) else {
         return Ok(None);
     };
+    // A deletion releases this pin before removing the external manifest.
+    // Treat that durable intermediate state as non-Ready so a crash in that
+    // interval cannot make startup fail or re-expose a workspace. It also
+    // means a malformed/partial catalog publication never counts as Ready.
+    if catalog.workspace_pin(id).is_none() {
+        return Ok(None);
+    }
     let manifest = read_workspace_manifest(workspace_manifest_path(manifests_root, id))?;
     if manifest.workspace_id != id || encode_workspace_manifest(&manifest)? != record {
         return Err(WorkspaceManifestError::Invalid);
     }
+    if catalog.workspace_name(&manifest.name) != Some(id)
+        || catalog.workspace_pin(id) != Some(manifest.generation)
+    {
+        return Ok(None);
+    }
     Ok(Some(manifest))
+}
+
+/// Maximum number of durable workspace manifests examined before startup
+/// accepts new checkout work. The daemon controls these directories, but a
+/// bounded scan keeps a corrupt or unexpectedly populated state root from
+/// turning recovery into unbounded work.
+pub const MAX_WORKSPACE_PUBLICATION_RECONCILIATION: usize = 4096;
+
+/// Result of reconciling manifest-first workspace publications after a crash.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WorkspacePublicationReconciliation {
+    /// Valid manifest files that were examined.
+    pub manifests_examined: u64,
+    /// Workspace directories whose manifest, catalog record, name map, and
+    /// generation pin were all complete.
+    pub ready_workspaces: u64,
+    /// Visible workspace directories moved back to private trash because
+    /// their manifest was never made Ready in the catalog.
+    pub incomplete_workspaces_withdrawn: u64,
+}
+
+/// Failure while reconciling a physical workspace with its durable manifest
+/// and catalog publication state.
+#[derive(Debug)]
+pub enum WorkspaceReconciliationError {
+    Io(io::Error),
+    Manifest(WorkspaceManifestError),
+    TooManyManifests { maximum: usize },
+    UnsafeWorkspacePath(PathBuf),
+    ReadyWorkspaceMissing(PathBuf),
+}
+
+impl std::fmt::Display for WorkspaceReconciliationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(error) => write!(formatter, "workspace reconciliation I/O error: {error}"),
+            Self::Manifest(error) => write!(
+                formatter,
+                "workspace reconciliation manifest error: {error}"
+            ),
+            Self::TooManyManifests { maximum } => {
+                write!(
+                    formatter,
+                    "workspace reconciliation exceeds manifest limit {maximum}"
+                )
+            }
+            Self::UnsafeWorkspacePath(path) => {
+                write!(
+                    formatter,
+                    "workspace path is not a real directory: {}",
+                    path.display()
+                )
+            }
+            Self::ReadyWorkspaceMissing(path) => {
+                write!(formatter, "Ready workspace is missing: {}", path.display())
+            }
+        }
+    }
+}
+
+impl std::error::Error for WorkspaceReconciliationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            Self::Manifest(error) => Some(error),
+            Self::TooManyManifests { .. }
+            | Self::UnsafeWorkspacePath(_)
+            | Self::ReadyWorkspaceMissing(_) => None,
+        }
+    }
+}
+
+impl From<io::Error> for WorkspaceReconciliationError {
+    fn from(value: io::Error) -> Self {
+        Self::Io(value)
+    }
+}
+
+impl From<WorkspaceManifestError> for WorkspaceReconciliationError {
+    fn from(value: WorkspaceManifestError) -> Self {
+        Self::Manifest(value)
+    }
+}
+
+/// Moves an unready visible workspace out of the public namespace.
+///
+/// The caller provides an ID generated by the daemon rather than a path. The
+/// destination is therefore a private, deterministic-prefix trash name and
+/// the public workspace name becomes absent in one rename. A later cleaner
+/// can remove the retired tree without weakening publication safety.
+fn withdraw_workspace(
+    workspaces: &Path,
+    trash: &Path,
+    manifest: &WorkspaceManifest,
+) -> Result<Option<PathBuf>, WorkspaceReconciliationError> {
+    let source = workspaces.join(
+        std::str::from_utf8(&manifest.name)
+            .map_err(|_| WorkspaceReconciliationError::UnsafeWorkspacePath(workspaces.into()))?,
+    );
+    let metadata = match fs::symlink_metadata(&source) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(WorkspaceReconciliationError::UnsafeWorkspacePath(source));
+    }
+    fs::create_dir_all(trash)?;
+    for attempt in 0..32_u32 {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| WorkspaceReconciliationError::UnsafeWorkspacePath(trash.into()))?
+            .as_nanos();
+        let destination = trash.join(format!(
+            ".reflink-forest-withdrawn-{}-{timestamp}-{attempt}",
+            workspace_id_hex(manifest.workspace_id)
+        ));
+        match fs::rename(&source, &destination) {
+            Ok(()) => {
+                File::open(workspaces)?.sync_all()?;
+                File::open(trash)?.sync_all()?;
+                return Ok(Some(destination));
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(WorkspaceReconciliationError::UnsafeWorkspacePath(source))
+}
+
+fn workspace_id_hex(id: WorkspaceId) -> String {
+    let mut hex = String::with_capacity(32);
+    for byte in id.0 {
+        use std::fmt::Write as _;
+        let _ = write!(&mut hex, "{byte:02x}");
+    }
+    hex
+}
+
+/// Reconciles the manifest-first physical publication protocol.
+///
+/// A crash after the public workspace rename but before the synchronous
+/// catalog batch leaves an external manifest without a Ready catalog state.
+/// That workspace is withdrawn before new jobs are accepted. An existing
+/// manifest is deliberately retained for an idempotent retry; no Ready
+/// workspace may exist without the matching catalog record, name mapping, and
+/// generation pin.
+pub fn reconcile_workspace_publications<C: Catalog>(
+    catalog: &C,
+    manifests_root: impl AsRef<Path>,
+    workspaces: impl AsRef<Path>,
+    trash: impl AsRef<Path>,
+) -> Result<WorkspacePublicationReconciliation, WorkspaceReconciliationError> {
+    let manifests_root = manifests_root.as_ref();
+    let workspaces = workspaces.as_ref();
+    let trash = trash.as_ref();
+    let entries = match fs::read_dir(manifests_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(WorkspacePublicationReconciliation::default())
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let mut manifests = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(WORKSPACE_MANIFEST_SUFFIX))
+        {
+            manifests.push(path);
+            if manifests.len() > MAX_WORKSPACE_PUBLICATION_RECONCILIATION {
+                return Err(WorkspaceReconciliationError::TooManyManifests {
+                    maximum: MAX_WORKSPACE_PUBLICATION_RECONCILIATION,
+                });
+            }
+        }
+    }
+    manifests.sort_unstable();
+
+    let mut result = WorkspacePublicationReconciliation::default();
+    for path in manifests {
+        let manifest = read_workspace_manifest(&path)?;
+        result.manifests_examined = result.manifests_examined.checked_add(1).ok_or(
+            WorkspaceReconciliationError::TooManyManifests {
+                maximum: MAX_WORKSPACE_PUBLICATION_RECONCILIATION,
+            },
+        )?;
+        match load_ready_workspace(catalog, manifests_root, manifest.workspace_id)? {
+            Some(_) => {
+                let workspace =
+                    workspaces.join(std::str::from_utf8(&manifest.name).map_err(|_| {
+                        WorkspaceReconciliationError::UnsafeWorkspacePath(workspaces.into())
+                    })?);
+                let metadata = fs::symlink_metadata(&workspace).map_err(|error| {
+                    if error.kind() == io::ErrorKind::NotFound {
+                        WorkspaceReconciliationError::ReadyWorkspaceMissing(workspace.clone())
+                    } else {
+                        WorkspaceReconciliationError::Io(error)
+                    }
+                })?;
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err(WorkspaceReconciliationError::UnsafeWorkspacePath(workspace));
+                }
+                result.ready_workspaces = result.ready_workspaces.checked_add(1).ok_or(
+                    WorkspaceReconciliationError::TooManyManifests {
+                        maximum: MAX_WORKSPACE_PUBLICATION_RECONCILIATION,
+                    },
+                )?;
+            }
+            None => {
+                if withdraw_workspace(workspaces, trash, &manifest)?.is_some() {
+                    result.incomplete_workspaces_withdrawn = result
+                        .incomplete_workspaces_withdrawn
+                        .checked_add(1)
+                        .ok_or(WorkspaceReconciliationError::TooManyManifests {
+                            maximum: MAX_WORKSPACE_PUBLICATION_RECONCILIATION,
+                        })?;
+                }
+            }
+        }
+    }
+    Ok(result)
+}
+
+/// Failure while deleting a Ready workspace and releasing its GC retention.
+#[derive(Debug)]
+pub enum WorkspaceDeletionError {
+    Io(io::Error),
+    Manifest(WorkspaceManifestError),
+    Reconciliation(WorkspaceReconciliationError),
+    Catalog(CatalogError),
+    NotReady(WorkspaceId),
+}
+
+impl std::fmt::Display for WorkspaceDeletionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(error) => write!(formatter, "workspace deletion I/O error: {error}"),
+            Self::Manifest(error) => {
+                write!(formatter, "workspace deletion manifest error: {error}")
+            }
+            Self::Reconciliation(error) => {
+                write!(formatter, "workspace deletion withdrawal error: {error}")
+            }
+            Self::Catalog(error) => {
+                write!(formatter, "workspace deletion catalog error: {error:?}")
+            }
+            Self::NotReady(id) => write!(formatter, "workspace is not Ready: {id:?}"),
+        }
+    }
+}
+
+impl std::error::Error for WorkspaceDeletionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            Self::Manifest(error) => Some(error),
+            Self::Reconciliation(error) => Some(error),
+            Self::Catalog(error) => Some(error),
+            Self::NotReady(_) => None,
+        }
+    }
+}
+
+impl From<io::Error> for WorkspaceDeletionError {
+    fn from(value: io::Error) -> Self {
+        Self::Io(value)
+    }
+}
+
+impl From<WorkspaceManifestError> for WorkspaceDeletionError {
+    fn from(value: WorkspaceManifestError) -> Self {
+        Self::Manifest(value)
+    }
+}
+
+impl From<WorkspaceReconciliationError> for WorkspaceDeletionError {
+    fn from(value: WorkspaceReconciliationError) -> Self {
+        Self::Reconciliation(value)
+    }
+}
+
+impl From<CatalogError> for WorkspaceDeletionError {
+    fn from(value: CatalogError) -> Self {
+        Self::Catalog(value)
+    }
+}
+
+/// Removes a workspace from the public namespace before releasing its cold
+/// generation pin. A crash before the catalog update leaks a pin but never
+/// lets GC reclaim a still-visible workspace; a crash after the update leaves
+/// only non-Ready derived metadata that startup can clean up.
+pub fn delete_persisted_workspace<C: Catalog>(
+    catalog: &mut C,
+    manifests_root: impl AsRef<Path>,
+    workspaces: impl AsRef<Path>,
+    trash: impl AsRef<Path>,
+    id: WorkspaceId,
+) -> Result<(), WorkspaceDeletionError> {
+    let manifests_root = manifests_root.as_ref();
+    let manifest = load_ready_workspace(catalog, manifests_root, id)?
+        .ok_or(WorkspaceDeletionError::NotReady(id))?;
+    withdraw_workspace(workspaces.as_ref(), trash.as_ref(), &manifest)?;
+    let mut batch = CatalogBatch::new();
+    batch.delete_workspace_pin(id);
+    catalog.apply(batch)?;
+    let path = workspace_manifest_path(manifests_root, id);
+    match fs::remove_file(&path) {
+        Ok(()) => File::open(manifests_root)?.sync_all()?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
 }
 
 fn encode_workspace_manifest(
@@ -644,6 +1027,73 @@ pub struct WorkspaceCheckoutRequest<'a> {
     pub replace: ReplacePolicy,
 }
 
+/// Trusted inputs for a cold checkout that must become both physically
+/// visible and durably Ready. `manifest` is daemon-owned metadata, including
+/// the immutable snapshot identity and cold generation that the workspace
+/// must retain for GC.
+pub struct PersistedWorkspaceCheckoutRequest<'a> {
+    pub checkout: WorkspaceCheckoutRequest<'a>,
+    pub manifests_root: &'a Path,
+    pub manifest: WorkspaceManifestInput,
+}
+
+/// Failure while publishing a cold checkout together with its durable
+/// workspace manifest and catalog generation pin.
+#[derive(Debug)]
+pub enum PersistedWorkspaceCheckoutError {
+    ManifestInputMismatch,
+    ReplaceNotSupported,
+    Planning(Box<WorkspaceError>),
+    Materialize(Box<MaterializeError<WorkspaceError>>),
+    Manifest(WorkspaceManifestError),
+    Publish(WorkspacePublishError),
+    Persistence(WorkspacePersistenceError),
+    Rollback {
+        persistence: Box<WorkspacePersistenceError>,
+        rollback: Box<WorkspaceReconciliationError>,
+    },
+}
+
+impl std::fmt::Display for PersistedWorkspaceCheckoutError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ManifestInputMismatch => {
+                write!(formatter, "workspace manifest input does not match checkout request")
+            }
+            Self::ReplaceNotSupported => write!(
+                formatter,
+                "durable workspace publication requires a new workspace name; replacement is not supported"
+            ),
+            Self::Planning(error) => write!(formatter, "workspace planning failed: {error}"),
+            Self::Materialize(error) => write!(formatter, "workspace materialization failed: {error}"),
+            Self::Manifest(error) => write!(formatter, "workspace manifest preparation failed: {error}"),
+            Self::Publish(error) => write!(formatter, "workspace publication failed: {error}"),
+            Self::Persistence(error) => write!(formatter, "workspace Ready publication failed: {error}"),
+            Self::Rollback {
+                persistence,
+                rollback,
+            } => write!(
+                formatter,
+                "workspace Ready publication failed ({persistence}) and visible-workspace rollback failed ({rollback})"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PersistedWorkspaceCheckoutError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Planning(error) => Some(error),
+            Self::Materialize(error) => Some(error),
+            Self::Manifest(error) => Some(error),
+            Self::Publish(error) => Some(error),
+            Self::Persistence(error) => Some(error),
+            Self::Rollback { persistence, .. } => Some(persistence),
+            Self::ManifestInputMismatch | Self::ReplaceNotSupported => None,
+        }
+    }
+}
+
 /// Resolves records for one repository using a repo-scoped catalog namespace.
 /// `chunk_path` maps a persisted generation/chunk pair to its immutable file.
 pub struct ColdWorkspaceSource<'a, C, F> {
@@ -704,17 +1154,22 @@ impl<'a, C: Catalog, F: Fn(u32, u64) -> PathBuf> ColdWorkspaceSource<'a, C, F> {
             (self.chunk_path)(location.generation, location.chunk_id),
             location,
         )?;
-        if record.codec != Codec::Raw {
-            return Err(WorkspaceError::UnsupportedCodec(record.codec));
-        }
-        let actual = ContentId::for_object(record.kind, &record.payload);
+        let raw_payload = decode_object_payload(&record)?;
+        let actual = ContentId::for_object(record.kind, &raw_payload);
         if actual != id || record.content_id != id {
             return Err(WorkspaceError::ContentMismatch {
                 expected: id,
                 actual,
             });
         }
-        Ok((id, record))
+        Ok((
+            id,
+            ObjectRecord {
+                codec: Codec::Raw,
+                payload: raw_payload,
+                ..record
+            },
+        ))
     }
 
     fn git_object(&self, oid: &GitOid) -> Result<GitObject, WorkspaceError> {
@@ -831,6 +1286,91 @@ impl<'a, C: Catalog, F: Fn(u32, u64) -> PathBuf> ColdWorkspaceSource<'a, C, F> {
         let entry = TreeEntry::from_raw(entry.name, entry.mode, entry.oid, limits)?;
         builder.add_tree_entry(parent, entry)?;
         Ok(())
+    }
+}
+
+/// Builds, materializes, and publishes a real cold checkout with the
+/// manifest-first Ready transaction required for workspace GC safety.
+///
+/// The API deliberately owns the mutable catalog borrow. It creates short
+/// immutable reader borrows only while resolving cold objects, then releases
+/// them before committing the workspace record/name/pin batch. This avoids an
+/// unsafe split between the source catalog and a different persistence
+/// catalog. Replacement is intentionally rejected: a new durable workspace
+/// requires a fresh identity and name rather than risking an unpinned visible
+/// tree while trying to roll back an old one.
+pub fn checkout_cold_commit_and_persist<C, F>(
+    repository: RepoId,
+    catalog: &mut C,
+    cache: &Cache,
+    chunk_path: F,
+    request: PersistedWorkspaceCheckoutRequest<'_>,
+) -> Result<PathBuf, PersistedWorkspaceCheckoutError>
+where
+    C: Catalog,
+    F: Fn(u32, u64) -> PathBuf,
+{
+    let PersistedWorkspaceCheckoutRequest {
+        checkout,
+        manifests_root,
+        manifest: manifest_input,
+    } = request;
+    if manifest_input.repository != repository
+        || manifest_input.commit != checkout.commit
+        || manifest_input.name != *checkout.name
+    {
+        return Err(PersistedWorkspaceCheckoutError::ManifestInputMismatch);
+    }
+    if checkout.replace != ReplacePolicy::Reject {
+        return Err(PersistedWorkspaceCheckoutError::ReplaceNotSupported);
+    }
+    if let Some(existing) = catalog.workspace_name(checkout.name.as_str().as_bytes()) {
+        if existing != manifest_input.workspace_id {
+            return Err(PersistedWorkspaceCheckoutError::Persistence(
+                WorkspacePersistenceError::NameAlreadyPublished(existing),
+            ));
+        }
+    }
+
+    let plan = ColdWorkspaceSource::new(repository, &*catalog, cache, &chunk_path)
+        .plan_commit(checkout.commit, checkout.limits)
+        .map_err(|error| PersistedWorkspaceCheckoutError::Planning(Box::new(error)))?;
+    let manifest = WorkspaceManifest::from_plan(manifest_input, &plan)
+        .map_err(PersistedWorkspaceCheckoutError::Manifest)?;
+    {
+        let source = ColdWorkspaceSource::new(repository, &*catalog, cache, &chunk_path);
+        materialize_raw(
+            &plan,
+            &source,
+            cache,
+            checkout.staging,
+            checkout.gitlink_policy,
+        )
+        .map_err(|error| PersistedWorkspaceCheckoutError::Materialize(Box::new(error)))?;
+    }
+    ensure_workspace_manifest(manifests_root, &manifest)
+        .map_err(PersistedWorkspaceCheckoutError::Manifest)?;
+    let published = publish_workspace(
+        checkout.staging,
+        checkout.workspaces,
+        checkout.trash,
+        checkout.name,
+        ReplacePolicy::Reject,
+    )
+    .map_err(PersistedWorkspaceCheckoutError::Publish)?;
+    match persist_ready_workspace(catalog, manifests_root, &manifest) {
+        Ok(_) => Ok(published),
+        Err(persistence) => {
+            match withdraw_workspace(checkout.workspaces, checkout.trash, &manifest) {
+                Ok(Some(_)) | Ok(None) => {
+                    Err(PersistedWorkspaceCheckoutError::Persistence(persistence))
+                }
+                Err(rollback) => Err(PersistedWorkspaceCheckoutError::Rollback {
+                    persistence: Box::new(persistence),
+                    rollback: Box::new(rollback),
+                }),
+            }
+        }
     }
 }
 
@@ -1294,6 +1834,223 @@ mod tests {
             load_ready_workspace(&catalog, &manifests, workspace_id).unwrap(),
             None
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn persisted_cold_checkout_withdraws_on_catalog_failure_retries_and_pins_until_deletion() {
+        #[derive(Default)]
+        struct ToggleCatalog {
+            inner: InMemoryCatalog,
+            reject_next_apply: bool,
+        }
+
+        impl Catalog for ToggleCatalog {
+            fn apply(&mut self, batch: CatalogBatch) -> Result<(), CatalogError> {
+                if self.reject_next_apply {
+                    self.reject_next_apply = false;
+                    return Err(CatalogError::Backend(
+                        "injected Ready workspace catalog failure".into(),
+                    ));
+                }
+                self.inner.apply(batch)
+            }
+
+            fn object_location(
+                &self,
+                id: ContentId,
+            ) -> Option<reflink_forest_index::ObjectLocation> {
+                self.inner.object_location(id)
+            }
+
+            fn oid_alias(&self, repository: RepoId, oid: &GitOid) -> Option<ContentId> {
+                self.inner.oid_alias(repository, oid)
+            }
+
+            fn chunk(
+                &self,
+                generation: u32,
+                chunk_id: u64,
+            ) -> Option<reflink_forest_index::ChunkMetadata> {
+                self.inner.chunk(generation, chunk_id)
+            }
+
+            fn workspace(&self, id: WorkspaceId) -> Option<Vec<u8>> {
+                self.inner.workspace(id)
+            }
+
+            fn workspace_name(&self, name: &[u8]) -> Option<WorkspaceId> {
+                self.inner.workspace_name(name)
+            }
+
+            fn workspace_pin(&self, id: WorkspaceId) -> Option<u32> {
+                self.inner.workspace_pin(id)
+            }
+
+            fn workspace_pins(&self) -> Result<Vec<(WorkspaceId, u32)>, CatalogError> {
+                self.inner.workspace_pins()
+            }
+
+            fn current_generation(&self) -> Option<u32> {
+                self.inner.current_generation()
+            }
+        }
+
+        let root = temp_root();
+        fs::create_dir(&root).unwrap();
+        let chunk = root.join("1.open");
+        let cache = Cache::open(root.join("cache")).unwrap();
+        let repository = RepoId([0x51; 16]);
+        let commit = oid(0x52);
+        let tree = oid(0x53);
+        let target = oid(0x54);
+        let workspace_id = WorkspaceId([0x55; 16]);
+        let name = WorkspaceName::new("durable-workspace").unwrap();
+        let mut writer = ChunkWriter::create(
+            &chunk,
+            ChunkHeader {
+                generation: 1,
+                chunk_id: 1,
+                created_unix_secs: 0,
+                flags: 0,
+            },
+        )
+        .unwrap();
+        let mut catalog = ToggleCatalog::default();
+        append(
+            &mut writer,
+            &mut catalog,
+            repository,
+            target,
+            ObjectKind::Blob,
+            b"private-target".to_vec(),
+        );
+        let mut tree_bytes = b"120000 linked\0".to_vec();
+        tree_bytes.extend_from_slice(target.as_bytes());
+        append(
+            &mut writer,
+            &mut catalog,
+            repository,
+            tree,
+            ObjectKind::Tree,
+            tree_bytes,
+        );
+        append(
+            &mut writer,
+            &mut catalog,
+            repository,
+            commit,
+            ObjectKind::Commit,
+            format!("tree {}\n\ndurable workspace\n", oid_hex(&tree)).into_bytes(),
+        );
+        writer.sync_data().unwrap();
+        drop(writer);
+
+        let manifests = root.join("manifests");
+        let staging = root.join("staging/workspace");
+        let workspaces = root.join("workspaces");
+        let trash = root.join("trash");
+        fs::create_dir_all(&staging).unwrap();
+        fs::create_dir_all(&workspaces).unwrap();
+        let request = || PersistedWorkspaceCheckoutRequest {
+            checkout: WorkspaceCheckoutRequest {
+                commit,
+                limits: reflink_forest_checkout::DEFAULT_CHECKOUT_LIMITS,
+                staging: &staging,
+                workspaces: &workspaces,
+                trash: &trash,
+                name: &name,
+                gitlink_policy: GitlinkPolicy::Reject,
+                replace: ReplacePolicy::Reject,
+            },
+            manifests_root: &manifests,
+            manifest: WorkspaceManifestInput {
+                workspace_id,
+                repository,
+                snapshot_id: [0x56; 16],
+                commit,
+                generation: 1,
+                name: name.clone(),
+                created_unix_secs: 7,
+            },
+        };
+
+        catalog.reject_next_apply = true;
+        assert!(matches!(
+            checkout_cold_commit_and_persist(
+                repository,
+                &mut catalog,
+                &cache,
+                |_, _| chunk.clone(),
+                request(),
+            ),
+            Err(PersistedWorkspaceCheckoutError::Persistence(
+                WorkspacePersistenceError::Catalog(_)
+            ))
+        ));
+        assert!(!workspaces.join(name.as_str()).exists());
+        assert!(workspace_manifest_path(&manifests, workspace_id).is_file());
+        assert_eq!(catalog.workspace(workspace_id), None);
+        assert_eq!(catalog.workspace_pin(workspace_id), None);
+        assert_eq!(
+            reconcile_workspace_publications(&catalog, &manifests, &workspaces, &trash).unwrap(),
+            WorkspacePublicationReconciliation {
+                manifests_examined: 1,
+                ready_workspaces: 0,
+                incomplete_workspaces_withdrawn: 0,
+            }
+        );
+
+        fs::create_dir_all(&staging).unwrap();
+        let workspace = checkout_cold_commit_and_persist(
+            repository,
+            &mut catalog,
+            &cache,
+            |_, _| chunk.clone(),
+            request(),
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_link(workspace.join("linked")).unwrap(),
+            PathBuf::from("private-target")
+        );
+        assert_eq!(catalog.workspace_pin(workspace_id), Some(1));
+        assert!(load_ready_workspace(&catalog, &manifests, workspace_id)
+            .unwrap()
+            .is_some());
+
+        let generations = GenerationManager::open(root.join("leases")).unwrap();
+        let source_generation = root.join("generation-1");
+        fs::create_dir(&source_generation).unwrap();
+        let mut publish_generation = CatalogBatch::new();
+        publish_generation.put_current_generation(2);
+        catalog.apply(publish_generation).unwrap();
+        assert!(matches!(
+            reflink_forest_maintenance::retire_compacted_generation(
+                &catalog,
+                &generations,
+                1,
+                2,
+                &source_generation,
+                root.join("generation-trash"),
+            ),
+            Err(MaintenanceError::PinnedGeneration(1))
+        ));
+
+        delete_persisted_workspace(&mut catalog, &manifests, &workspaces, &trash, workspace_id)
+            .unwrap();
+        assert!(!workspaces.join(name.as_str()).exists());
+        assert_eq!(catalog.workspace_pin(workspace_id), None);
+        assert!(!workspace_manifest_path(&manifests, workspace_id).exists());
+        assert!(reflink_forest_maintenance::retire_compacted_generation(
+            &catalog,
+            &generations,
+            1,
+            2,
+            &source_generation,
+            root.join("generation-trash"),
+        )
+        .is_ok());
         fs::remove_dir_all(root).unwrap();
     }
 

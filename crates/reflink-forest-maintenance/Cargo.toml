@@ -7,6 +7,7 @@ license = "MIT OR Apache-2.0"
 description = "Generation leases and atomic maintenance state for Reflink Forest"
 
 [dependencies]
+reflink-forest-cache = { path = "../reflink-forest-cache" }
 reflink-forest-index = { path = "../reflink-forest-index" }
 reflink-forest-core = { path = "../reflink-forest-core" }
 reflink-forest-format = { path = "../reflink-forest-format" }

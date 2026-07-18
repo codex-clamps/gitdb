@@ -8,6 +8,8 @@ only in the privileged VM capability job.
 | --- | --- | --- | --- |
 | Import | source repository removed after Ready snapshot | retained tag, commit, tree, and blobs resolve from cold storage | portable integration test |
 | Cold record | truncated/corrupt payload, header, footer, or tail | invalid data is rejected; only a valid open prefix remains usable | portable store/format tests |
+| Cold chunk seal | crash after footer sync, after rename/directory sync, or after catalog publication | startup validates the footer, completes or republishes the sealed state idempotently, and never makes the chunk writable again | portable store tests |
+| Cold chunk rotation | target crossed or one record exceeds the target | every record remains whole; an oversized record occupies one sealed dedicated chunk | portable store tests |
 | Cache hydrate | concurrent same-ContentId requests | one authoritative read/publish; all callers receive the verified file | portable cache test |
 | Cache hydrate | corrupt/incomplete cache leaf or malicious symlink | no invalid file is accepted; leaf is quarantined or regenerated without following links | portable cache test |
 | Checkout | malformed Git path or concurrent symlink substitution below staging | no path escapes staging and no partial workspace is published | portable checkout test |

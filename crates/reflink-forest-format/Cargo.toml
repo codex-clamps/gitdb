@@ -8,4 +8,4 @@ description = "Version 1 chunk and record codec for Reflink Forest"
 
 [dependencies]
 reflink-forest-core = { path = "../reflink-forest-core" }
-
+zstd = "0.13"

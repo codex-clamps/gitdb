@@ -589,7 +589,7 @@ fn clone_blob_at(
     relative: &RelativePath,
 ) -> Result<(), CacheError> {
     use std::os::fd::AsRawFd;
-    let source = File::open(cache.verified_path(id)?)?;
+    let source = cache.open_verified_blob(id)?;
     let destination = create_file_at(stage, relative, 0o644)?;
     if unsafe { libc::ioctl(destination.as_raw_fd(), FICLONE, source.as_raw_fd()) } != 0 {
         return Err(CacheError::Io(io::Error::last_os_error()));

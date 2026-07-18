@@ -8,7 +8,7 @@ use core::fmt;
 use sha2::{Digest, Sha256};
 use std::{
     fs::{File, OpenOptions},
-    io,
+    io::{self, Write},
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::Path,
 };
@@ -179,6 +179,63 @@ impl GitOid {
     }
 }
 
+/// Incremental native Git object-ID hasher.
+///
+/// The constructor writes the canonical Git object header
+/// (`"<kind> <raw_length>\\0"`) before accepting raw object bytes through
+/// [`Write`].  This lets callers verify aliases while streaming an object
+/// without retaining its full payload.
+pub struct GitOidHasher {
+    algorithm: HashAlgorithm,
+    digest: GitOidDigest,
+}
+
+enum GitOidDigest {
+    Sha1(sha1::Sha1),
+    Sha256(Sha256),
+}
+
+impl GitOidHasher {
+    /// Starts hashing one raw Git object with its canonical type-and-length
+    /// header already included.
+    pub fn new(algorithm: HashAlgorithm, kind: ObjectKind, raw_length: u64) -> Self {
+        let header = git_object_header(kind, raw_length);
+        let mut digest = match algorithm {
+            HashAlgorithm::Sha1 => GitOidDigest::Sha1(sha1::Sha1::new()),
+            HashAlgorithm::Sha256 => GitOidDigest::Sha256(Sha256::new()),
+        };
+        match &mut digest {
+            GitOidDigest::Sha1(digest) => digest.update(&header),
+            GitOidDigest::Sha256(digest) => digest.update(&header),
+        }
+        Self { algorithm, digest }
+    }
+
+    /// Finalizes the canonical native Git object ID.
+    pub fn finish(self) -> GitOid {
+        match self.digest {
+            GitOidDigest::Sha1(digest) => GitOid::new(self.algorithm, &digest.finalize())
+                .expect("SHA-1 digest has a fixed length"),
+            GitOidDigest::Sha256(digest) => GitOid::new(self.algorithm, &digest.finalize())
+                .expect("SHA-256 digest has a fixed length"),
+        }
+    }
+}
+
+impl Write for GitOidHasher {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        match &mut self.digest {
+            GitOidDigest::Sha1(digest) => digest.update(bytes),
+            GitOidDigest::Sha256(digest) => digest.update(bytes),
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 fn git_object_kind_name(kind: ObjectKind) -> &'static str {
     match kind {
         ObjectKind::Commit => "commit",
@@ -186,6 +243,15 @@ fn git_object_kind_name(kind: ObjectKind) -> &'static str {
         ObjectKind::Blob => "blob",
         ObjectKind::Tag => "tag",
     }
+}
+
+fn git_object_header(kind: ObjectKind, raw_length: u64) -> Vec<u8> {
+    let mut header = Vec::with_capacity(32);
+    header.extend_from_slice(git_object_kind_name(kind).as_bytes());
+    header.push(b' ');
+    header.extend_from_slice(raw_length.to_string().as_bytes());
+    header.push(0);
+    header
 }
 
 /// The domain separator for internal, algorithm-independent object identities.
@@ -330,6 +396,21 @@ mod tests {
         let error = GitOid::new(HashAlgorithm::Sha256, &[0; 20]).unwrap_err();
         assert_eq!(error.algorithm, HashAlgorithm::Sha256);
         assert_eq!(error.actual, 20);
+    }
+
+    #[test]
+    fn git_oid_hasher_matches_one_shot_for_sha1_and_sha256() {
+        let payload = b"native Git object IDs hash the canonical raw payload";
+        for algorithm in [HashAlgorithm::Sha1, HashAlgorithm::Sha256] {
+            let mut hasher = GitOidHasher::new(algorithm, ObjectKind::Blob, payload.len() as u64);
+            for part in payload.chunks(7) {
+                hasher.write_all(part).unwrap();
+            }
+            assert_eq!(
+                hasher.finish(),
+                GitOid::for_object(algorithm, ObjectKind::Blob, payload)
+            );
+        }
     }
 
     #[test]

@@ -10,8 +10,10 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 reflink-forest-backup = { path = "../crates/reflink-forest-backup" }
+reflink-forest-core = { path = "../crates/reflink-forest-core" }
 reflink-forest-format = { path = "../crates/reflink-forest-format" }
 reflink-forest-import = { path = "../crates/reflink-forest-import" }
+reflink-forest-store = { path = "../crates/reflink-forest-store" }
 
 [[bin]]
 name = "format_decode"
@@ -30,6 +32,20 @@ bench = false
 [[bin]]
 name = "backup_decode"
 path = "fuzz_targets/backup_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "codec_decode"
+path = "fuzz_targets/codec_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "open_chunk_recovery"
+path = "fuzz_targets/open_chunk_recovery.rs"
 test = false
 doc = false
 bench = false

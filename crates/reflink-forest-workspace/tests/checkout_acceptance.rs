@@ -12,15 +12,22 @@ use std::{
 
 use reflink_forest_cache::{Cache, CacheError};
 use reflink_forest_checkout::{
-    materialize_raw, publish_workspace, GitlinkPolicy, MaterializeError, ReplacePolicy,
-    WorkspaceName,
+    materialize_raw, publish_workspace, GitlinkPolicy, MaterializeError, RawCheckoutSource,
+    ReplacePolicy, WorkspaceName,
 };
 use reflink_forest_core::{ContentId, GitOid, HashAlgorithm, ObjectKind};
-use reflink_forest_format::{ChunkHeader, Codec, ObjectRecord};
-use reflink_forest_index::{Catalog, InMemoryCatalog, RepoId};
+use reflink_forest_format::{encode_object_payload, ChunkHeader, Codec, ObjectRecord};
+use reflink_forest_index::{
+    Catalog, CatalogBatch, CatalogError, InMemoryCatalog, RepoId, WorkspaceId,
+};
+use reflink_forest_maintenance::{
+    retire_compacted_generation, GenerationManager, MaintenanceError,
+};
 use reflink_forest_store::ChunkWriter;
 use reflink_forest_workspace::{
-    ColdWorkspaceSource, WorkspaceCheckoutError, WorkspaceCheckoutRequest, WorkspaceError,
+    checkout_cold_commit_and_persist, delete_persisted_workspace, ColdWorkspaceSource,
+    PersistedWorkspaceCheckoutRequest, WorkspaceCheckoutError, WorkspaceCheckoutRequest,
+    WorkspaceError, WorkspaceManifestInput,
 };
 
 struct TempRoot(PathBuf);
@@ -92,6 +99,29 @@ fn append<C: Catalog>(
         .unwrap();
 }
 
+fn append_zstd<C: Catalog>(
+    writer: &mut ChunkWriter,
+    catalog: &mut C,
+    repository: RepoId,
+    object: GitOid,
+    kind: ObjectKind,
+    payload: impl Into<Vec<u8>>,
+) {
+    let raw = payload.into();
+    let record = ObjectRecord {
+        kind,
+        codec: Codec::Zstd,
+        flags: 0,
+        raw_length: raw.len() as u64,
+        content_id: ContentId::for_object(kind, &raw),
+        primary_oid: object,
+        payload: encode_object_payload(Codec::Zstd, &raw).unwrap(),
+    };
+    writer
+        .append_and_index(catalog, repository, 1, 1, &record)
+        .unwrap();
+}
+
 fn new_writer(path: &Path) -> ChunkWriter {
     ChunkWriter::create(
         path,
@@ -118,6 +148,220 @@ fn ficlone_is_unsupported(error: &MaterializeError<WorkspaceError>) -> bool {
         MaterializeError::Cache(CacheError::Io(io_error))
             if matches!(io_error.raw_os_error(), Some(18) | Some(95))
     )
+}
+
+/// Exercises the persisted publication API rather than assembling its
+/// manifest, catalog pin, and public tree separately. The checked-out tree
+/// contains only a symlink so this test works on filesystems without FICLONE.
+#[test]
+fn persisted_checkout_pin_blocks_gc_until_the_public_workspace_is_deleted() {
+    #[derive(Default)]
+    struct TestCatalog(InMemoryCatalog);
+
+    impl Catalog for TestCatalog {
+        fn apply(&mut self, batch: CatalogBatch) -> Result<(), CatalogError> {
+            self.0.apply(batch)
+        }
+
+        fn object_location(&self, id: ContentId) -> Option<reflink_forest_index::ObjectLocation> {
+            self.0.object_location(id)
+        }
+
+        fn oid_alias(&self, repository: RepoId, oid: &GitOid) -> Option<ContentId> {
+            self.0.oid_alias(repository, oid)
+        }
+
+        fn chunk(
+            &self,
+            generation: u32,
+            chunk_id: u64,
+        ) -> Option<reflink_forest_index::ChunkMetadata> {
+            self.0.chunk(generation, chunk_id)
+        }
+
+        fn workspace(&self, id: WorkspaceId) -> Option<Vec<u8>> {
+            self.0.workspace(id)
+        }
+
+        fn workspace_name(&self, name: &[u8]) -> Option<WorkspaceId> {
+            self.0.workspace_name(name)
+        }
+
+        fn workspace_pin(&self, id: WorkspaceId) -> Option<u32> {
+            self.0.workspace_pin(id)
+        }
+
+        fn workspace_pins(&self) -> Result<Vec<(WorkspaceId, u32)>, CatalogError> {
+            self.0.workspace_pins()
+        }
+
+        fn current_generation(&self) -> Option<u32> {
+            self.0.current_generation()
+        }
+    }
+
+    let root = TempRoot::on_clone_domain("checkout-persisted-pin");
+    let chunk = root.path().join("1.open");
+    let cache = Cache::open(root.path().join("cache")).unwrap();
+    let repository = RepoId([0x81; 16]);
+    let commit = oid(0x82);
+    let tree = oid(0x83);
+    let symlink_target = oid(0x84);
+    let workspace_id = WorkspaceId([0x85; 16]);
+    let name = WorkspaceName::new("pinned-public-workspace").unwrap();
+    let mut catalog = TestCatalog::default();
+    let mut writer = new_writer(&chunk);
+    append(
+        &mut writer,
+        &mut catalog,
+        repository,
+        symlink_target,
+        ObjectKind::Blob,
+        b"cold-target".to_vec(),
+    );
+    let mut tree_payload = Vec::new();
+    push_tree_entry(&mut tree_payload, b"120000", b"linked", symlink_target);
+    append(
+        &mut writer,
+        &mut catalog,
+        repository,
+        tree,
+        ObjectKind::Tree,
+        tree_payload,
+    );
+    append(
+        &mut writer,
+        &mut catalog,
+        repository,
+        commit,
+        ObjectKind::Commit,
+        format!("tree {}\n\npersisted public checkout\n", oid_hex(&tree)).into_bytes(),
+    );
+    writer.sync_data().unwrap();
+    drop(writer);
+
+    let manifests = root.path().join("manifests");
+    let staging = root.path().join("staging/private");
+    let workspaces = root.path().join("workspaces");
+    let trash = root.path().join("trash");
+    fs::create_dir_all(&staging).unwrap();
+    fs::create_dir_all(&workspaces).unwrap();
+    let workspace = checkout_cold_commit_and_persist(
+        repository,
+        &mut catalog,
+        &cache,
+        |_, _| chunk.clone(),
+        PersistedWorkspaceCheckoutRequest {
+            checkout: WorkspaceCheckoutRequest {
+                commit,
+                limits: reflink_forest_checkout::DEFAULT_CHECKOUT_LIMITS,
+                staging: &staging,
+                workspaces: &workspaces,
+                trash: &trash,
+                name: &name,
+                gitlink_policy: GitlinkPolicy::Reject,
+                replace: ReplacePolicy::Reject,
+            },
+            manifests_root: &manifests,
+            manifest: WorkspaceManifestInput {
+                workspace_id,
+                repository,
+                snapshot_id: [0x86; 16],
+                commit,
+                generation: 1,
+                name: name.clone(),
+                created_unix_secs: 0,
+            },
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        fs::read_link(workspace.join("linked")).unwrap(),
+        PathBuf::from("cold-target")
+    );
+    assert_eq!(catalog.workspace_pin(workspace_id), Some(1));
+
+    let generations = GenerationManager::open(root.path().join("leases")).unwrap();
+    let old_generation = root.path().join("generation-1");
+    fs::create_dir(&old_generation).unwrap();
+    let mut publish = CatalogBatch::new();
+    publish.put_current_generation(2);
+    catalog.apply(publish).unwrap();
+    assert!(matches!(
+        retire_compacted_generation(
+            &catalog,
+            &generations,
+            1,
+            2,
+            &old_generation,
+            root.path().join("generation-trash"),
+        ),
+        Err(MaintenanceError::PinnedGeneration(1))
+    ));
+
+    delete_persisted_workspace(&mut catalog, &manifests, &workspaces, &trash, workspace_id)
+        .unwrap();
+    assert!(!workspace.exists());
+    assert_eq!(catalog.workspace_pin(workspace_id), None);
+    assert!(retire_compacted_generation(
+        &catalog,
+        &generations,
+        1,
+        2,
+        &old_generation,
+        root.path().join("generation-trash"),
+    )
+    .is_ok());
+}
+
+#[test]
+fn cold_workspace_plans_and_reads_zstd_git_objects() {
+    let root = TempRoot::on_clone_domain("checkout-zstd");
+    let chunk = root.path().join("1.open");
+    let cache = Cache::open(root.path().join("cache")).unwrap();
+    let repository = RepoId([0x41; 16]);
+    let commit = oid(0x42);
+    let tree = oid(0x43);
+    let blob = oid(0x44);
+    let blob_bytes = b"zstd raw checkout bytes\n".to_vec();
+
+    let mut writer = new_writer(&chunk);
+    let mut catalog = InMemoryCatalog::default();
+    append_zstd(
+        &mut writer,
+        &mut catalog,
+        repository,
+        blob,
+        ObjectKind::Blob,
+        blob_bytes.clone(),
+    );
+    let mut tree_payload = Vec::new();
+    push_tree_entry(&mut tree_payload, b"100644", b"zstd.txt", blob);
+    append_zstd(
+        &mut writer,
+        &mut catalog,
+        repository,
+        tree,
+        ObjectKind::Tree,
+        tree_payload,
+    );
+    append_zstd(
+        &mut writer,
+        &mut catalog,
+        repository,
+        commit,
+        ObjectKind::Commit,
+        format!("tree {}\n\nzstd checkout\n", oid_hex(&tree)).into_bytes(),
+    );
+    writer.sync_data().unwrap();
+    drop(writer);
+
+    let source = ColdWorkspaceSource::new(repository, &catalog, &cache, |_, _| chunk.clone());
+    let plan = source
+        .plan_commit(commit, reflink_forest_checkout::DEFAULT_CHECKOUT_LIMITS)
+        .unwrap();
+    assert_eq!(plan.entries().len(), 1);
+    assert_eq!(source.blob_bytes(&blob).unwrap(), blob_bytes);
 }
 
 #[test]

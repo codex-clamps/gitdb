@@ -63,6 +63,13 @@ RecordFooter: payload CRC32C, total record length, magic "RENDOBJ\\0"
 Padding:      zero to the next 8-byte boundary
 ```
 
+Codec `0` is raw and codec `1` is one independent Zstd frame. V1 Zstd writers
+use a bounded 2^23-byte history window and a frame checksum; readers reject a
+larger window, concatenated frames, trailing compressed bytes, a decoded length
+other than `raw length`, or raw bytes that do not recompute to the record's
+`ContentId`. Unknown codec tags are required fields and fail closed before
+decompression.
+
 All lengths and offsets are `u64`. A scanner validates bounds, header CRC,
 footer, total length, and payload CRC before accepting a record. A full
 verification additionally decompresses the payload and recomputes its
@@ -71,8 +78,26 @@ performed from the catalog for every repository-scoped alias.
 
 The only valid tail of an open chunk is a sequence of complete records. During
 recovery, truncate at the first incomplete or invalid trailing record. A sealed
-chunk also has a footer containing its record count, final length, and rolling
-metadata checksum.
+chunk ends with this fixed 64-byte footer:
+
+| Offset | Size | Field |
+| --- | ---: | --- |
+| 0 | 8 | magic `RFSSEAL\\0` |
+| 8 | 2 | format version (v1) |
+| 10 | 2 | footer length (64) |
+| 12 | 8 | complete record count |
+| 20 | 8 | final file length, including this footer |
+| 28 | 4 | CRC32C of the exact encoded record stream |
+| 32 | 4 | footer CRC32C, with this field zeroed while calculating |
+| 36 | 28 | reserved, zero |
+
+The record-stream CRC covers every complete encoded record, including its
+alignment padding, and excludes both the chunk header and this footer. A sealed
+reader validates the footer CRC, final length, every record boundary, the count,
+and this rolling CRC before treating the chunk as immutable. A complete valid
+footer under an `.open` name is an interrupted rename, not an open-tail record:
+startup finishes the rename and publishes sealed metadata. A partial or invalid
+footer is discarded as an invalid open tail.
 
 ## Commit and publication rules
 
@@ -80,8 +105,18 @@ For new records, append complete records, `fdatasync` the chunk, then write the
 corresponding RocksDB `WriteBatch`. Durable mode uses synchronous RocksDB
 writes. The catalog must never reference bytes that were not synchronized.
 
-Sealing writes and synchronizes the chunk footer, renames `.open` to `.sealed`,
-synchronizes its directory, then records the sealed state in RocksDB.
+Creating an open chunk writes and synchronizes its header, synchronizes the
+parent directory, and then publishes its `Open` metadata. Sealing writes and
+synchronizes the chunk footer, renames `.open` to `.sealed`, synchronizes its
+directory, then records the sealed state in RocksDB. Startup reconciles these
+steps idempotently: a verified `.sealed` file republishes its sealed metadata,
+and a complete footer in an `.open` file completes the rename before metadata is
+published.
+
+Rotation happens only before a complete record. The configured target includes
+the header and sealed footer; a record that cannot fit in an otherwise empty
+target-sized chunk is written to and immediately sealed in its own oversized
+chunk.
 
 Repository and workspace manifests are written to a temporary file, synced,
 renamed into place, and followed by a parent-directory sync before their Ready
@@ -118,4 +153,3 @@ reflink/copy-fallback results, and the pin needed by cold GC.
 
 Unknown optional manifest fields must be preserved by tools that rewrite a
 manifest. Unknown required fields or incompatible schema versions fail closed.
-

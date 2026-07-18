@@ -4,6 +4,15 @@
 //! Unix UID. It intentionally exposes no mount or ownership-changing action;
 //! those remain a fixed-purpose privileged-helper concern.
 
+#[cfg(feature = "production")]
+pub mod production;
+pub mod structured_log;
+#[cfg(feature = "production")]
+pub use production::{
+    ProductionDaemonConfig, ProductionDaemonService, ProductionDaemonServiceError,
+    ProductionStartup,
+};
+
 use reflink_forest_cache::{
     Cache, CacheCapacityCoordinator, CacheError, CacheEviction, CacheReconciliation,
     CapacityAdmission, CapacityAdmissionError, CapacityMeter, ReservePolicy,
@@ -20,7 +29,10 @@ use reflink_forest_maintenance::{
     SnapshotManifestSource,
 };
 use reflink_forest_store::{verify_chunk, StoreError};
-use reflink_forest_workspace::{load_ready_workspace, WorkspaceManifestError};
+use reflink_forest_workspace::{
+    load_ready_workspace, reconcile_workspace_publications, WorkspaceManifestError,
+    WorkspaceReconciliationError,
+};
 use std::{
     collections::{BTreeMap, VecDeque},
     fs::{self, File, OpenOptions},
@@ -886,6 +898,8 @@ impl TrustedOperationId {
 pub struct ImportCheckoutConfig {
     cache_root: PathBuf,
     workspace_manifests_root: PathBuf,
+    workspace_root: Option<PathBuf>,
+    workspace_trash_root: Option<PathBuf>,
     snapshot_manifests: Vec<PathBuf>,
     workspace_ids: Vec<WorkspaceId>,
 }
@@ -895,6 +909,8 @@ impl ImportCheckoutConfig {
         Self {
             cache_root: cache_root.as_ref().to_path_buf(),
             workspace_manifests_root: workspace_manifests_root.as_ref().to_path_buf(),
+            workspace_root: None,
+            workspace_trash_root: None,
             snapshot_manifests: Vec::new(),
             workspace_ids: Vec::new(),
         }
@@ -906,6 +922,20 @@ impl ImportCheckoutConfig {
 
     pub fn workspace_manifests_root(&self) -> &Path {
         &self.workspace_manifests_root
+    }
+
+    /// Enables manifest-first physical workspace recovery. These are daemon
+    /// deployment roots, never client socket inputs. When configured, startup
+    /// scans all durable workspace manifests, withdraws any visible workspace
+    /// lacking its Ready catalog batch, and verifies every Ready workspace's
+    /// generation pin before request acceptance.
+    pub fn set_workspace_publication_roots(
+        &mut self,
+        workspace_root: impl AsRef<Path>,
+        workspace_trash_root: impl AsRef<Path>,
+    ) {
+        self.workspace_root = Some(workspace_root.as_ref().to_path_buf());
+        self.workspace_trash_root = Some(workspace_trash_root.as_ref().to_path_buf());
     }
 
     /// Registers one daemon-known manifest that may have been written before
@@ -996,6 +1026,9 @@ pub struct ImportCheckoutStartup {
     /// Private incomplete workspace states recovered by the trusted injected
     /// backend. This count is informational; no path is retained here.
     pub incomplete_workspaces_recovered: u64,
+    /// Public workspace directories withdrawn because a crash left them
+    /// visible after manifest sync but before their Ready catalog batch.
+    pub incomplete_visible_workspaces_withdrawn: u64,
 }
 
 /// Failure from public snapshot/workspace reconciliation before the injected
@@ -1004,6 +1037,7 @@ pub struct ImportCheckoutStartup {
 pub enum ImportCheckoutStartupError {
     Snapshot(SnapshotPublicationError),
     Workspace(WorkspaceManifestError),
+    WorkspaceReconciliation(WorkspaceReconciliationError),
 }
 
 impl std::fmt::Display for ImportCheckoutStartupError {
@@ -1011,6 +1045,9 @@ impl std::fmt::Display for ImportCheckoutStartupError {
         match self {
             Self::Snapshot(_) => write!(formatter, "snapshot publication reconciliation failed"),
             Self::Workspace(_) => write!(formatter, "workspace manifest reconciliation failed"),
+            Self::WorkspaceReconciliation(_) => {
+                write!(formatter, "workspace publication reconciliation failed")
+            }
         }
     }
 }
@@ -1020,6 +1057,7 @@ impl std::error::Error for ImportCheckoutStartupError {
         match self {
             Self::Snapshot(error) => Some(error),
             Self::Workspace(error) => Some(error),
+            Self::WorkspaceReconciliation(error) => Some(error),
         }
     }
 }
@@ -1033,6 +1071,12 @@ impl From<SnapshotPublicationError> for ImportCheckoutStartupError {
 impl From<WorkspaceManifestError> for ImportCheckoutStartupError {
     fn from(value: WorkspaceManifestError) -> Self {
         Self::Workspace(value)
+    }
+}
+
+impl From<WorkspaceReconciliationError> for ImportCheckoutStartupError {
+    fn from(value: WorkspaceReconciliationError) -> Self {
+        Self::WorkspaceReconciliation(value)
     }
 }
 
@@ -1051,10 +1095,39 @@ pub fn reconcile_import_checkout_startup<C: Catalog>(
             SnapshotPublicationStatus::AlreadyReady => startup.snapshots_already_ready += 1,
         }
     }
-    for workspace_id in &config.workspace_ids {
-        match load_ready_workspace(catalog, &config.workspace_manifests_root, *workspace_id)? {
-            Some(_) => startup.ready_workspaces += 1,
-            None => startup.absent_workspaces += 1,
+    match (&config.workspace_root, &config.workspace_trash_root) {
+        (Some(workspaces), Some(trash)) => {
+            let reconciliation = reconcile_workspace_publications(
+                catalog,
+                &config.workspace_manifests_root,
+                workspaces,
+                trash,
+            )?;
+            startup.ready_workspaces = reconciliation.ready_workspaces;
+            startup.incomplete_visible_workspaces_withdrawn =
+                reconciliation.incomplete_workspaces_withdrawn;
+        }
+        (None, None) => {
+            for workspace_id in &config.workspace_ids {
+                match load_ready_workspace(
+                    catalog,
+                    &config.workspace_manifests_root,
+                    *workspace_id,
+                )? {
+                    Some(_) => startup.ready_workspaces += 1,
+                    None => startup.absent_workspaces += 1,
+                }
+            }
+        }
+        // `set_workspace_publication_roots` always assigns both values. Keep
+        // this fail-closed branch for forward-compatible deserialization or
+        // accidental struct construction within this crate.
+        _ => {
+            return Err(ImportCheckoutStartupError::WorkspaceReconciliation(
+                WorkspaceReconciliationError::UnsafeWorkspacePath(
+                    config.workspace_manifests_root.clone(),
+                ),
+            ))
         }
     }
     Ok(startup)
@@ -4675,8 +4748,24 @@ pub struct DaemonService {
     rejected_requests: AtomicU64,
 }
 
-impl DaemonService {
-    pub fn start(config: DaemonConfig) -> Result<Self, DaemonServiceError> {
+/// Startup state held after durable daemon recovery but before the local
+/// listener is bound.
+///
+/// Keeping the instance lock in this value lets production startup validate
+/// its already-mounted materialization domain and authoritative catalog while
+/// excluding another daemon process. Dropping it on any pre-bind failure
+/// releases the lock without ever exposing a socket.
+pub(crate) struct DaemonServiceStartup {
+    config: DaemonConfig,
+    jobs: JobStore,
+    scrubs: ScrubScheduleStore,
+    migrations: MigrationStore,
+    store_lock: InstanceLock,
+    recovered_on_startup: u64,
+}
+
+impl DaemonServiceStartup {
+    pub(crate) fn acquire(config: DaemonConfig) -> Result<Self, DaemonServiceError> {
         config.prepare()?;
         let lock_path = config.state_root.join("instance.lock");
         let store_lock = match acquire_lock(&lock_path) {
@@ -4692,18 +4781,37 @@ impl DaemonService {
         let scrubs = ScrubScheduleStore::open(&config.state_root, current_unix_seconds()?)?;
         let migrations =
             MigrationStore::open(&config.state_root, reflink_forest_format::FORMAT_VERSION)?;
-        let daemon = Daemon::bind(&config.runtime_dir)?;
         Ok(Self {
             config,
-            daemon,
             jobs,
             scrubs,
             migrations,
-            _store_lock: store_lock,
+            store_lock,
             recovered_on_startup: recovered as u64,
+        })
+    }
+
+    /// Binds the control socket only after every caller-owned production
+    /// preflight and catalog reconciliation step has succeeded.
+    pub(crate) fn bind(self) -> Result<DaemonService, DaemonServiceError> {
+        let daemon = Daemon::bind(&self.config.runtime_dir)?;
+        Ok(DaemonService {
+            config: self.config,
+            daemon,
+            jobs: self.jobs,
+            scrubs: self.scrubs,
+            migrations: self.migrations,
+            _store_lock: self.store_lock,
+            recovered_on_startup: self.recovered_on_startup,
             accepted_requests: AtomicU64::new(0),
             rejected_requests: AtomicU64::new(0),
         })
+    }
+}
+
+impl DaemonService {
+    pub fn start(config: DaemonConfig) -> Result<Self, DaemonServiceError> {
+        DaemonServiceStartup::acquire(config)?.bind()
     }
 
     pub fn socket_path(&self) -> &Path {

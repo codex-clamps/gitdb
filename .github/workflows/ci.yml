@@ -4,6 +4,12 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    # Nightly soak on the default branch. The job itself is also guarded so
+    # it cannot be enabled by pull-request or manual-dispatch events.
+    - cron: '17 3 * * *'
+  release:
+    types: [published]
   workflow_dispatch:
     inputs:
       run_privileged_btrfs:
@@ -53,3 +59,37 @@ jobs:
         run: |
           cargo test -p reflink-forest-workspace --test checkout_acceptance
           cargo test -p reflink-forest-workspace restored_cold_tier_materializes_a_workspace_without_the_original_tree -- --exact
+
+  m1-million-record-soak:
+    # Run on protected main pushes, the default-branch nightly schedule, and
+    # published releases—not on pull requests or manual workflow dispatches.
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run the release million-record cold-store soak
+        env:
+          REFLINK_FOREST_RUN_MILLION_RECORD_SOAK: "1"
+        run: >-
+          cargo test --release -p reflink-forest-store --test million_record_soak
+          million_record_soak -- --ignored --exact
+
+  m8-fuzz:
+    # Nightly/default-branch and published-release hardening only. Fuzzing is
+    # intentionally excluded from pull requests and protected-main pushes.
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'release' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Install the cargo-fuzz runner
+        run: cargo +nightly install cargo-fuzz --locked
+      - name: Run bounded parser, codec, and recovery fuzz campaign
+        working-directory: fuzz
+        run: |
+          for target in format_decode codec_decode open_chunk_recovery snapshot_manifest_decode backup_decode; do
+            cargo +nightly fuzz run "$target" -- -max_total_time=120 -rss_limit_mb=512 -timeout=5
+          done

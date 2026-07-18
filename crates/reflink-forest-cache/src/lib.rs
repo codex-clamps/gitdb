@@ -8,7 +8,7 @@ use std::{
     collections::HashMap,
     ffi::{CString, OsStr},
     fs::{self, File, OpenOptions},
-    io::{self, Read, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     mem::MaybeUninit,
     os::{
         fd::AsRawFd,
@@ -26,7 +26,7 @@ use std::{
 use reflink_forest_core::{ContentHasher, ContentId, ObjectKind};
 use reflink_forest_format::Codec;
 use reflink_forest_index::{Catalog, ObjectLocation};
-use reflink_forest_store::{stream_record_at, StoreError};
+use reflink_forest_store::{stream_decoded_record_at, StoreError};
 
 const FICLONE: std::ffi::c_ulong = 0x4004_9409;
 
@@ -42,6 +42,7 @@ pub enum CacheError {
         expected: ContentId,
         actual: ContentId,
     },
+    UnsafeRoot(PathBuf),
     UnsafeEntry(ContentId),
     NotCached(ContentId),
 }
@@ -52,6 +53,9 @@ impl std::fmt::Display for CacheError {
             Self::AccountingOverflow => write!(f, "cache byte accounting overflowed u64"),
             Self::ContentMismatch { .. } => {
                 write!(f, "cache payload does not match its content ID")
+            }
+            Self::UnsafeRoot(path) => {
+                write!(f, "cache root is not a real directory: {}", path.display())
             }
             Self::UnsafeEntry(_) => write!(f, "cache entry is not a regular file"),
             Self::NotCached(_) => write!(f, "cache entry is missing"),
@@ -356,14 +360,43 @@ impl From<CacheError> for CapacityAdmissionError {
     }
 }
 
+/// Failure from work protected by reserve admission.
+///
+/// The `Admission` variant means the protected operation was never invoked.
+/// `Operation` preserves the error from work that began only after both
+/// host- and guest-space reserves were admitted.
+#[derive(Debug)]
+pub enum CapacityAdmissionOperationError<E> {
+    Admission(CapacityAdmissionError),
+    Operation(E),
+}
+
+impl<E: std::fmt::Display> std::fmt::Display for CapacityAdmissionOperationError<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Admission(error) => write!(f, "capacity admission failed: {error}"),
+            Self::Operation(error) => write!(f, "admitted operation failed: {error}"),
+        }
+    }
+}
+
+impl<E: std::error::Error + 'static> std::error::Error for CapacityAdmissionOperationError<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Admission(error) => Some(error),
+            Self::Operation(error) => Some(error),
+        }
+    }
+}
+
 /// Coordinates derived-cache allocations with host and guest reserve floors.
 ///
 /// When the initial measurement fails the policy, the coordinator evicts cache
 /// leaves in [`Cache::evict_to`] order, remeasures both domains, and only then
 /// admits the allocation. The cache is derived data, so it is the only state
 /// this coordinator deletes. The operating system remains authoritative: use
-/// [`Self::with_admission`] to keep this coordinator's admission lock across
-/// the immediate cache publication, and still handle an allocation-time
+/// [`Self::with_reserve_admission`] to keep this coordinator's admission lock
+/// across the immediate allocation, and still handle an allocation-time
 /// `ENOSPC` or quota error.
 pub struct CacheCapacityCoordinator<M> {
     cache: Cache,
@@ -432,6 +465,34 @@ impl<M: CapacityMeter> CacheCapacityCoordinator<M> {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let admission = self.admit_locked(projected_allocation_bytes)?;
         let result = allocate(&self.cache)?;
+        Ok((admission, result))
+    }
+
+    /// Runs arbitrary allocation work only after preserving both configured
+    /// reserves.
+    ///
+    /// This is the shared guard for cold-import staging and output,
+    /// compaction output, and guest-image growth. The projected byte count
+    /// must conservatively include every allocation the closure can make;
+    /// the admission lock remains held until the closure returns. If initial
+    /// capacity is short, only derived cache entries are evicted before a
+    /// fresh measurement decides whether to invoke the closure.
+    pub fn with_reserve_admission<T, E, F>(
+        &self,
+        projected_allocation_bytes: u64,
+        operation: F,
+    ) -> Result<(CapacityAdmission, T), CapacityAdmissionOperationError<E>>
+    where
+        F: FnOnce() -> Result<T, E>,
+    {
+        let _guard = self
+            .admission_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let admission = self
+            .admit_locked(projected_allocation_bytes)
+            .map_err(CapacityAdmissionOperationError::Admission)?;
+        let result = operation().map_err(CapacityAdmissionOperationError::Operation)?;
         Ok((admission, result))
     }
 
@@ -547,8 +608,25 @@ impl Cache {
     /// it inside the verified Btrfs clone domain.
     pub fn open(root: impl AsRef<Path>) -> Result<Self, CacheError> {
         let root = root.as_ref().to_path_buf();
-        fs::create_dir_all(&root)?;
-        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
+        match fs::symlink_metadata(&root) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(CacheError::UnsafeRoot(root));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => fs::create_dir_all(&root)?,
+            Err(error) => return Err(CacheError::Io(error)),
+        }
+        // Reopen the final root without following it after creation. This
+        // catches a symlink substitution before permissions or cache content
+        // can be touched through the configured root.
+        let root_directory = open_directory_no_follow(&root).map_err(|error| {
+            if is_missing_or_unsafe(&error) {
+                CacheError::UnsafeRoot(root.clone())
+            } else {
+                CacheError::Io(error)
+            }
+        })?;
+        root_directory.set_permissions(fs::Permissions::from_mode(0o700))?;
         Ok(Self {
             root,
             state: Arc::new(CacheState::new()),
@@ -572,6 +650,82 @@ impl Cache {
             });
         }
         Ok(path)
+    }
+
+    /// Opens one cache entry through retained no-follow fanout descriptors
+    /// and returns the exact file descriptor whose contents were verified.
+    ///
+    /// Callers that consume cache data (especially FICLONE checkout) must use
+    /// this instead of validating a pathname and then reopening that pathname:
+    /// a cache leaf can otherwise be replaced between those two operations.
+    /// The returned descriptor remains valid even if reconciliation later
+    /// unlinks its directory entry.
+    pub fn open_verified_blob(&self, id: ContentId) -> Result<File, CacheError> {
+        let lock = self.entry_lock(id);
+        let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.open_verified_blob_locked(id)
+    }
+
+    fn open_verified_blob_locked(&self, id: ContentId) -> Result<File, CacheError> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+
+        let parent = self.open_fanout_parent_no_follow(id).map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                CacheError::NotCached(id)
+            } else if is_missing_or_unsafe(&error) {
+                CacheError::UnsafeEntry(id)
+            } else {
+                CacheError::Io(error)
+            }
+        })?;
+        let name = CString::new(hex(id.as_bytes()))
+            .expect("canonical content ID names never contain a NUL byte");
+        // SAFETY: `parent` is a retained directory descriptor and `name` is a
+        // canonical single filename. O_NOFOLLOW keeps a swapped leaf from
+        // resolving to a symlink target.
+        let descriptor = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if descriptor < 0 {
+            let error = io::Error::last_os_error();
+            return if error.kind() == io::ErrorKind::NotFound {
+                Err(CacheError::NotCached(id))
+            } else if is_missing_or_unsafe(&error) {
+                Err(CacheError::UnsafeEntry(id))
+            } else {
+                Err(CacheError::Io(error))
+            };
+        }
+        // SAFETY: `openat` returned an owned file descriptor above.
+        let mut file = unsafe { File::from_raw_fd(descriptor) };
+        let length = match file.metadata() {
+            Ok(metadata) if metadata.file_type().is_file() => metadata.len(),
+            Ok(_) => return Err(CacheError::UnsafeEntry(id)),
+            Err(error) => return Err(CacheError::Io(error)),
+        };
+
+        let mut hasher = ContentHasher::new(ObjectKind::Blob, length);
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let count = file.read(&mut buffer).map_err(CacheError::Io)?;
+            if count == 0 {
+                break;
+            }
+            hasher.update(&buffer[..count]);
+        }
+        let actual = hasher.finalize();
+        if actual != id {
+            return Err(CacheError::ContentMismatch {
+                expected: id,
+                actual,
+            });
+        }
+        file.seek(SeekFrom::Start(0)).map_err(CacheError::Io)?;
+        Ok(file)
     }
 
     /// Removes a cache file only when it fails the cache's content-ID check.
@@ -1222,8 +1376,7 @@ impl Cache {
         id: ContentId,
         destination: impl AsRef<Path>,
     ) -> Result<(), CacheError> {
-        let source_path = self.verified_path(id)?;
-        let source = File::open(source_path)?;
+        let source = self.open_verified_blob(id)?;
         let destination = OpenOptions::new()
             .read(true)
             .write(true)
@@ -1480,7 +1633,7 @@ impl From<StoreError> for HydrationError {
     }
 }
 
-/// Hydrates one raw blob addressed by `id` from its catalog location.
+/// Hydrates one raw cache blob addressed by `id` from its catalog location.
 ///
 /// `chunk_path` is supplied by the caller's generation/manifest resolver.
 /// The path cannot substitute a different chunk: its header's generation and
@@ -1493,13 +1646,26 @@ pub fn hydrate_raw_blob_from_chunk<C: Catalog>(
     id: ContentId,
     chunk_path: impl AsRef<Path>,
 ) -> Result<PathBuf, HydrationError> {
+    hydrate_blob_from_chunk(cache, catalog, id, chunk_path)
+}
+
+/// Hydrates one cache blob from a raw or Zstd cold record.
+///
+/// The cache always receives canonical raw blob bytes. The cold record's
+/// codec is decoded through a bounded stream before atomic cache publication.
+pub fn hydrate_blob_from_chunk<C: Catalog>(
+    cache: &Cache,
+    catalog: &C,
+    id: ContentId,
+    chunk_path: impl AsRef<Path>,
+) -> Result<PathBuf, HydrationError> {
     let chunk_path = chunk_path.as_ref().to_path_buf();
     cache.singleflight_hydrate(id, || {
-        hydrate_raw_blob_from_chunk_inner(cache, catalog, id, &chunk_path)
+        hydrate_blob_from_chunk_inner(cache, catalog, id, &chunk_path)
     })
 }
 
-fn hydrate_raw_blob_from_chunk_inner<C: Catalog>(
+fn hydrate_blob_from_chunk_inner<C: Catalog>(
     cache: &Cache,
     catalog: &C,
     id: ContentId,
@@ -1517,7 +1683,7 @@ fn hydrate_raw_blob_from_chunk_inner<C: Catalog>(
     let location = catalog
         .object_location(id)
         .ok_or(HydrationError::MissingLocation(id))?;
-    validate_raw_blob_location(location)?;
+    validate_blob_location(location)?;
     // An existing corrupt cache file can only be derived state.  Stream the
     // authoritative raw bytes into a temporary file while incrementally
     // hashing them; no full blob payload is materialized in memory before the
@@ -1526,7 +1692,7 @@ fn hydrate_raw_blob_from_chunk_inner<C: Catalog>(
     // verification.  Discard it and retry once; if another hydrator won with
     // valid content, the second publication returns that verified entry.
     match cache.publish_blob_streamed(id, |file| {
-        stream_raw_blob_into_cache(file, chunk_path, location, id)
+        stream_blob_into_cache(file, chunk_path, location, id)
     }) {
         Ok(path) => Ok(path),
         Err(HydrationError::Cache(
@@ -1534,37 +1700,31 @@ fn hydrate_raw_blob_from_chunk_inner<C: Catalog>(
         )) => {
             cache.discard_invalid_blob(id)?;
             cache.publish_blob_streamed(id, |file| {
-                stream_raw_blob_into_cache(file, chunk_path, location, id)
+                stream_blob_into_cache(file, chunk_path, location, id)
             })
         }
         Err(error) => Err(error),
     }
 }
 
-fn validate_raw_blob_location(location: ObjectLocation) -> Result<(), HydrationError> {
+fn validate_blob_location(location: ObjectLocation) -> Result<(), HydrationError> {
     if location.kind != ObjectKind::Blob {
         return Err(HydrationError::NotBlob(location.kind));
-    }
-    if location.codec != Codec::Raw {
-        return Err(HydrationError::UnsupportedCodec(location.codec));
     }
     Ok(())
 }
 
-fn stream_raw_blob_into_cache(
+fn stream_blob_into_cache(
     file: &mut File,
     chunk_path: &Path,
     location: ObjectLocation,
     expected_id: ContentId,
 ) -> Result<ContentId, HydrationError> {
     let mut writer = ContentHashingWriter::new(file, location.raw_length);
-    let metadata = stream_record_at(chunk_path, location, &mut writer)?;
+    let metadata = stream_decoded_record_at(chunk_path, location, &mut writer)?;
     let (actual, actual_length) = writer.finish();
     if metadata.kind != ObjectKind::Blob {
         return Err(HydrationError::NotBlob(metadata.kind));
-    }
-    if metadata.codec != Codec::Raw {
-        return Err(HydrationError::UnsupportedCodec(metadata.codec));
     }
     if metadata.raw_length != actual_length {
         return Err(HydrationError::RawLengthMismatch {
@@ -1641,7 +1801,9 @@ fn hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use reflink_forest_core::{GitOid, HashAlgorithm};
-    use reflink_forest_format::{ChunkHeader, ObjectRecord, RECORD_HEADER_LEN};
+    use reflink_forest_format::{
+        encode_object_payload, ChunkHeader, ObjectRecord, RECORD_HEADER_LEN,
+    };
     use reflink_forest_index::{
         Catalog, CatalogBatch, CatalogError, ChunkMetadata, InMemoryCatalog, RepoId, WorkspaceId,
     };
@@ -1755,17 +1917,29 @@ mod tests {
     }
 
     fn cold_blob_fixture_with_id(payload: &[u8], id: ContentId) -> ColdBlobFixture {
+        cold_blob_fixture_with_codec(payload, id, Codec::Raw)
+    }
+
+    fn cold_blob_fixture_with_codec(
+        payload: &[u8],
+        id: ContentId,
+        codec: Codec,
+    ) -> ColdBlobFixture {
         let directory = directory();
         fs::create_dir(&directory).unwrap();
         let chunk = directory.join("0000000000000001.open");
+        // Store writes now verify `record.content_id` before accepting a
+        // record. Keep the physical record valid, then deliberately attach
+        // its location to `id` in the fixture catalog below so hydration must
+        // detect the catalog-to-record content-ID disagreement.
         let record = ObjectRecord {
             kind: ObjectKind::Blob,
-            codec: Codec::Raw,
+            codec,
             flags: 0,
             raw_length: payload.len() as u64,
-            content_id: id,
+            content_id: ContentId::for_object(ObjectKind::Blob, payload),
             primary_oid: GitOid::new(HashAlgorithm::Sha1, &[7; 20]).unwrap(),
-            payload: payload.to_vec(),
+            payload: encode_object_payload(codec, payload).unwrap(),
         };
         let header = ChunkHeader {
             generation: 3,
@@ -1821,6 +1995,48 @@ mod tests {
         let path = cache.publish_blob(id, b"cache bytes").unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"cache bytes");
         assert_eq!(cache.verified_path(id).unwrap(), path);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn cache_open_rejects_a_final_component_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let directory = directory();
+        let target = directory.join("target");
+        let cache_root = directory.join("cache");
+        fs::create_dir(&directory).unwrap();
+        fs::create_dir(&target).unwrap();
+        symlink(&target, &cache_root).unwrap();
+
+        assert!(matches!(
+            Cache::open(&cache_root),
+            Err(CacheError::UnsafeRoot(path)) if path == cache_root
+        ));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn verified_blob_descriptor_never_follows_a_cache_leaf_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let directory = directory();
+        let cache = Cache::open(&directory).unwrap();
+        let payload = b"descriptor must stay beneath cache";
+        let id = ContentId::for_object(ObjectKind::Blob, payload);
+        cache.publish_blob(id, payload).unwrap();
+
+        let outside = directory.join("outside-cache");
+        fs::write(&outside, payload).unwrap();
+        let leaf = cache.path_for(id);
+        fs::remove_file(&leaf).unwrap();
+        symlink(&outside, &leaf).unwrap();
+
+        assert!(matches!(
+            cache.open_verified_blob(id),
+            Err(CacheError::UnsafeEntry(actual)) if actual == id
+        ));
+        assert_eq!(fs::read(&outside).unwrap(), payload);
         fs::remove_dir_all(directory).unwrap();
     }
     #[test]
@@ -2072,6 +2288,31 @@ mod tests {
     }
 
     #[test]
+    fn reserve_admission_guard_allows_growth_work_only_after_both_reserves_pass() {
+        let directory = directory();
+        let cache = Cache::open(&directory).unwrap();
+        let meter = ScriptedCapacityMeter::new([CapacitySnapshot {
+            host_available_bytes: 101,
+            guest_available_bytes: 81,
+        }]);
+        let coordinator = CacheCapacityCoordinator::new(cache, meter, ReservePolicy::new(100, 80));
+        let grew = AtomicBool::new(false);
+
+        let (admission, ()) = coordinator
+            .with_reserve_admission(1, || {
+                grew.store(true, Ordering::SeqCst);
+                Ok::<(), io::Error>(())
+            })
+            .unwrap();
+
+        assert!(grew.load(Ordering::SeqCst));
+        assert_eq!(admission.projected_allocation_bytes, 1);
+        assert_eq!(admission.eviction, None);
+        assert_eq!(coordinator.meter().remaining(), 0);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn filesystem_capacity_meter_measures_the_supplied_paths() {
         let meter = FilesystemCapacityMeter::new(".", ".");
         let measured = meter.measure().unwrap();
@@ -2095,6 +2336,20 @@ mod tests {
 
         assert_eq!(fs::read(&path).unwrap(), b"authoritative cold bytes");
         assert_eq!(fixture.cache.verified_path(fixture.id).unwrap(), path);
+        fs::remove_dir_all(fixture.directory).unwrap();
+    }
+
+    #[test]
+    fn hydration_streams_zstd_cold_blob_into_raw_cache() {
+        let payload = vec![b'z'; STREAM_COPY_BUFFER_BYTES * 2 + 19];
+        let id = ContentId::for_object(ObjectKind::Blob, &payload);
+        let fixture = cold_blob_fixture_with_codec(&payload, id, Codec::Zstd);
+
+        let path =
+            hydrate_blob_from_chunk(&fixture.cache, &fixture.catalog, fixture.id, &fixture.chunk)
+                .unwrap();
+
+        assert_eq!(fs::read(path).unwrap(), payload);
         fs::remove_dir_all(fixture.directory).unwrap();
     }
 
@@ -2139,7 +2394,7 @@ mod tests {
                 fixture.id,
                 &fixture.chunk,
             ),
-            Err(HydrationError::Store(StoreError::Format(_)))
+            Err(HydrationError::Store(StoreError::Codec(_)))
         ));
         assert!(!fixture.cache.path_for(fixture.id).exists());
         fs::remove_dir_all(fixture.directory).unwrap();

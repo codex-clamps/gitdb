@@ -363,6 +363,8 @@ dependencies = [
 name = "reflink-forest-daemon"
 version = "0.1.0"
 dependencies = [
+ "reflink-forest-backup",
+ "reflink-forest-btrfs",
  "reflink-forest-cache",
  "reflink-forest-core",
  "reflink-forest-format",
@@ -378,6 +380,7 @@ name = "reflink-forest-format"
 version = "0.1.0"
 dependencies = [
  "reflink-forest-core",
+ "zstd",
 ]
 
 [[package]]
@@ -392,6 +395,7 @@ dependencies = [
 name = "reflink-forest-import"
 version = "0.1.0"
 dependencies = [
+ "reflink-forest-cache",
  "reflink-forest-core",
  "reflink-forest-format",
  "reflink-forest-git",
@@ -412,6 +416,7 @@ dependencies = [
 name = "reflink-forest-maintenance"
 version = "0.1.0"
 dependencies = [
+ "reflink-forest-cache",
  "reflink-forest-core",
  "reflink-forest-format",
  "reflink-forest-git",
@@ -567,6 +572,24 @@ name = "windows-link"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
+
+[[package]]
+name = "zstd"
+version = "0.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e91ee311a569c327171651566e07972200e76fcfe2242a4fa446149a3881c08a"
+dependencies = [
+ "zstd-safe",
+]
+
+[[package]]
+name = "zstd-safe"
+version = "7.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8f49c4d5f0abb602a93fb8736af2a4f4dd9512e36f7f570d66e65ff867ed3b9d"
+dependencies = [
+ "zstd-sys",
+]
 
 [[package]]
 name = "zstd-sys"

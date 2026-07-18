@@ -4,7 +4,7 @@
 //! eventual RocksDB adapter: a batch either completely commits or leaves every
 //! catalog map unchanged.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use reflink_forest_core::{ContentId, GitOid, HashAlgorithm, ObjectKind};
 use reflink_forest_format::Codec;
@@ -18,6 +18,16 @@ pub const GC_PIN_ID_LEN: usize = 16;
 /// The fixed metadata key that identifies the generation new readers should
 /// use. Its value is an encoded unsigned 32-bit generation number.
 pub const CURRENT_GENERATION_META_KEY: &[u8] = b"current_generation";
+
+/// Metadata marker persisted while a locations-only catalog rebuild is in
+/// progress. The marker is intentionally separate from the current-generation
+/// metadata: an interrupted rebuild must fail closed even when the active
+/// generation itself remains valid. It is reserved for
+/// [`ObjectLocationRebuildCatalog`]; ordinary [`CatalogBatch`] metadata writes
+/// cannot mutate it.
+pub const OBJECT_LOCATION_REBUILD_META_KEY: &[u8] = b"object_location_rebuild_v1";
+#[cfg(feature = "rocksdb-backend")]
+const OBJECT_LOCATION_REBUILD_IN_PROGRESS_MARKER: u8 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Hash)]
 pub struct RepoId(pub [u8; REPO_ID_LEN]);
@@ -144,10 +154,44 @@ pub struct ChunkMetadata {
     pub record_count: u64,
 }
 
+/// One object-location record discovered during a streaming catalog scan.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ObjectLocationEntry {
+    pub content_id: ContentId,
+    pub location: ObjectLocation,
+}
+
+/// One Git-object alias record discovered during a streaming catalog scan.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OidAliasEntry {
+    pub repository: RepoId,
+    pub oid: GitOid,
+    pub content_id: ContentId,
+}
+
+/// One chunk metadata record discovered during a streaming catalog scan.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChunkEntry {
+    pub generation: u32,
+    pub chunk_id: u64,
+    pub metadata: ChunkMetadata,
+}
+
+/// Durable state of the locations-only rebuild protocol.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ObjectLocationRebuildState {
+    Idle,
+    InProgress,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CatalogError {
     InvalidEncoding,
     UnsupportedVersion(u8),
+    UnsupportedOperation(&'static str),
+    ObjectLocationRebuildInProgress,
+    ObjectLocationRebuildNotInProgress,
+    DuplicateRebuiltObjectLocation(ContentId),
     AliasConflict {
         repo: RepoId,
         oid: GitOid,
@@ -163,6 +207,21 @@ impl std::fmt::Display for CatalogError {
             Self::InvalidEncoding => write!(formatter, "invalid catalog-v1 encoding"),
             Self::UnsupportedVersion(version) => {
                 write!(formatter, "unsupported catalog-v1 version {version}")
+            }
+            Self::UnsupportedOperation(operation) => {
+                write!(formatter, "catalog backend does not support {operation}")
+            }
+            Self::ObjectLocationRebuildInProgress => {
+                write!(formatter, "object-location rebuild is already in progress")
+            }
+            Self::ObjectLocationRebuildNotInProgress => {
+                write!(formatter, "object-location rebuild is not in progress")
+            }
+            Self::DuplicateRebuiltObjectLocation(id) => {
+                write!(
+                    formatter,
+                    "rebuilt object-location for {id:?} is duplicated"
+                )
             }
             Self::AliasConflict {
                 repo,
@@ -409,6 +468,16 @@ pub fn decode_current_generation_value(input: &[u8]) -> Result<u32, CatalogError
     Ok(read_u32(input, 1))
 }
 
+#[cfg(feature = "rocksdb-backend")]
+fn decode_object_location_rebuild_marker(
+    input: &[u8],
+) -> Result<ObjectLocationRebuildState, CatalogError> {
+    match decode_opaque_value(input)?.as_slice() {
+        [OBJECT_LOCATION_REBUILD_IN_PROGRESS_MARKER] => Ok(ObjectLocationRebuildState::InProgress),
+        _ => Err(CatalogError::InvalidEncoding),
+    }
+}
+
 /// Versioned `workspaces` key: version then WorkspaceId.
 pub fn encode_workspace_key(id: WorkspaceId) -> [u8; 17] {
     let mut out = [0_u8; 17];
@@ -638,9 +707,61 @@ impl CatalogBatch {
     }
 }
 
+fn reject_direct_rebuild_marker_mutation(batch: &CatalogBatch) -> Result<(), CatalogError> {
+    if batch.operations.iter().any(|operation| {
+        matches!(
+            operation,
+            Operation::Meta(key, _) if key.as_slice() == OBJECT_LOCATION_REBUILD_META_KEY
+        )
+    }) {
+        return Err(CatalogError::UnsupportedOperation(
+            "direct object-location rebuild metadata mutation",
+        ));
+    }
+    Ok(())
+}
+
 pub trait Catalog {
     fn apply(&mut self, batch: CatalogBatch) -> Result<(), CatalogError>;
     fn object_location(&self, id: ContentId) -> Option<ObjectLocation>;
+    /// Returns the durable locations-only rebuild state.
+    ///
+    /// Backends that predate the rebuild protocol report `Idle`, preserving
+    /// source compatibility while requiring rebuild callers to opt into
+    /// [`ObjectLocationRebuildCatalog`] before mutating locations.
+    fn object_location_rebuild_state(&self) -> Result<ObjectLocationRebuildState, CatalogError> {
+        Ok(ObjectLocationRebuildState::Idle)
+    }
+    /// Visits every object location in deterministic key order.
+    ///
+    /// A verifier must complete this scan before starting a rebuild, because a
+    /// rebuild intentionally clears this collection first.
+    fn visit_object_locations(
+        &self,
+        _visitor: &mut dyn FnMut(ObjectLocationEntry) -> Result<(), CatalogError>,
+    ) -> Result<(), CatalogError> {
+        Err(CatalogError::UnsupportedOperation(
+            "object-location enumeration",
+        ))
+    }
+    /// Visits every OID alias in deterministic key order.
+    ///
+    /// Alias records remain available while a locations-only rebuild is in
+    /// progress so a recovery scan can verify the aliases that the rebuild
+    /// deliberately preserves.
+    fn visit_oid_aliases(
+        &self,
+        _visitor: &mut dyn FnMut(OidAliasEntry) -> Result<(), CatalogError>,
+    ) -> Result<(), CatalogError> {
+        Err(CatalogError::UnsupportedOperation("OID-alias enumeration"))
+    }
+    /// Visits every chunk record in deterministic key order.
+    fn visit_chunks(
+        &self,
+        _visitor: &mut dyn FnMut(ChunkEntry) -> Result<(), CatalogError>,
+    ) -> Result<(), CatalogError> {
+        Err(CatalogError::UnsupportedOperation("chunk enumeration"))
+    }
     fn oid_alias(&self, repo: RepoId, oid: &GitOid) -> Option<ContentId>;
     /// Returns opaque repository metadata after checking the catalog version.
     fn repository(&self, _id: RepoId) -> Option<Vec<u8>> {
@@ -748,9 +869,35 @@ pub trait Catalog {
     }
 }
 
+/// Atomic locations-only rebuild protocol for a catalog implementation.
+///
+/// Callers must hold the catalog's sole-writer lease for the full protocol
+/// and should complete every verification scan before [`Self::begin_object_location_rebuild`].
+/// Beginning a rebuild clears only `object_locations`; OID aliases and all
+/// other catalog families remain intact. A crash leaves a durable
+/// `InProgress` marker, so normal catalog writes and object-location reads
+/// fail closed until the caller resumes with appends and finish, or explicitly
+/// restarts the rebuild.
+pub trait ObjectLocationRebuildCatalog: Catalog {
+    /// Clears object locations and records a durable in-progress marker.
+    fn begin_object_location_rebuild(&mut self) -> Result<(), CatalogError>;
+    /// Discards partially rebuilt locations after an interrupted rebuild while
+    /// retaining the in-progress marker.
+    fn restart_object_location_rebuild(&mut self) -> Result<(), CatalogError>;
+    /// Adds verified locations to an active rebuild. Entries must not repeat
+    /// a content ID already added by this rebuild.
+    fn append_rebuilt_object_locations(
+        &mut self,
+        entries: &[ObjectLocationEntry],
+    ) -> Result<(), CatalogError>;
+    /// Publishes the rebuilt locations by removing the durable marker.
+    fn finish_object_location_rebuild(&mut self) -> Result<(), CatalogError>;
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct InMemoryCatalog {
     objects: HashMap<ContentId, ObjectLocation>,
+    object_location_rebuild_in_progress: bool,
     aliases: HashMap<(RepoId, GitOid), ContentId>,
     repositories: HashMap<RepoId, Vec<u8>>,
     repository_snapshots: HashMap<(RepoId, SnapshotId), SnapshotVisibility>,
@@ -764,6 +911,10 @@ pub struct InMemoryCatalog {
 }
 impl Catalog for InMemoryCatalog {
     fn apply(&mut self, batch: CatalogBatch) -> Result<(), CatalogError> {
+        if self.object_location_rebuild_in_progress {
+            return Err(CatalogError::ObjectLocationRebuildInProgress);
+        }
+        reject_direct_rebuild_marker_mutation(&batch)?;
         // Apply to a clone: no error can expose a partially committed batch.
         let mut staged = self.clone();
         for operation in batch.operations {
@@ -831,7 +982,64 @@ impl Catalog for InMemoryCatalog {
         Ok(())
     }
     fn object_location(&self, id: ContentId) -> Option<ObjectLocation> {
+        if self.object_location_rebuild_in_progress {
+            return None;
+        }
         self.objects.get(&id).copied()
+    }
+    fn object_location_rebuild_state(&self) -> Result<ObjectLocationRebuildState, CatalogError> {
+        Ok(if self.object_location_rebuild_in_progress {
+            ObjectLocationRebuildState::InProgress
+        } else {
+            ObjectLocationRebuildState::Idle
+        })
+    }
+    fn visit_object_locations(
+        &self,
+        visitor: &mut dyn FnMut(ObjectLocationEntry) -> Result<(), CatalogError>,
+    ) -> Result<(), CatalogError> {
+        if self.object_location_rebuild_in_progress {
+            return Err(CatalogError::ObjectLocationRebuildInProgress);
+        }
+        let mut entries: Vec<_> = self
+            .objects
+            .iter()
+            .map(|(&content_id, &location)| ObjectLocationEntry {
+                content_id,
+                location,
+            })
+            .collect();
+        entries.sort_unstable_by(|left, right| {
+            left.content_id.as_bytes().cmp(right.content_id.as_bytes())
+        });
+        for entry in entries {
+            visitor(entry)?;
+        }
+        Ok(())
+    }
+    fn visit_oid_aliases(
+        &self,
+        visitor: &mut dyn FnMut(OidAliasEntry) -> Result<(), CatalogError>,
+    ) -> Result<(), CatalogError> {
+        let mut entries: Vec<_> = self
+            .aliases
+            .iter()
+            .map(|(&(repository, oid), &content_id)| OidAliasEntry {
+                repository,
+                oid,
+                content_id,
+            })
+            .collect();
+        entries.sort_unstable_by(|left, right| {
+            left.repository
+                .cmp(&right.repository)
+                .then_with(|| left.oid.algorithm().tag().cmp(&right.oid.algorithm().tag()))
+                .then_with(|| left.oid.as_bytes().cmp(right.oid.as_bytes()))
+        });
+        for entry in entries {
+            visitor(entry)?;
+        }
+        Ok(())
     }
     fn oid_alias(&self, repo: RepoId, oid: &GitOid) -> Option<ContentId> {
         self.aliases.get(&(repo, *oid)).copied()
@@ -866,6 +1074,28 @@ impl Catalog for InMemoryCatalog {
     fn chunk(&self, generation: u32, chunk_id: u64) -> Option<ChunkMetadata> {
         self.chunks.get(&(generation, chunk_id)).copied()
     }
+    fn visit_chunks(
+        &self,
+        visitor: &mut dyn FnMut(ChunkEntry) -> Result<(), CatalogError>,
+    ) -> Result<(), CatalogError> {
+        if self.object_location_rebuild_in_progress {
+            return Err(CatalogError::ObjectLocationRebuildInProgress);
+        }
+        let mut entries: Vec<_> = self
+            .chunks
+            .iter()
+            .map(|(&(generation, chunk_id), &metadata)| ChunkEntry {
+                generation,
+                chunk_id,
+                metadata,
+            })
+            .collect();
+        entries.sort_unstable_by_key(|entry| (entry.generation, entry.chunk_id));
+        for entry in entries {
+            visitor(entry)?;
+        }
+        Ok(())
+    }
     fn meta(&self, key: &[u8]) -> Option<Vec<u8>> {
         self.meta.get(key).cloned()
     }
@@ -898,6 +1128,54 @@ impl Catalog for InMemoryCatalog {
     }
     fn job(&self, job_id: &[u8]) -> Option<Vec<u8>> {
         self.jobs.get(job_id).cloned()
+    }
+}
+
+impl ObjectLocationRebuildCatalog for InMemoryCatalog {
+    fn begin_object_location_rebuild(&mut self) -> Result<(), CatalogError> {
+        if self.object_location_rebuild_in_progress {
+            return Err(CatalogError::ObjectLocationRebuildInProgress);
+        }
+        self.objects.clear();
+        self.object_location_rebuild_in_progress = true;
+        Ok(())
+    }
+
+    fn restart_object_location_rebuild(&mut self) -> Result<(), CatalogError> {
+        if !self.object_location_rebuild_in_progress {
+            return Err(CatalogError::ObjectLocationRebuildNotInProgress);
+        }
+        self.objects.clear();
+        Ok(())
+    }
+
+    fn append_rebuilt_object_locations(
+        &mut self,
+        entries: &[ObjectLocationEntry],
+    ) -> Result<(), CatalogError> {
+        if !self.object_location_rebuild_in_progress {
+            return Err(CatalogError::ObjectLocationRebuildNotInProgress);
+        }
+        let mut seen = HashSet::with_capacity(entries.len());
+        for entry in entries {
+            if !seen.insert(entry.content_id) || self.objects.contains_key(&entry.content_id) {
+                return Err(CatalogError::DuplicateRebuiltObjectLocation(
+                    entry.content_id,
+                ));
+            }
+        }
+        for entry in entries {
+            self.objects.insert(entry.content_id, entry.location);
+        }
+        Ok(())
+    }
+
+    fn finish_object_location_rebuild(&mut self) -> Result<(), CatalogError> {
+        if !self.object_location_rebuild_in_progress {
+            return Err(CatalogError::ObjectLocationRebuildNotInProgress);
+        }
+        self.object_location_rebuild_in_progress = false;
+        Ok(())
     }
 }
 
@@ -1061,8 +1339,17 @@ impl RocksDbCatalog {
             Ok(())
         })?;
         self.validate_entries(CF_PINS, |key, value| {
-            decode_workspace_pin_key(key)?;
-            decode_workspace_pin_value(value)?;
+            match key.len() {
+                17 => {
+                    decode_workspace_pin_key(key)?;
+                    decode_workspace_pin_value(value)?;
+                }
+                18 => {
+                    decode_gc_pin_key(key)?;
+                    decode_gc_pin_value(value)?;
+                }
+                _ => return Err(CatalogError::InvalidEncoding),
+            }
             Ok(())
         })?;
         self.validate_entries(CF_JOBS, |key, value| {
@@ -1074,6 +1361,8 @@ impl RocksDbCatalog {
             let key = decode_meta_key(key)?;
             if key == CURRENT_GENERATION_META_KEY {
                 decode_current_generation_value(value)?;
+            } else if key == OBJECT_LOCATION_REBUILD_META_KEY {
+                decode_object_location_rebuild_marker(value)?;
             } else {
                 decode_opaque_value(value)?;
             }
@@ -1121,11 +1410,29 @@ impl RocksDbCatalog {
         }
         Ok(())
     }
+
+    fn read_object_location_rebuild_state(
+        &self,
+    ) -> Result<ObjectLocationRebuildState, CatalogError> {
+        let meta_cf = self.cf(CF_META)?;
+        let value = self
+            .db
+            .get_cf(meta_cf, encode_meta_key(OBJECT_LOCATION_REBUILD_META_KEY))
+            .map_err(|error| CatalogError::Backend(error.to_string()))?;
+        match value {
+            None => Ok(ObjectLocationRebuildState::Idle),
+            Some(value) => decode_object_location_rebuild_marker(&value),
+        }
+    }
 }
 
 #[cfg(feature = "rocksdb-backend")]
 impl Catalog for RocksDbCatalog {
     fn apply(&mut self, batch: CatalogBatch) -> Result<(), CatalogError> {
+        if self.read_object_location_rebuild_state()? == ObjectLocationRebuildState::InProgress {
+            return Err(CatalogError::ObjectLocationRebuildInProgress);
+        }
+        reject_direct_rebuild_marker_mutation(&batch)?;
         let object_cf = self.cf(CF_OBJECT_LOCATIONS)?;
         let alias_cf = self.cf(CF_OID_ALIASES)?;
         let repository_cf = self.cf(CF_REPOSITORIES)?;
@@ -1243,6 +1550,9 @@ impl Catalog for RocksDbCatalog {
     }
 
     fn object_location(&self, id: ContentId) -> Option<ObjectLocation> {
+        if self.read_object_location_rebuild_state().ok()? != ObjectLocationRebuildState::Idle {
+            return None;
+        }
         let value = self
             .db
             .get_cf(
@@ -1251,6 +1561,42 @@ impl Catalog for RocksDbCatalog {
             )
             .ok()??;
         decode_object_location_value(&value).ok()
+    }
+    fn object_location_rebuild_state(&self) -> Result<ObjectLocationRebuildState, CatalogError> {
+        self.read_object_location_rebuild_state()
+    }
+    fn visit_object_locations(
+        &self,
+        visitor: &mut dyn FnMut(ObjectLocationEntry) -> Result<(), CatalogError>,
+    ) -> Result<(), CatalogError> {
+        if self.read_object_location_rebuild_state()? == ObjectLocationRebuildState::InProgress {
+            return Err(CatalogError::ObjectLocationRebuildInProgress);
+        }
+        let object_cf = self.cf(CF_OBJECT_LOCATIONS)?;
+        for entry in self.db.iterator_cf(object_cf, rocksdb::IteratorMode::Start) {
+            let (key, value) = entry.map_err(|error| CatalogError::Backend(error.to_string()))?;
+            visitor(ObjectLocationEntry {
+                content_id: decode_object_location_key(&key)?,
+                location: decode_object_location_value(&value)?,
+            })?;
+        }
+        Ok(())
+    }
+    fn visit_oid_aliases(
+        &self,
+        visitor: &mut dyn FnMut(OidAliasEntry) -> Result<(), CatalogError>,
+    ) -> Result<(), CatalogError> {
+        let alias_cf = self.cf(CF_OID_ALIASES)?;
+        for entry in self.db.iterator_cf(alias_cf, rocksdb::IteratorMode::Start) {
+            let (key, value) = entry.map_err(|error| CatalogError::Backend(error.to_string()))?;
+            let (repository, oid) = decode_oid_alias_key(&key)?;
+            visitor(OidAliasEntry {
+                repository,
+                oid,
+                content_id: decode_content_id_value(&value)?,
+            })?;
+        }
+        Ok(())
     }
     fn oid_alias(&self, repo: RepoId, oid: &GitOid) -> Option<ContentId> {
         let value = self
@@ -1312,7 +1658,29 @@ impl Catalog for RocksDbCatalog {
             .ok()??;
         decode_chunk_value(&value).ok()
     }
+    fn visit_chunks(
+        &self,
+        visitor: &mut dyn FnMut(ChunkEntry) -> Result<(), CatalogError>,
+    ) -> Result<(), CatalogError> {
+        if self.read_object_location_rebuild_state()? == ObjectLocationRebuildState::InProgress {
+            return Err(CatalogError::ObjectLocationRebuildInProgress);
+        }
+        let chunk_cf = self.cf(CF_CHUNKS)?;
+        for entry in self.db.iterator_cf(chunk_cf, rocksdb::IteratorMode::Start) {
+            let (key, value) = entry.map_err(|error| CatalogError::Backend(error.to_string()))?;
+            let (generation, chunk_id) = decode_chunk_key(&key)?;
+            visitor(ChunkEntry {
+                generation,
+                chunk_id,
+                metadata: decode_chunk_value(&value)?,
+            })?;
+        }
+        Ok(())
+    }
     fn meta(&self, key: &[u8]) -> Option<Vec<u8>> {
+        if key == OBJECT_LOCATION_REBUILD_META_KEY {
+            return None;
+        }
         let value = self
             .db
             .get_cf(self.cf(CF_META).ok()?, encode_meta_key(key))
@@ -1383,6 +1751,90 @@ impl Catalog for RocksDbCatalog {
             .get_cf(self.cf(CF_JOBS).ok()?, encode_job_key(job_id))
             .ok()??;
         decode_opaque_value(&value).ok()
+    }
+}
+
+#[cfg(feature = "rocksdb-backend")]
+impl ObjectLocationRebuildCatalog for RocksDbCatalog {
+    fn begin_object_location_rebuild(&mut self) -> Result<(), CatalogError> {
+        if self.read_object_location_rebuild_state()? == ObjectLocationRebuildState::InProgress {
+            return Err(CatalogError::ObjectLocationRebuildInProgress);
+        }
+        self.clear_object_locations_and_mark_rebuild()
+    }
+
+    fn restart_object_location_rebuild(&mut self) -> Result<(), CatalogError> {
+        if self.read_object_location_rebuild_state()? != ObjectLocationRebuildState::InProgress {
+            return Err(CatalogError::ObjectLocationRebuildNotInProgress);
+        }
+        self.clear_object_locations_and_mark_rebuild()
+    }
+
+    fn append_rebuilt_object_locations(
+        &mut self,
+        entries: &[ObjectLocationEntry],
+    ) -> Result<(), CatalogError> {
+        if self.read_object_location_rebuild_state()? != ObjectLocationRebuildState::InProgress {
+            return Err(CatalogError::ObjectLocationRebuildNotInProgress);
+        }
+        let object_cf = self.cf(CF_OBJECT_LOCATIONS)?;
+        let mut seen = HashSet::with_capacity(entries.len());
+        for entry in entries {
+            if !seen.insert(entry.content_id)
+                || self
+                    .db
+                    .get_cf(object_cf, encode_object_location_key(entry.content_id))
+                    .map_err(|error| CatalogError::Backend(error.to_string()))?
+                    .is_some()
+            {
+                return Err(CatalogError::DuplicateRebuiltObjectLocation(
+                    entry.content_id,
+                ));
+            }
+        }
+        let mut writes = rocksdb::WriteBatch::default();
+        for entry in entries {
+            writes.put_cf(
+                object_cf,
+                encode_object_location_key(entry.content_id),
+                encode_object_location_value(entry.location),
+            );
+        }
+        self.write_sync(writes)
+    }
+
+    fn finish_object_location_rebuild(&mut self) -> Result<(), CatalogError> {
+        if self.read_object_location_rebuild_state()? != ObjectLocationRebuildState::InProgress {
+            return Err(CatalogError::ObjectLocationRebuildNotInProgress);
+        }
+        let meta_cf = self.cf(CF_META)?;
+        let mut writes = rocksdb::WriteBatch::default();
+        writes.delete_cf(meta_cf, encode_meta_key(OBJECT_LOCATION_REBUILD_META_KEY));
+        self.write_sync(writes)
+    }
+}
+
+#[cfg(feature = "rocksdb-backend")]
+impl RocksDbCatalog {
+    fn clear_object_locations_and_mark_rebuild(&self) -> Result<(), CatalogError> {
+        let object_cf = self.cf(CF_OBJECT_LOCATIONS)?;
+        let meta_cf = self.cf(CF_META)?;
+        let mut writes = rocksdb::WriteBatch::default();
+        writes.delete_range_cf(object_cf, [CATALOG_VERSION], [CATALOG_VERSION + 1]);
+        writes.put_cf(
+            meta_cf,
+            encode_meta_key(OBJECT_LOCATION_REBUILD_META_KEY),
+            encode_opaque_value(&[OBJECT_LOCATION_REBUILD_IN_PROGRESS_MARKER]),
+        );
+        self.write_sync(writes)
+    }
+
+    fn write_sync(&self, writes: rocksdb::WriteBatch) -> Result<(), CatalogError> {
+        let mut options = rocksdb::WriteOptions::default();
+        options.set_sync(true);
+        self.db
+            .write_opt(writes, &options)
+            .map_err(|error| CatalogError::Backend(error.to_string()))
     }
 }
 
@@ -1724,6 +2176,174 @@ mod tests {
         );
     }
 
+    #[test]
+    fn locations_only_rebuild_preserves_aliases_and_blocks_normal_access() {
+        let repository = RepoId([0x51; REPO_ID_LEN]);
+        let original = id(0x52);
+        let rebuilt = id(0x53);
+        let mut rebuilt_location = location();
+        rebuilt_location.generation = 2;
+        let mut catalog = InMemoryCatalog::default();
+        let mut initial = CatalogBatch::new();
+        initial.put_object_location(original, location());
+        initial.put_oid_alias(repository, oid(), original);
+        initial.put_chunk(
+            1,
+            2,
+            ChunkMetadata {
+                state: ChunkState::Sealed,
+                size: 3,
+                record_count: 4,
+            },
+        );
+        catalog.apply(initial).unwrap();
+
+        catalog.begin_object_location_rebuild().unwrap();
+        assert_eq!(
+            catalog.object_location_rebuild_state().unwrap(),
+            ObjectLocationRebuildState::InProgress
+        );
+        assert_eq!(catalog.object_location(original), None);
+        assert_eq!(catalog.oid_alias(repository, &oid()), Some(original));
+        let mut aliases = Vec::new();
+        catalog
+            .visit_oid_aliases(&mut |entry| {
+                aliases.push(entry);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            aliases,
+            vec![OidAliasEntry {
+                repository,
+                oid: oid(),
+                content_id: original,
+            }]
+        );
+        assert!(matches!(
+            catalog.apply(CatalogBatch::new()),
+            Err(CatalogError::ObjectLocationRebuildInProgress)
+        ));
+        assert!(matches!(
+            catalog.visit_object_locations(&mut |_| Ok(())),
+            Err(CatalogError::ObjectLocationRebuildInProgress)
+        ));
+
+        catalog
+            .append_rebuilt_object_locations(&[ObjectLocationEntry {
+                content_id: rebuilt,
+                location: rebuilt_location,
+            }])
+            .unwrap();
+        catalog.finish_object_location_rebuild().unwrap();
+
+        assert_eq!(
+            catalog.object_location_rebuild_state().unwrap(),
+            ObjectLocationRebuildState::Idle
+        );
+        assert_eq!(catalog.object_location(original), None);
+        assert_eq!(catalog.object_location(rebuilt), Some(rebuilt_location));
+        assert_eq!(catalog.oid_alias(repository, &oid()), Some(original));
+    }
+
+    #[test]
+    fn locations_only_rebuild_restarts_partial_output_and_rejects_duplicates() {
+        let partial = id(0x61);
+        let final_entry = id(0x62);
+        let mut catalog = InMemoryCatalog::default();
+        catalog.begin_object_location_rebuild().unwrap();
+        let entry = ObjectLocationEntry {
+            content_id: partial,
+            location: location(),
+        };
+        catalog.append_rebuilt_object_locations(&[entry]).unwrap();
+        assert_eq!(
+            catalog.append_rebuilt_object_locations(&[entry]),
+            Err(CatalogError::DuplicateRebuiltObjectLocation(partial))
+        );
+
+        catalog.restart_object_location_rebuild().unwrap();
+        catalog
+            .append_rebuilt_object_locations(&[ObjectLocationEntry {
+                content_id: final_entry,
+                location: location(),
+            }])
+            .unwrap();
+        catalog.finish_object_location_rebuild().unwrap();
+
+        assert_eq!(catalog.object_location(partial), None);
+        assert_eq!(catalog.object_location(final_entry), Some(location()));
+        assert_eq!(
+            catalog.restart_object_location_rebuild(),
+            Err(CatalogError::ObjectLocationRebuildNotInProgress)
+        );
+    }
+
+    #[test]
+    fn streaming_enumeration_uses_catalog_key_order() {
+        let first_repository = RepoId([0x70; REPO_ID_LEN]);
+        let second_repository = RepoId([0x71; REPO_ID_LEN]);
+        let second_oid = GitOid::new(HashAlgorithm::Sha1, &[6; 20]).unwrap();
+        let mut catalog = InMemoryCatalog::default();
+        let mut batch = CatalogBatch::new();
+        batch.put_object_location(id(2), location());
+        batch.put_object_location(id(1), location());
+        batch.put_oid_alias(second_repository, oid(), id(2));
+        batch.put_oid_alias(first_repository, second_oid, id(1));
+        batch.put_chunk(
+            2,
+            1,
+            ChunkMetadata {
+                state: ChunkState::Open,
+                size: 1,
+                record_count: 2,
+            },
+        );
+        batch.put_chunk(
+            1,
+            9,
+            ChunkMetadata {
+                state: ChunkState::Sealed,
+                size: 3,
+                record_count: 4,
+            },
+        );
+        catalog.apply(batch).unwrap();
+
+        let mut locations = Vec::new();
+        catalog
+            .visit_object_locations(&mut |entry| {
+                locations.push(entry.content_id);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(locations, vec![id(1), id(2)]);
+
+        let mut aliases = Vec::new();
+        catalog
+            .visit_oid_aliases(&mut |entry| {
+                aliases.push((entry.repository, entry.oid, entry.content_id));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            aliases,
+            vec![
+                (first_repository, second_oid, id(1)),
+                (second_repository, oid(), id(2)),
+            ]
+        );
+
+        let mut chunks = Vec::new();
+        catalog
+            .visit_chunks(&mut |entry| {
+                chunks.push((entry.generation, entry.chunk_id));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(chunks, vec![(1, 9), (2, 1)]);
+    }
+
     #[cfg(feature = "rocksdb-backend")]
     #[test]
     fn rocksdb_batch_survives_reopen() {
@@ -1796,7 +2416,93 @@ mod tests {
             ]
         );
         assert_eq!(catalog.job(&[4, 5, 6]), Some(b"opaque job record".to_vec()));
+        // The pins family intentionally mixes 17-byte workspace keys with
+        // 18-byte explicit-GC keys; schema validation must accept both.
+        catalog.validate().unwrap();
         drop(catalog);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[cfg(feature = "rocksdb-backend")]
+    #[test]
+    fn rocksdb_locations_rebuild_recovers_interruption_and_preserves_aliases() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let path = std::env::temp_dir().join(format!(
+            "reflink-forest-index-rebuild-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let repository = RepoId([0x81; REPO_ID_LEN]);
+        let original = id(0x82);
+        let partial = id(0x83);
+        let final_entry = id(0x84);
+        {
+            let mut catalog = RocksDbCatalog::open(&path).unwrap();
+            let mut batch = CatalogBatch::new();
+            batch.put_object_location(original, location());
+            batch.put_oid_alias(repository, oid(), original);
+            catalog.apply(batch).unwrap();
+
+            catalog.begin_object_location_rebuild().unwrap();
+            assert_eq!(catalog.object_location(original), None);
+            assert!(matches!(
+                catalog.apply(CatalogBatch::new()),
+                Err(CatalogError::ObjectLocationRebuildInProgress)
+            ));
+            let mut aliases = Vec::new();
+            catalog
+                .visit_oid_aliases(&mut |entry| {
+                    aliases.push(entry);
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(
+                aliases,
+                vec![OidAliasEntry {
+                    repository,
+                    oid: oid(),
+                    content_id: original,
+                }]
+            );
+            catalog
+                .append_rebuilt_object_locations(&[ObjectLocationEntry {
+                    content_id: partial,
+                    location: location(),
+                }])
+                .unwrap();
+        }
+
+        {
+            let mut catalog = RocksDbCatalog::open_existing(&path).unwrap();
+            assert_eq!(
+                catalog.object_location_rebuild_state().unwrap(),
+                ObjectLocationRebuildState::InProgress
+            );
+            assert_eq!(catalog.object_location(partial), None);
+            assert_eq!(catalog.oid_alias(repository, &oid()), Some(original));
+            catalog.validate().unwrap();
+
+            catalog.restart_object_location_rebuild().unwrap();
+            catalog
+                .append_rebuilt_object_locations(&[ObjectLocationEntry {
+                    content_id: final_entry,
+                    location: location(),
+                }])
+                .unwrap();
+            catalog.finish_object_location_rebuild().unwrap();
+
+            assert_eq!(
+                catalog.object_location_rebuild_state().unwrap(),
+                ObjectLocationRebuildState::Idle
+            );
+            assert_eq!(catalog.object_location(partial), None);
+            assert_eq!(catalog.object_location(final_entry), Some(location()));
+            assert_eq!(catalog.oid_alias(repository, &oid()), Some(original));
+            catalog.validate().unwrap();
+        }
         std::fs::remove_dir_all(path).unwrap();
     }
 

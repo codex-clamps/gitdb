@@ -10,7 +10,9 @@ use reflink_forest_import::{
     RepoSnapshotId, SnapshotManifest,
 };
 use reflink_forest_index::{Catalog, InMemoryCatalog, RepoId, SnapshotVisibility, WorkspaceId};
-use reflink_forest_workspace::{persist_ready_workspace, WorkspaceManifest};
+use reflink_forest_workspace::{
+    persist_ready_workspace, write_workspace_manifest, WorkspaceManifest,
+};
 use std::{
     collections::BTreeSet,
     fmt, fs, io,
@@ -274,6 +276,48 @@ fn restart_reconciles_public_state_then_replays_trusted_import_and_checkout() {
 
     drop(orchestrator);
     drop(daemon);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn startup_with_publication_roots_withdraws_visible_workspace_without_ready_pin() {
+    let root = root();
+    fs::create_dir(&root).unwrap();
+    let manifests = root.join("workspace-manifests");
+    let workspaces = root.join("workspaces");
+    let trash = root.join("trash");
+    fs::create_dir(&workspaces).unwrap();
+    let id = WorkspaceId([0xa1; 16]);
+    let manifest = WorkspaceManifest {
+        workspace_id: id,
+        repository: RepoId([0xa2; 16]),
+        snapshot_id: [0xa3; 16],
+        commit: GitOid::for_object(HashAlgorithm::Sha1, ObjectKind::Commit, b"interrupted"),
+        generation: 7,
+        name: b"interrupted-workspace".to_vec(),
+        created_unix_secs: 3,
+        directories: 0,
+        regular_files: 0,
+        executable_files: 0,
+        symlinks: 0,
+        gitlinks: 0,
+        reflinked_regular_files: 0,
+        copied_regular_files: 0,
+        optional_fields: Vec::new(),
+    };
+    write_workspace_manifest(&manifests, &manifest).unwrap();
+    fs::create_dir(workspaces.join("interrupted-workspace")).unwrap();
+
+    let mut config = ImportCheckoutConfig::new(root.join("cache"), &manifests);
+    config.set_workspace_publication_roots(&workspaces, &trash);
+    let mut catalog = InMemoryCatalog::default();
+    let startup =
+        reflink_forest_daemon::reconcile_import_checkout_startup(&mut catalog, &config).unwrap();
+    assert_eq!(startup.ready_workspaces, 0);
+    assert_eq!(startup.incomplete_visible_workspaces_withdrawn, 1);
+    assert!(!workspaces.join("interrupted-workspace").exists());
+    assert!(trash.is_dir());
+    assert_eq!(catalog.workspace_pin(id), None);
     fs::remove_dir_all(root).unwrap();
 }
 

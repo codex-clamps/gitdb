@@ -4,8 +4,13 @@
 //! location in it. Leases make that dependency explicit and survive a process
 //! crash as files that startup reconciliation can inspect.
 
+use reflink_forest_cache::{
+    CacheCapacityCoordinator, CapacityAdmission, CapacityAdmissionOperationError, CapacityMeter,
+};
 use reflink_forest_core::{ContentId, GitOid};
-use reflink_forest_format::{Codec, ObjectRecord};
+use reflink_forest_format::{
+    decode_object_payload, verify_object_record, CodecError, ObjectRecord,
+};
 use reflink_forest_git::{referenced_oids, GitObject};
 use reflink_forest_import::SnapshotManifest;
 use reflink_forest_index::{Catalog, CatalogBatch, GcRoot, ObjectLocation, RepoId, SnapshotId};
@@ -316,10 +321,6 @@ pub enum MarkError {
         actual_generation: u32,
     },
     Read(String),
-    UnsupportedCodec {
-        content_id: ContentId,
-        codec: Codec,
-    },
     RawLengthMismatch {
         content_id: ContentId,
         expected: u64,
@@ -376,10 +377,6 @@ impl std::fmt::Display for MarkError {
                 "GC mark found {content_id:?} in generation {actual_generation}, not current generation {expected_generation}"
             ),
             Self::Read(error) => write!(f, "GC mark could not read a cold record: {error}"),
-            Self::UnsupportedCodec { content_id, codec } => write!(
-                f,
-                "GC mark cannot inspect {content_id:?}: unsupported cold codec {codec:?}"
-            ),
             Self::RawLengthMismatch {
                 content_id,
                 expected,
@@ -406,6 +403,18 @@ impl std::fmt::Display for MarkError {
 }
 
 impl std::error::Error for MarkError {}
+
+fn mark_codec_error(content_id: ContentId, error: CodecError) -> MarkError {
+    match error {
+        CodecError::RawLengthMismatch { expected, actual } => MarkError::RawLengthMismatch {
+            content_id,
+            expected,
+            actual,
+        },
+        CodecError::ContentMismatch { .. } => MarkError::PayloadContentIdMismatch(content_id),
+        other => MarkError::Read(other.to_string()),
+    }
+}
 
 struct MarkWalk {
     limits: MarkLimits,
@@ -594,30 +603,9 @@ where
                 actual: record.content_id,
             });
         }
-        if record.codec != Codec::Raw {
-            return Err(MarkError::UnsupportedCodec {
-                content_id,
-                codec: record.codec,
-            });
-        }
-        let raw_length =
-            u64::try_from(record.payload.len()).map_err(|_| MarkError::RawLengthMismatch {
-                content_id,
-                expected: record.raw_length,
-                actual: u64::MAX,
-            })?;
-        if record.raw_length != raw_length {
-            return Err(MarkError::RawLengthMismatch {
-                content_id,
-                expected: record.raw_length,
-                actual: raw_length,
-            });
-        }
-        if ContentId::for_object(record.kind, &record.payload) != content_id {
-            return Err(MarkError::PayloadContentIdMismatch(content_id));
-        }
-        let actual_oid =
-            GitOid::for_object(reference.oid.algorithm(), record.kind, &record.payload);
+        let raw_payload =
+            decode_object_payload(&record).map_err(|error| mark_codec_error(content_id, error))?;
+        let actual_oid = GitOid::for_object(reference.oid.algorithm(), record.kind, &raw_payload);
         if actual_oid != reference.oid {
             return Err(MarkError::NativeOidMismatch {
                 expected: reference.oid,
@@ -631,7 +619,7 @@ where
         let object = GitObject {
             oid: reference.oid,
             kind: record.kind,
-            data: record.payload,
+            data: raw_payload,
         };
         for oid in referenced_oids(&object)
             .map_err(|error| MarkError::InvalidGitObject(error.to_string()))?
@@ -713,6 +701,8 @@ where
         if record.content_id != content_id {
             return Err(MaintenanceError::CompactionRecordIdMismatch(content_id));
         }
+        verify_object_record(&record)
+            .map_err(|error| MaintenanceError::CompactionRead(error.to_string()))?;
         let shadow_location = writer
             .append(&record)
             .map_err(|error| MaintenanceError::CompactionWrite(error.to_string()))?;
@@ -747,6 +737,45 @@ where
         source_generation,
         target_generation,
         copied_records: shadow_locations.len(),
+    })
+}
+
+/// Copies and publishes a completed mark set only after the shared reserve
+/// guard admits its complete destination-output allocation budget.
+///
+/// `projected_compaction_output_bytes` must conservatively cover all target
+/// chunk writes, temporary staging, and caller-known metadata growth. On an
+/// admission failure no source record is read, no target record is appended,
+/// and the catalog is left unchanged. Normal compaction failures after
+/// admission are preserved in [`CapacityAdmissionOperationError::Operation`].
+#[allow(clippy::too_many_arguments)] // Mirrors the established compaction entry point plus capacity.
+pub fn compact_completed_mark_set_with_reserve_admission<C, R, W, M>(
+    capacity: &CacheCapacityCoordinator<M>,
+    projected_compaction_output_bytes: u64,
+    catalog: &mut C,
+    manager: &GenerationManager,
+    source_generation: u32,
+    target_generation: u32,
+    live: &[(ContentId, ObjectLocation)],
+    reader: &mut R,
+    writer: &mut W,
+) -> Result<(CapacityAdmission, CompactionOutcome), CapacityAdmissionOperationError<MaintenanceError>>
+where
+    C: Catalog,
+    R: CompactionReader,
+    W: CompactionWriter,
+    M: CapacityMeter,
+{
+    capacity.with_reserve_admission(projected_compaction_output_bytes, || {
+        compact_completed_mark_set(
+            catalog,
+            manager,
+            source_generation,
+            target_generation,
+            live,
+            reader,
+            writer,
+        )
     })
 }
 
@@ -1051,8 +1080,11 @@ fn nonce() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reflink_forest_cache::{
+        Cache, CacheCapacityCoordinator, CapacityAdmissionError, CapacitySnapshot, ReservePolicy,
+    };
     use reflink_forest_core::{HashAlgorithm, ObjectKind};
-    use reflink_forest_format::{crc32c, ChunkHeader, Codec, ObjectRecord};
+    use reflink_forest_format::{crc32c, encode_object_payload, ChunkHeader, Codec, ObjectRecord};
     use reflink_forest_git::LocalRefKind;
     use reflink_forest_import::{ImportPolicy, ImportSummary, PersistedRef, RepoSnapshotId};
     use reflink_forest_index::{
@@ -1061,6 +1093,18 @@ mod tests {
     };
     use reflink_forest_store::{read_record_at, ChunkWriter, RecordLocation};
     use std::collections::{BTreeMap, HashMap};
+
+    struct UnavailableCapacityMeter;
+
+    impl CapacityMeter for UnavailableCapacityMeter {
+        fn measure(&self) -> io::Result<CapacitySnapshot> {
+            Ok(CapacitySnapshot {
+                host_available_bytes: 100,
+                guest_available_bytes: 80,
+            })
+        }
+    }
+
     fn root() -> PathBuf {
         std::env::temp_dir().join(format!("reflink-forest-maintenance-{}", nonce()))
     }
@@ -1302,7 +1346,9 @@ mod tests {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         let mut writer = ChunkWriter::create(&path, chunk_header(1, 1)).unwrap();
         let first = object_record(b"live object one", 1);
-        let second = object_record(b"live object two", 2);
+        let mut second = object_record(b"live object two", 2);
+        second.codec = Codec::Zstd;
+        second.payload = encode_object_payload(Codec::Zstd, b"live object two").unwrap();
         let first_location = object_location(1, 1, &first, writer.append(&first).unwrap());
         let second_location = object_location(1, 1, &second, writer.append(&second).unwrap());
         writer.sync_data().unwrap();
@@ -1405,6 +1451,54 @@ mod tests {
         assert!(retired.is_dir());
         assert!(!source_path.exists());
         drop(writer);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn compaction_reserve_admission_refuses_before_copy_or_catalog_publication() {
+        let root = root();
+        let manager = GenerationManager::open(root.join("maintenance")).unwrap();
+        let (_source_path, mut reader, live) = source_generation(&root);
+        let mut writer = target_generation(&root);
+        let cache = Cache::open(root.join("cache")).unwrap();
+        let capacity = CacheCapacityCoordinator::new(
+            cache,
+            UnavailableCapacityMeter,
+            ReservePolicy::new(100, 80),
+        );
+        let mut catalog = InMemoryCatalog::default();
+        seed_source_locations(&mut catalog, &live);
+        manager.publish_active(1).unwrap();
+
+        let error = compact_completed_mark_set_with_reserve_admission(
+            &capacity,
+            1,
+            &mut catalog,
+            &manager,
+            1,
+            2,
+            &live,
+            &mut reader,
+            &mut writer,
+        )
+        .expect_err("one byte would consume the exact reserve floor");
+
+        assert!(matches!(
+            error,
+            CapacityAdmissionOperationError::Admission(CapacityAdmissionError::ReservesStillUnmet(
+                _
+            ))
+        ));
+        assert_eq!(writer.writer.record_count(), 0);
+        assert_eq!(catalog.current_generation(), Some(1));
+        for &(content_id, location) in &live {
+            assert_eq!(catalog.object_location(content_id), Some(location));
+        }
+
+        drop(capacity);
+        drop(writer);
+        drop(reader);
+        drop(manager);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1664,6 +1758,30 @@ mod tests {
             .windows(2)
             .all(|pair| pair[0].0.as_bytes() < pair[1].0.as_bytes()));
         assert!(marked.iter().all(|(_, location)| location.generation == 7));
+    }
+
+    #[test]
+    fn completed_mark_set_traverses_zstd_git_objects() {
+        let mut fixture = mark_fixture();
+        let content_id = fixture.ids[0];
+        let record = fixture.reader.records.get_mut(&content_id).unwrap();
+        let raw = record.payload.clone();
+        record.codec = Codec::Zstd;
+        record.payload = encode_object_payload(Codec::Zstd, &raw).unwrap();
+
+        let mut batch = CatalogBatch::new();
+        batch.put_object_location(content_id, mark_location(record));
+        fixture.catalog.apply(batch).unwrap();
+
+        let marked = completed_mark_set(
+            &fixture.catalog,
+            &fixture.manifests,
+            &mut fixture.reader,
+            [fixture.retained],
+            MarkLimits::default(),
+        )
+        .unwrap();
+        assert!(marked.iter().any(|(id, _)| *id == content_id));
     }
 
     #[test]
