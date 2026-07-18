@@ -1,0 +1,9 @@
+/target/
+*.swp
+*.tmp
+*.open
+*.sealed
+hot.btrfs
+chunks/
+rocksdb/
+temporary/

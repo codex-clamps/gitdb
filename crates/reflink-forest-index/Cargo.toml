@@ -1,0 +1,12 @@
+[package]
+name = "reflink-forest-index"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+license = "MIT OR Apache-2.0"
+description = "Versioned catalog encodings and transactional in-memory catalog"
+
+[dependencies]
+reflink-forest-core = { path = "../reflink-forest-core" }
+reflink-forest-format = { path = "../reflink-forest-format" }
+

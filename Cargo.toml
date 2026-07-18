@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/reflink-forest-core", "crates/reflink-forest-probe", "crates/reflink-forest-format", "crates/reflink-forest-store", "crates/reflink-forest-index"]
+resolver = "2"

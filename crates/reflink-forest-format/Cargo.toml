@@ -1,0 +1,11 @@
+[package]
+name = "reflink-forest-format"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+license = "MIT OR Apache-2.0"
+description = "Version 1 chunk and record codec for Reflink Forest"
+
+[dependencies]
+reflink-forest-core = { path = "../reflink-forest-core" }
+

@@ -1,0 +1,11 @@
+[package]
+name = "reflink-forest-core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+license = "MIT OR Apache-2.0"
+description = "Stable object identity primitives for Reflink Forest"
+
+[dependencies]
+sha2 = "0.10"
+

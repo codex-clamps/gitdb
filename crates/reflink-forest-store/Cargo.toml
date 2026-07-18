@@ -1,0 +1,12 @@
+[package]
+name = "reflink-forest-store"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+license = "MIT OR Apache-2.0"
+description = "Append-only cold chunk storage for Reflink Forest"
+
+[dependencies]
+reflink-forest-format = { path = "../reflink-forest-format" }
+reflink-forest-core = { path = "../reflink-forest-core" }
+reflink-forest-index = { path = "../reflink-forest-index" }
