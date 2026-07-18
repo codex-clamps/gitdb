@@ -432,6 +432,17 @@ pub enum PrivilegedPlan {
     ResizeFilesystem {
         mount_root: PathBuf,
     },
+    /// Reads qgroup counters with raw byte units. This is diagnostic-only:
+    /// the plan neither enables quotas nor changes qgroup limits.
+    ShowQgroups {
+        mount_root: PathBuf,
+    },
+    /// Asks the filesystem for a dry-run discard estimate. `fstrim --dry-run`
+    /// performs no discard; its result is advisory and is not proof that
+    /// cache eviction immediately returns blocks to the backing filesystem.
+    ProbeTrim {
+        mount_root: PathBuf,
+    },
 }
 impl PrivilegedPlan {
     pub fn attach(
@@ -469,6 +480,20 @@ impl PrivilegedPlan {
         Ok(Self::GrowImage {
             image: validate_backing_image(image, configured_parent)?,
             size,
+        })
+    }
+    /// Builds the fixed qgroup diagnostic plan for a configured mount root.
+    /// This plan never enables quotas or creates/deletes qgroups.
+    pub fn show_qgroups(mount_root: impl AsRef<Path>) -> Result<Self, BtrfsError> {
+        Ok(Self::ShowQgroups {
+            mount_root: checked_mount_root(mount_root.as_ref())?,
+        })
+    }
+    /// Builds the fixed, non-mutating trim capability probe for a configured
+    /// mount root. It deliberately has no offset, length, or device input.
+    pub fn probe_trim(mount_root: impl AsRef<Path>) -> Result<Self, BtrfsError> {
+        Ok(Self::ProbeTrim {
+            mount_root: checked_mount_root(mount_root.as_ref())?,
         })
     }
     pub fn command(&self) -> Command {
@@ -522,6 +547,16 @@ impl PrivilegedPlan {
                     .arg(mount_root);
                 command
             }
+            Self::ShowQgroups { mount_root } => {
+                let mut command = Command::new("btrfs");
+                command.args(["qgroup", "show", "--raw"]).arg(mount_root);
+                command
+            }
+            Self::ProbeTrim { mount_root } => {
+                let mut command = Command::new("fstrim");
+                command.args(["--dry-run", "--verbose"]).arg(mount_root);
+                command
+            }
         }
     }
 
@@ -535,6 +570,8 @@ impl PrivilegedPlan {
             Self::Mount { .. } => "mount",
             Self::GrowImage { .. } => "truncate",
             Self::ResizeFilesystem { .. } => "btrfs filesystem resize",
+            Self::ShowQgroups { .. } => "btrfs qgroup show",
+            Self::ProbeTrim { .. } => "fstrim --dry-run",
         }
     }
 }
@@ -897,6 +934,259 @@ pub struct DoctorDiagnostics {
     pub guest_free_bytes: Option<u64>,
     pub notes: Vec<String>,
 }
+
+/// The result of a Btrfs capability diagnostic. Diagnostics are deliberately
+/// three-valued: a failed query is not treated as either a disabled feature or
+/// evidence that the feature is available.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DiagnosticOutcome<T> {
+    /// The command completed and its narrowly specified output was parsed.
+    Supported(T),
+    /// The command reported a known, stable unsupported/disabled condition.
+    Unsupported,
+    /// Permission failures, I/O failures, malformed output, or an unfamiliar
+    /// command failure. Operators must not make capacity decisions from this.
+    Unknown,
+}
+
+impl<T> DiagnosticOutcome<T> {
+    pub fn is_supported(&self) -> bool {
+        matches!(self, Self::Supported(_))
+    }
+}
+
+/// A kernel qgroup identifier in the `level/subvolume-id` representation used
+/// by `btrfs qgroup show`. The daemon only reads these counters; it never
+/// creates qgroups or changes quota limits as part of diagnosis.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct QgroupId {
+    pub level: u64,
+    pub subvolume_id: u64,
+}
+
+/// Raw qgroup counters emitted by the constrained `btrfs qgroup show --raw`
+/// plan. A `None` limit is the command's `none` value, not zero.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgroupUsage {
+    pub id: QgroupId,
+    pub referenced_bytes: u64,
+    pub exclusive_bytes: u64,
+    pub max_referenced_bytes: Option<u64>,
+    pub max_exclusive_bytes: Option<u64>,
+}
+
+/// The byte count estimated by `fstrim --dry-run --verbose`. It is an
+/// advisory filesystem/device discard estimate, not a promise that deleting
+/// cache entries has already returned backing-image allocation to the host.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TrimDiagnostics {
+    pub reclaimable_bytes: u64,
+}
+
+/// Parses the output of the fixed `btrfs qgroup show --raw <mount-root>`
+/// diagnostic plan. It recognizes the command's stable "quotas disabled" and
+/// "not supported" errors as `Unsupported`; permissions, I/O, and malformed
+/// output remain explicitly `Unknown`.
+///
+/// The parser accepts the standard heading and separator lines but requires
+/// every data line to contain precisely the five raw columns selected by the
+/// fixed plan. This prevents a differently shaped invocation from being
+/// silently interpreted as an authoritative quota report.
+pub fn parse_qgroup_diagnostics(
+    stdout: &[u8],
+    stderr: &[u8],
+    success: bool,
+) -> DiagnosticOutcome<Vec<QgroupUsage>> {
+    if !success {
+        return diagnostic_failure_kind(stderr, stdout);
+    }
+    let Ok(output) = std::str::from_utf8(stdout) else {
+        return DiagnosticOutcome::Unknown;
+    };
+    let mut qgroups = Vec::new();
+    for line in output.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with("qgroupid") || is_qgroup_separator(line) {
+            continue;
+        }
+        let mut fields = line.split_ascii_whitespace();
+        let (
+            Some(id),
+            Some(referenced_bytes),
+            Some(exclusive_bytes),
+            Some(max_referenced_bytes),
+            Some(max_exclusive_bytes),
+            None,
+        ) = (
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+        )
+        else {
+            return DiagnosticOutcome::Unknown;
+        };
+        let Some(id) = parse_qgroup_id(id) else {
+            return DiagnosticOutcome::Unknown;
+        };
+        let (Ok(referenced_bytes), Ok(exclusive_bytes)) =
+            (referenced_bytes.parse(), exclusive_bytes.parse())
+        else {
+            return DiagnosticOutcome::Unknown;
+        };
+        let (Some(max_referenced_bytes), Some(max_exclusive_bytes)) = (
+            parse_qgroup_limit(max_referenced_bytes),
+            parse_qgroup_limit(max_exclusive_bytes),
+        ) else {
+            return DiagnosticOutcome::Unknown;
+        };
+        qgroups.push(QgroupUsage {
+            id,
+            referenced_bytes,
+            exclusive_bytes,
+            max_referenced_bytes,
+            max_exclusive_bytes,
+        });
+    }
+    DiagnosticOutcome::Supported(qgroups)
+}
+
+/// Parses the output of the fixed `fstrim --dry-run --verbose <mount-root>`
+/// plan. A parsed zero is still `Supported`: it means the filesystem accepted
+/// the probe and reported no current discardable bytes. The parser does not
+/// execute a trim and callers must never use the estimate as an accounting
+/// substitute for host/guest free-space measurements.
+pub fn parse_trim_diagnostics(
+    stdout: &[u8],
+    stderr: &[u8],
+    success: bool,
+) -> DiagnosticOutcome<TrimDiagnostics> {
+    if !success {
+        return diagnostic_failure_kind(stderr, stdout);
+    }
+    let Ok(output) = std::str::from_utf8(stdout) else {
+        return DiagnosticOutcome::Unknown;
+    };
+    let mut estimate = None;
+    for line in output.lines().filter(|line| !line.trim().is_empty()) {
+        let Some(value) = parse_trim_line(line) else {
+            return DiagnosticOutcome::Unknown;
+        };
+        if estimate.replace(value).is_some() {
+            return DiagnosticOutcome::Unknown;
+        }
+    }
+    estimate
+        .map(|reclaimable_bytes| {
+            DiagnosticOutcome::Supported(TrimDiagnostics { reclaimable_bytes })
+        })
+        .unwrap_or(DiagnosticOutcome::Unknown)
+}
+
+fn diagnostic_failure_kind<T>(stderr: &[u8], stdout: &[u8]) -> DiagnosticOutcome<T> {
+    const UNSUPPORTED_MESSAGES: [&[u8]; 7] = [
+        b"quota not enabled",
+        b"quotas not enabled",
+        b"qgroup not enabled",
+        b"quotas are not enabled",
+        b"operation not supported",
+        b"discard operation is not supported",
+        b"not supported",
+    ];
+    if UNSUPPORTED_MESSAGES.iter().any(|message| {
+        contains_ascii_case_insensitive(stderr, message)
+            || contains_ascii_case_insensitive(stdout, message)
+    }) {
+        DiagnosticOutcome::Unsupported
+    } else {
+        DiagnosticOutcome::Unknown
+    }
+}
+
+fn contains_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|window| {
+        window
+            .iter()
+            .zip(needle)
+            .all(|(actual, expected)| actual.to_ascii_lowercase() == *expected)
+    })
+}
+
+fn parse_qgroup_id(value: &str) -> Option<QgroupId> {
+    let (level, subvolume_id) = value.split_once('/')?;
+    Some(QgroupId {
+        level: level.parse().ok()?,
+        subvolume_id: subvolume_id.parse().ok()?,
+    })
+}
+
+fn parse_qgroup_limit(value: &str) -> Option<Option<u64>> {
+    if value == "none" {
+        Some(None)
+    } else {
+        value.parse().ok().map(Some)
+    }
+}
+
+fn is_qgroup_separator(line: &str) -> bool {
+    line.bytes()
+        .all(|byte| byte == b'-' || byte.is_ascii_whitespace())
+}
+
+fn parse_trim_line(line: &str) -> Option<u64> {
+    let (mount_root, estimate) = line.split_once(':')?;
+    if mount_root.is_empty() {
+        return None;
+    }
+    let estimate = estimate.trim();
+    let estimate = estimate.strip_suffix("(dry run) trimmed")?.trim_end();
+    let mut fields = estimate.split_ascii_whitespace();
+    let number = fields.next()?;
+    let unit = fields.next()?;
+    if fields.next().is_some() {
+        return None;
+    }
+    parse_trim_bytes(number, trim_unit_multiplier(unit)?)
+}
+
+fn parse_trim_bytes(number: &str, multiplier: u64) -> Option<u64> {
+    let (whole, fractional) = match number.split_once('.') {
+        Some((whole, fractional)) if !fractional.is_empty() && fractional.len() <= 6 => {
+            (whole, Some(fractional))
+        }
+        Some(_) => return None,
+        None => (number, None),
+    };
+    if whole.is_empty() || !whole.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let whole = whole.parse::<u64>().ok()?.checked_mul(multiplier)?;
+    let Some(fractional) = fractional else {
+        return Some(whole);
+    };
+    if !fractional.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let scale = 10_u64.checked_pow(fractional.len() as u32)?;
+    let fractional = fractional.parse::<u64>().ok()?;
+    let fraction = fractional.checked_mul(multiplier)?.checked_div(scale)?;
+    whole.checked_add(fraction)
+}
+
+fn trim_unit_multiplier(unit: &str) -> Option<u64> {
+    match unit {
+        "B" => Some(1),
+        "KiB" => Some(1 << 10),
+        "MiB" => Some(1 << 20),
+        "GiB" => Some(1 << 30),
+        "TiB" => Some(1 << 40),
+        "PiB" => Some(1 << 50),
+        "EiB" => Some(1 << 60),
+        _ => None,
+    }
+}
 /// Parses the numeric `df -B1 --output=avail` body emitted by a constrained
 /// helper. Missing/unparseable values are reported as inconclusive, never 0.
 pub fn parse_available_bytes(output: &str) -> Option<u64> {
@@ -1144,6 +1434,110 @@ mod tests {
         let plan = PrivilegedPlan::attach(&image, &parent, "").unwrap();
         assert!(format!("{:?}", plan.command()).contains("losetup"));
         fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn qgroup_and_trim_plans_have_no_mutating_or_caller_selected_options() {
+        let root = temp_path("reflink-forest-diagnostics-plan");
+        fs::create_dir(&root).unwrap();
+
+        let qgroups = PrivilegedPlan::show_qgroups(&root).unwrap().command();
+        assert_eq!(qgroups.get_program(), OsStr::new("btrfs"));
+        assert_eq!(
+            qgroups
+                .get_args()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            vec!["qgroup", "show", "--raw", root.to_str().unwrap()]
+        );
+
+        let trim = PrivilegedPlan::probe_trim(&root).unwrap().command();
+        assert_eq!(trim.get_program(), OsStr::new("fstrim"));
+        assert_eq!(
+            trim.get_args()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            vec!["--dry-run", "--verbose", root.to_str().unwrap()]
+        );
+        fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn qgroup_diagnostics_parse_raw_counters_and_distinguish_outcomes() {
+        let output = b"qgroupid         rfer         excl     max_rfer     max_excl\n--------         ----         ----     --------     --------\n0/5              1048576       524288         none      2097152\n1/42             4096          2048           8192      none\n";
+        assert_eq!(
+            parse_qgroup_diagnostics(output, b"", true),
+            DiagnosticOutcome::Supported(vec![
+                QgroupUsage {
+                    id: QgroupId {
+                        level: 0,
+                        subvolume_id: 5,
+                    },
+                    referenced_bytes: 1_048_576,
+                    exclusive_bytes: 524_288,
+                    max_referenced_bytes: None,
+                    max_exclusive_bytes: Some(2_097_152),
+                },
+                QgroupUsage {
+                    id: QgroupId {
+                        level: 1,
+                        subvolume_id: 42,
+                    },
+                    referenced_bytes: 4_096,
+                    exclusive_bytes: 2_048,
+                    max_referenced_bytes: Some(8_192),
+                    max_exclusive_bytes: None,
+                },
+            ])
+        );
+        assert_eq!(
+            parse_qgroup_diagnostics(b"", b"ERROR: quotas not enabled", false),
+            DiagnosticOutcome::Unsupported
+        );
+        assert_eq!(
+            parse_qgroup_diagnostics(
+                b"",
+                b"ERROR: can't list qgroups: Operation not permitted",
+                false
+            ),
+            DiagnosticOutcome::Unknown
+        );
+        assert_eq!(
+            parse_qgroup_diagnostics(b"0/5 1 2 none\n", b"", true),
+            DiagnosticOutcome::Unknown
+        );
+    }
+
+    #[test]
+    fn trim_diagnostics_parse_byte_estimates_and_distinguish_outcomes() {
+        assert_eq!(
+            parse_trim_diagnostics(b"/mount: 0 B (dry run) trimmed\n", b"", true),
+            DiagnosticOutcome::Supported(TrimDiagnostics {
+                reclaimable_bytes: 0,
+            })
+        );
+        assert_eq!(
+            parse_trim_diagnostics(b"/mount: 1.5 MiB (dry run) trimmed\n", b"", true),
+            DiagnosticOutcome::Supported(TrimDiagnostics {
+                reclaimable_bytes: 1_572_864,
+            })
+        );
+        assert_eq!(
+            parse_trim_diagnostics(
+                b"",
+                b"fstrim: /mount: the discard operation is not supported",
+                false,
+            ),
+            DiagnosticOutcome::Unsupported
+        );
+        assert_eq!(
+            parse_trim_diagnostics(b"", b"fstrim: /mount: Input/output error", false),
+            DiagnosticOutcome::Unknown
+        );
+        assert_eq!(
+            parse_trim_diagnostics(b"not a trim result\n", b"", true),
+            DiagnosticOutcome::Unknown
+        );
     }
 
     #[derive(Default)]

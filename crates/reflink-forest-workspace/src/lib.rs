@@ -872,7 +872,7 @@ impl<'a, C: Catalog, F: Fn(u32, u64) -> PathBuf> RawCheckoutSource
 mod tests {
     use super::*;
     use reflink_forest_format::{ChunkHeader, ObjectRecord};
-    use reflink_forest_index::InMemoryCatalog;
+    use reflink_forest_index::{InMemoryCatalog, RocksDbCatalog};
     use reflink_forest_store::ChunkWriter;
     use std::{
         fs,
@@ -893,9 +893,9 @@ mod tests {
         ))
     }
 
-    fn append(
+    fn append<C: Catalog>(
         writer: &mut ChunkWriter,
-        catalog: &mut InMemoryCatalog,
+        catalog: &mut C,
         repo: RepoId,
         oid: GitOid,
         kind: ObjectKind,
@@ -1312,7 +1312,6 @@ mod tests {
         let original = temp_root();
         fs::create_dir(&original).unwrap();
         let chunk = original.join("1.open");
-        let original_cache = Cache::open(original.join("cache")).unwrap();
         let repository = RepoId([0x41; 16]);
         let commit_oid = oid(0x42);
         let tree_oid = oid(0x43);
@@ -1328,7 +1327,9 @@ mod tests {
             },
         )
         .unwrap();
-        let mut catalog = InMemoryCatalog::default();
+        let catalog_path = original.join("metadata/catalog");
+        fs::create_dir_all(catalog_path.parent().unwrap()).unwrap();
+        let mut catalog = RocksDbCatalog::open(&catalog_path).unwrap();
         append(
             &mut writer,
             &mut catalog,
@@ -1357,15 +1358,16 @@ mod tests {
         );
         writer.sync_data().unwrap();
         drop(writer);
-        drop(original_cache);
+        // RocksDB owns a lock while open. Closing it before the checkpoint
+        // models the daemon's quiesce/sync handoff and proves the restored
+        // catalog is independently reopenable.
+        drop(catalog);
         let authoritative_paths = ColdTierAuthoritativePaths::new(
-            "metadata/catalog.bin",
+            "metadata/catalog",
             "metadata/config.bin",
             "metadata/pins.bin",
         )
         .unwrap();
-        fs::create_dir_all(original.join("metadata")).unwrap();
-        fs::write(original.join(authoritative_paths.catalog()), b"catalog").unwrap();
         fs::write(original.join(authoritative_paths.config()), b"config").unwrap();
         fs::write(
             original.join(authoritative_paths.pins_manifest()),
@@ -1418,6 +1420,8 @@ mod tests {
         ));
         restore_cold_tier(&backup, &manifest, &restored, &authoritative_paths).unwrap();
         let cache = Cache::open(restored.join("cache")).unwrap();
+        let catalog = RocksDbCatalog::open(restored.join(authoritative_paths.catalog())).unwrap();
+        assert!(catalog.oid_alias(repository, &commit_oid).is_some());
         let source =
             ColdWorkspaceSource::new(repository, &catalog, &cache, |_, _| restored.join("1.open"));
         assert_eq!(source.blob_bytes(&blob_oid).unwrap(), payload);

@@ -21,6 +21,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 pub const MANIFEST_FILE_NAME: &str = "manifest-v1";
 pub const COLD_DESCRIPTOR_FILE_NAME: &str = "cold-tier-v1";
 const COLD_DESCRIPTOR_MAGIC: &[u8; 8] = b"RFCOLD01";
+const AUTHORITATIVE_DIRECTORY_MAGIC: &[u8; 8] = b"RFAUTD01";
 
 const MANIFEST_MAGIC: &[u8; 8] = b"RFBKMAN1";
 const MANIFEST_HEADER_LEN: usize = MANIFEST_MAGIC.len() + 8;
@@ -77,7 +78,7 @@ pub struct ColdTierCheckpointDescriptor {
     pub pins_manifest_digest: [u8; 32],
 }
 
-/// The three authoritative metadata files whose content digests are carried
+/// The three authoritative metadata entries whose content digests are carried
 /// by a [`ColdTierCheckpointDescriptor`].
 ///
 /// Reflink Forest deliberately does not prescribe names for these files.  The
@@ -136,7 +137,14 @@ impl ColdTierAuthoritativePaths {
         &self.pins_manifest
     }
 
-    /// Hashes the three authoritative regular files below `root`.
+    /// Hashes the three authoritative metadata entries below `root`.
+    ///
+    /// An entry may be a regular file or a directory tree. Regular-file
+    /// digests remain the SHA-256 digest of their content. A directory uses a
+    /// domain-separated, deterministic digest of every descendant name, type,
+    /// and regular-file payload. Symlinks and non-regular filesystem objects
+    /// are rejected at every level, so a descriptor cannot authenticate a
+    /// catalog through a path that escapes the cold-tier root.
     ///
     /// This is useful when the catalog layer constructs a descriptor after it
     /// has durably synchronized its own authoritative metadata.
@@ -147,9 +155,9 @@ impl ColdTierAuthoritativePaths {
         self.validate()?;
         let root = root.as_ref();
         Ok(ColdTierAuthoritativeDigests {
-            catalog_digest: hash_authoritative_file(root, &self.catalog)?,
-            config_digest: hash_authoritative_file(root, &self.config)?,
-            pins_manifest_digest: hash_authoritative_file(root, &self.pins_manifest)?,
+            catalog_digest: hash_authoritative_entry(root, &self.catalog)?,
+            config_digest: hash_authoritative_entry(root, &self.config)?,
+            pins_manifest_digest: hash_authoritative_entry(root, &self.pins_manifest)?,
         })
     }
 
@@ -465,23 +473,145 @@ fn hash_file(path: &Path) -> Result<(u64, [u8; 32]), BackupError> {
     Ok((bytes, hasher.finalize().into()))
 }
 
-fn hash_authoritative_file(root: &Path, relative: &Path) -> Result<[u8; 32], BackupError> {
+fn hash_authoritative_entry(root: &Path, relative: &Path) -> Result<[u8; 32], BackupError> {
     let path = root.join(relative);
     match fs::symlink_metadata(&path) {
-        Ok(metadata) if metadata.file_type().is_file() => {}
-        Ok(_) => return Err(BackupError::VerificationFailed(relative.to_path_buf())),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Err(BackupError::VerificationFailed(relative.to_path_buf()))
+        Ok(metadata) if metadata.file_type().is_file() => hash_authoritative_file(&path, relative),
+        Ok(metadata) if metadata.file_type().is_dir() => {
+            hash_authoritative_directory(&path, relative)
         }
-        Err(error) => return Err(BackupError::Io(error)),
+        Ok(_) => Err(BackupError::VerificationFailed(relative.to_path_buf())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            Err(BackupError::VerificationFailed(relative.to_path_buf()))
+        }
+        Err(error) => Err(BackupError::Io(error)),
     }
-    match hash_file(&path) {
+}
+
+/// Keeps the v1 regular-file digest exactly as it was before directory
+/// authorities were added. This means a descriptor written for a file-backed
+/// catalog remains valid after this extension.
+fn hash_authoritative_file(path: &Path, relative: &Path) -> Result<[u8; 32], BackupError> {
+    match hash_file(path) {
         Ok((_, digest)) => Ok(digest),
         Err(BackupError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
             Err(BackupError::VerificationFailed(relative.to_path_buf()))
         }
         Err(error) => Err(error),
     }
+}
+
+/// Hashes a directory authority in canonical depth-first entry-name order.
+///
+/// The directory root is represented explicitly, then each entry is encoded
+/// as its type, a length-prefixed native name, and (for regular files) a
+/// length-prefixed payload. A native path can contain non-UTF-8 bytes on
+/// Unix, so the same byte representation used by the manifest is used here.
+fn hash_authoritative_directory(path: &Path, authority: &Path) -> Result<[u8; 32], BackupError> {
+    let mut hasher = Sha256::new();
+    hasher.update(AUTHORITATIVE_DIRECTORY_MAGIC);
+    hash_authoritative_directory_entries(path, authority, &mut hasher)?;
+    Ok(hasher.finalize().into())
+}
+
+fn hash_authoritative_directory_entries(
+    directory: &Path,
+    authority: &Path,
+    hasher: &mut Sha256,
+) -> Result<(), BackupError> {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(BackupError::VerificationFailed(authority.to_path_buf()))
+        }
+        Err(error) => return Err(BackupError::Io(error)),
+    };
+    let mut children = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let name = path_to_bytes(Path::new(&entry.file_name()))
+            .map_err(|_| BackupError::VerificationFailed(authority.to_path_buf()))?;
+        children.push((name, entry.path()));
+    }
+    children.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+
+    for (name, path) in children {
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(BackupError::VerificationFailed(authority.to_path_buf()))
+            }
+            Err(error) => return Err(BackupError::Io(error)),
+        };
+        if metadata.file_type().is_file() {
+            hasher.update(b"F");
+            hash_authoritative_name(hasher, &name)?;
+            hash_authoritative_file_contents(&path, authority, hasher)?;
+        } else if metadata.file_type().is_dir() {
+            hasher.update(b"D");
+            hash_authoritative_name(hasher, &name)?;
+            hash_authoritative_directory_entries(&path, authority, hasher)?;
+        } else {
+            return Err(BackupError::VerificationFailed(authority.to_path_buf()));
+        }
+    }
+    // Delimit this directory explicitly: without an end marker, a child
+    // directory's final entry could be ambiguous with the next sibling of
+    // that directory in the parent stream.
+    hasher.update(b"E");
+    Ok(())
+}
+
+fn hash_authoritative_name(hasher: &mut Sha256, name: &[u8]) -> Result<(), BackupError> {
+    let length: u32 = name
+        .len()
+        .try_into()
+        .map_err(|_: TryFromIntError| BackupError::InvalidColdTierLayout)?;
+    hasher.update(length.to_be_bytes());
+    hasher.update(name);
+    Ok(())
+}
+
+fn hash_authoritative_file_contents(
+    path: &Path,
+    authority: &Path,
+    hasher: &mut Sha256,
+) -> Result<(), BackupError> {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(BackupError::VerificationFailed(authority.to_path_buf()))
+        }
+        Err(error) => return Err(BackupError::Io(error)),
+    };
+    let bytes = match file.metadata() {
+        Ok(metadata) if metadata.is_file() => metadata.len(),
+        Ok(_) => return Err(BackupError::VerificationFailed(authority.to_path_buf())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(BackupError::VerificationFailed(authority.to_path_buf()))
+        }
+        Err(error) => return Err(BackupError::Io(error)),
+    };
+    hasher.update(bytes.to_be_bytes());
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut remaining = bytes;
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        let read: u64 = read
+            .try_into()
+            .map_err(|_: TryFromIntError| BackupError::InvalidManifest)?;
+        remaining = remaining
+            .checked_sub(read)
+            .ok_or(BackupError::VerificationFailed(authority.to_path_buf()))?;
+        hasher.update(&buffer[..usize::try_from(read).expect("read came from usize")]);
+    }
+    if remaining != 0 {
+        return Err(BackupError::VerificationFailed(authority.to_path_buf()));
+    }
+    Ok(())
 }
 
 fn verify_cold_descriptor_authority(
@@ -990,6 +1120,58 @@ mod tests {
         assert!(!restore.exists());
         fs::remove_dir_all(source).unwrap();
         fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn directory_authority_hashes_every_entry_in_deterministic_name_order() {
+        let root = dir("directory-authority");
+        let alternate = dir("directory-authority-alternate");
+        for base in [&root, &alternate] {
+            fs::create_dir_all(base.join("catalog/nested")).unwrap();
+            fs::write(base.join("config"), b"config").unwrap();
+            fs::write(base.join("pins"), b"pins").unwrap();
+        }
+        // Deliberately create files in a different order in each tree. The
+        // digest commits to entry names and payloads, rather than readdir's
+        // unspecified order or filesystem creation order.
+        fs::write(root.join("catalog/z"), b"z").unwrap();
+        fs::write(root.join("catalog/a"), b"a").unwrap();
+        fs::write(root.join("catalog/nested/one"), b"one").unwrap();
+        fs::write(alternate.join("catalog/nested/one"), b"one").unwrap();
+        fs::write(alternate.join("catalog/a"), b"a").unwrap();
+        fs::write(alternate.join("catalog/z"), b"z").unwrap();
+        let paths = ColdTierAuthoritativePaths::new("catalog", "config", "pins").unwrap();
+        assert_eq!(
+            paths.digests(&root).unwrap(),
+            paths.digests(&alternate).unwrap()
+        );
+
+        fs::write(alternate.join("catalog/nested/one"), b"changed").unwrap();
+        assert_ne!(
+            paths.digests(&root).unwrap(),
+            paths.digests(&alternate).unwrap()
+        );
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(alternate).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_authority_rejects_symlinked_descendants() {
+        use std::os::unix::fs::symlink;
+
+        let root = dir("directory-authority-symlink");
+        fs::create_dir_all(root.join("catalog")).unwrap();
+        fs::write(root.join("config"), b"config").unwrap();
+        fs::write(root.join("pins"), b"pins").unwrap();
+        fs::write(root.join("outside"), b"outside").unwrap();
+        symlink(root.join("outside"), root.join("catalog/link")).unwrap();
+        let paths = ColdTierAuthoritativePaths::new("catalog", "config", "pins").unwrap();
+        assert!(matches!(
+            paths.digests(&root),
+            Err(BackupError::VerificationFailed(path)) if path == paths.catalog()
+        ));
+        fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn checkpoint_is_verified_and_rejects_symlinks() {

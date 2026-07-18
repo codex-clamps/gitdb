@@ -140,6 +140,62 @@ pub struct JobRecord {
     pub last_error: Option<Vec<u8>>,
 }
 
+/// The durable result of attempting one unit of queued work.
+///
+/// A handler failure is deliberately represented as a successful return from
+/// the runner: the failure has been recorded durably in the contained job and
+/// can be inspected or retried through [`JobStore`]. Only a failure to claim
+/// or persist a job is returned as [`JobError`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum JobExecutionOutcome {
+    /// There was no queued work when the store was checked.
+    Idle,
+    /// The handler returned successfully and that result was persisted.
+    Succeeded(JobRecord),
+    /// The handler did not complete successfully, but the durable record was
+    /// changed to [`JobState::Failed`].
+    Failed {
+        job: JobRecord,
+        failure: JobExecutionFailure,
+    },
+}
+
+/// Why a [`JobExecutionOutcome::Failed`] job was persisted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JobExecutionFailure {
+    /// The injected handler returned an error. The byte-exact diagnostic is
+    /// available in `job.last_error`.
+    HandlerError,
+    /// The injected handler unwound. The runner catches the unwind so it can
+    /// first persist a retryable diagnostic rather than leaving the daemon
+    /// thread unwound with a `Running` record.
+    HandlerPanic,
+}
+
+/// Generic implementation hook for the durable job runner.
+///
+/// Implementations must treat `job.id` as an idempotency key. A process crash
+/// after the durable `Queued -> Running` claim but before the final state is
+/// recorded is recovered as queued work on the next [`JobStore::open`], so a
+/// handler may be invoked more than once across process lifetimes.
+pub trait JobHandler {
+    type Error: std::fmt::Display;
+
+    fn handle(&mut self, job: &JobRecord) -> Result<(), Self::Error>;
+}
+
+impl<F, E> JobHandler for F
+where
+    F: FnMut(&JobRecord) -> Result<(), E>,
+    E: std::fmt::Display,
+{
+    type Error = E;
+
+    fn handle(&mut self, job: &JobRecord) -> Result<(), Self::Error> {
+        self(job)
+    }
+}
+
 impl JobRecord {
     fn queued(id: JobId, kind: Vec<u8>, payload: Vec<u8>) -> Self {
         Self {
@@ -296,6 +352,7 @@ impl JobStore {
             if !self.job_path(id).exists() {
                 let record =
                     JobRecord::queued(id, kind.as_ref().to_vec(), payload.as_ref().to_vec());
+                ensure_execution_failure_space(&record)?;
                 self.write_record_locked(&record)?;
                 return Ok(record);
             }
@@ -320,6 +377,7 @@ impl JobStore {
             return Err(JobError::AlreadyExists(id));
         }
         let record = JobRecord::queued(id, kind.as_ref().to_vec(), payload.as_ref().to_vec());
+        ensure_execution_failure_space(&record)?;
         self.write_record_locked(&record)?;
         Ok(record)
     }
@@ -334,6 +392,81 @@ impl JobStore {
     pub fn list(&self) -> Result<Vec<JobRecord>, JobError> {
         let _guard = lock_unpoisoned(&self.mutation_lock);
         self.list_records_locked()
+    }
+
+    /// Claims the oldest queued job in stable [`JobId`] order.
+    ///
+    /// The returned record has already been atomically persisted as
+    /// [`JobState::Running`] and its attempt count has been increased. This is
+    /// intentionally one mutex-protected operation rather than `list` plus
+    /// `start`, so competing in-process workers cannot both select the same
+    /// job.
+    pub fn claim_next(&self) -> Result<Option<JobRecord>, JobError> {
+        let _guard = lock_unpoisoned(&self.mutation_lock);
+        let Some(mut record) = self
+            .list_records_locked()?
+            .into_iter()
+            .find(|record| record.state == JobState::Queued)
+        else {
+            return Ok(None);
+        };
+        ensure_execution_failure_space(&record)?;
+        record.attempts = record
+            .attempts
+            .checked_add(1)
+            .ok_or(JobError::AttemptOverflow(record.id))?;
+        record.state = JobState::Running;
+        self.write_record_locked(&record)?;
+        Ok(Some(record))
+    }
+
+    /// Durably claims and executes at most one queued job.
+    ///
+    /// The state transition to `Running` is synchronized before the injected
+    /// handler runs. A successful handler is committed as `Succeeded`; a
+    /// handler error or panic is committed as `Failed`. If the process stops
+    /// between the claim and the final commit, startup recovery returns the
+    /// `Running` record to `Queued` for a later attempt.
+    ///
+    /// Handler panics are caught at this boundary. The runner therefore does
+    /// not let a faulty job handler unwind the daemon worker before it has a
+    /// chance to persist the failure. If persisting any final state fails, the
+    /// method returns that [`JobError`] and the durable `Running` claim remains
+    /// safe for recovery.
+    pub fn execute_next<H: JobHandler>(
+        &self,
+        handler: &mut H,
+    ) -> Result<JobExecutionOutcome, JobError> {
+        let Some(claimed) = self.claim_next()? else {
+            return Ok(JobExecutionOutcome::Idle);
+        };
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            handler
+                .handle(&claimed)
+                .map_err(|error| bounded_handler_error(&claimed, error.to_string().into_bytes()))
+        }));
+
+        match result {
+            Ok(Ok(())) => Ok(JobExecutionOutcome::Succeeded(self.succeed(claimed.id)?)),
+            Ok(Err(error)) => {
+                let job = self.fail(claimed.id, error)?;
+                Ok(JobExecutionOutcome::Failed {
+                    job,
+                    failure: JobExecutionFailure::HandlerError,
+                })
+            }
+            Err(_) => {
+                let job = self.fail(
+                    claimed.id,
+                    bounded_handler_error(&claimed, b"job handler panicked".to_vec()),
+                )?;
+                Ok(JobExecutionOutcome::Failed {
+                    job,
+                    failure: JobExecutionFailure::HandlerPanic,
+                })
+            }
+        }
     }
 
     pub fn start(&self, id: JobId) -> Result<JobRecord, JobError> {
@@ -708,6 +841,39 @@ fn require_transition(
             to: target,
         })
     }
+}
+
+/// Converts an untrusted handler diagnostic into a record-sized failure
+/// payload. The durable record keeps its original kind and payload, so the
+/// remaining space—not merely the nominal field limit—bounds the diagnostic.
+fn bounded_handler_error(record: &JobRecord, mut error: Vec<u8>) -> Vec<u8> {
+    let capacity = execution_failure_capacity(record);
+    if error.is_empty() {
+        error = b"job handler returned an empty error".to_vec();
+    }
+    error.truncate(capacity);
+    error
+}
+
+/// Queued work must retain at least one byte for a final durable diagnostic.
+/// This turns an over-large job into an enqueue/claim error before any handler
+/// can be run, rather than risking an unrecordable handler failure.
+fn ensure_execution_failure_space(record: &JobRecord) -> Result<(), JobError> {
+    if execution_failure_capacity(record) == 0 {
+        Err(JobError::InvalidRecord(
+            "job record leaves no room for an execution failure",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn execution_failure_capacity(record: &JobRecord) -> usize {
+    MAX_JOB_RECORD_LEN
+        .saturating_sub(JOB_HEADER_LEN)
+        .saturating_sub(JOB_TRAILER_LEN)
+        .saturating_sub(record.kind.len())
+        .saturating_sub(record.payload.len())
 }
 
 fn lock_unpoisoned<T>(lock: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -2574,7 +2740,10 @@ mod tests {
     use super::*;
     use reflink_forest_index::{Catalog, CatalogBatch, InMemoryCatalog};
     use std::{
-        sync::Arc,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
         thread,
         time::{SystemTime, UNIX_EPOCH},
     };
@@ -3009,6 +3178,175 @@ mod tests {
         let record = store.get(id).unwrap();
         assert_eq!(record.state, JobState::Running);
         assert_eq!(record.attempts, 1);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn execute_next_persists_handler_success_and_reports_idle() {
+        let root = dir();
+        let store = JobStore::open(&root).unwrap();
+        let id = job_id(0x56);
+        store
+            .enqueue_with_id(id, b"hydrate", b"cold-object")
+            .unwrap();
+        let mut seen = None;
+        let outcome = {
+            let mut handler = |job: &JobRecord| -> Result<(), &'static str> {
+                seen = Some((job.id, job.kind.clone(), job.payload.clone(), job.state));
+                Ok(())
+            };
+            store.execute_next(&mut handler).unwrap()
+        };
+        assert!(matches!(
+            outcome,
+            JobExecutionOutcome::Succeeded(JobRecord {
+                id: found,
+                state: JobState::Succeeded,
+                attempts: 1,
+                last_error: None,
+                ..
+            }) if found == id
+        ));
+        assert_eq!(
+            seen,
+            Some((
+                id,
+                b"hydrate".to_vec(),
+                b"cold-object".to_vec(),
+                JobState::Running,
+            ))
+        );
+        assert_eq!(store.get(id).unwrap().state, JobState::Succeeded);
+        let mut idle_handler = |_job: &JobRecord| -> Result<(), &'static str> { Ok(()) };
+        assert_eq!(
+            store.execute_next(&mut idle_handler).unwrap(),
+            JobExecutionOutcome::Idle
+        );
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn execute_next_persists_handler_errors_and_catches_panics() {
+        let root = dir();
+        let store = JobStore::open(&root).unwrap();
+        let failed_id = job_id(0x57);
+        store
+            .enqueue_with_id(failed_id, b"import", b"unreachable-source")
+            .unwrap();
+        let mut failing_handler =
+            |_job: &JobRecord| -> Result<(), &'static str> { Err("source unavailable") };
+        let failed = store.execute_next(&mut failing_handler).unwrap();
+        assert!(matches!(
+            failed,
+            JobExecutionOutcome::Failed {
+                job: JobRecord {
+                    id: found,
+                    state: JobState::Failed,
+                    attempts: 1,
+                    last_error: Some(ref error),
+                    ..
+                },
+                failure: JobExecutionFailure::HandlerError,
+            } if found == failed_id && error == b"source unavailable"
+        ));
+
+        let panic_id = job_id(0x58);
+        store
+            .enqueue_with_id(panic_id, b"checkout", b"workspace")
+            .unwrap();
+        let mut panicking_handler =
+            |_job: &JobRecord| -> Result<(), &'static str> { panic!("handler bug") };
+        let panicked = store.execute_next(&mut panicking_handler).unwrap();
+        assert!(matches!(
+            panicked,
+            JobExecutionOutcome::Failed {
+                job: JobRecord {
+                    id: found,
+                    state: JobState::Failed,
+                    attempts: 1,
+                    last_error: Some(ref error),
+                    ..
+                },
+                failure: JobExecutionFailure::HandlerPanic,
+            } if found == panic_id && error == b"job handler panicked"
+        ));
+        assert_eq!(store.get(panic_id).unwrap().state, JobState::Failed);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn concurrent_execute_next_invokes_one_handler_for_one_job() {
+        let root = dir();
+        let store = Arc::new(JobStore::open(&root).unwrap());
+        let id = job_id(0x59);
+        store.enqueue_with_id(id, b"compact", b"payload").unwrap();
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let mut workers = Vec::new();
+        for _ in 0..8 {
+            let store = Arc::clone(&store);
+            let invocations = Arc::clone(&invocations);
+            workers.push(thread::spawn(move || {
+                let mut handler = move |_job: &JobRecord| -> Result<(), &'static str> {
+                    invocations.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                };
+                store.execute_next(&mut handler).unwrap()
+            }));
+        }
+        let outcomes: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, JobExecutionOutcome::Succeeded(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, JobExecutionOutcome::Idle))
+                .count(),
+            7
+        );
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
+        let record = store.get(id).unwrap();
+        assert_eq!(record.state, JobState::Succeeded);
+        assert_eq!(record.attempts, 1);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn claimed_work_is_recovered_and_reexecuted_after_restart() {
+        let root = dir();
+        let id = job_id(0x5a);
+        {
+            let store = JobStore::open(&root).unwrap();
+            store.enqueue_with_id(id, b"hydrate", b"payload").unwrap();
+            let claimed = store.claim_next().unwrap().unwrap();
+            assert_eq!(claimed.state, JobState::Running);
+            assert_eq!(claimed.attempts, 1);
+        }
+
+        let (store, recovered) = JobStore::open_with_recovery(&root).unwrap();
+        assert_eq!(recovered, 1);
+        assert_eq!(store.get(id).unwrap().state, JobState::Queued);
+        let mut handler = |_job: &JobRecord| -> Result<(), &'static str> { Ok(()) };
+        let outcome = store.execute_next(&mut handler).unwrap();
+        assert!(matches!(
+            outcome,
+            JobExecutionOutcome::Succeeded(JobRecord {
+                id: found,
+                attempts: 2,
+                ..
+            }) if found == id
+        ));
         drop(store);
         fs::remove_dir_all(root).unwrap();
     }

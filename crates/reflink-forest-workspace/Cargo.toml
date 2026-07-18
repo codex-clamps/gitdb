@@ -18,3 +18,4 @@ reflink-forest-store = { path = "../reflink-forest-store" }
 
 [dev-dependencies]
 reflink-forest-backup = { path = "../reflink-forest-backup" }
+reflink-forest-index = { path = "../reflink-forest-index", features = ["rocksdb-backend"] }

@@ -117,6 +117,27 @@ the immediate cache publication, but callers still handle allocation-time
 `ENOSPC` or quota failures because unrelated filesystem activity can consume
 space concurrently.
 
+### Qgroup and trim diagnostics
+
+Qgroups remain optional. `doctor` may read `btrfs qgroup show --raw` for the
+verified materialization root, but it never enables quotas, creates a qgroup,
+or changes a qgroup limit. A successful report contains raw referenced and
+exclusive byte counters plus any configured limits. If Btrfs reports that
+quotas are disabled or the operation is unsupported, the result is explicitly
+`Unsupported`. Permission errors, I/O failures, malformed command output, and
+other unfamiliar failures are `Unknown`; they are not evidence that quotas are
+disabled and must not be converted to zero headroom.
+
+Trim capability is measured only with the fixed `fstrim --dry-run --verbose`
+plan for the verified root. This makes no discard request. A parsed byte count,
+including zero, means the dry-run probe was supported at that instant. It is an
+advisory lower-precision estimate of discardable storage, not proof that a
+cache deletion has returned blocks to the backing image or host filesystem.
+The same explicit `Unsupported` and `Unknown` outcomes apply. Capacity
+admission continues to rely on host and guest free-space measurements and
+configured reserves; neither qgroup nor trim diagnostics authorize an
+allocation by themselves.
+
 `store verify --quick` checks structural data; a full verification additionally
 decompresses every record and validates ContentIds and repository-scoped native
 aliases. Cache corruption is quarantined or deleted and regenerated. Btrfs
