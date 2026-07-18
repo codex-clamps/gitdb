@@ -12,8 +12,9 @@ use std::{
 };
 
 use reflink_forest_format::{
-    crc32c, decode_record, encode_record, encoded_record_len_from_header, ChunkHeader, FormatError,
-    ObjectRecord, CHUNK_HEADER_LEN, RECORD_HEADER_LEN,
+    crc32c, decode_record, decode_record_metadata, encode_record, encoded_record_len_from_header,
+    encoded_record_len_from_metadata, validate_record_footer, ChunkHeader, Crc32c, FormatError,
+    ObjectRecord, RecordMetadata, CHUNK_HEADER_LEN, RECORD_FOOTER_LEN, RECORD_HEADER_LEN,
 };
 use reflink_forest_index::{Catalog, CatalogBatch, CatalogError, ObjectLocation, RepoId};
 
@@ -21,6 +22,10 @@ use reflink_forest_index::{Catalog, CatalogBatch, CatalogError, ObjectLocation, 
 /// attacker-controlled length. Production configuration will make this a
 /// store limit and route larger objects through a streaming/spool path.
 pub const MAX_RECOVERY_RECORD_BYTES: usize = 64 * 1024 * 1024;
+
+/// Maximum payload bytes read or written by [`stream_record_at`] in one I/O
+/// operation.  This bounds cold hydration memory independently of blob size.
+pub const STREAM_COPY_BUFFER_BYTES: usize = 64 * 1024;
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -357,6 +362,110 @@ pub fn read_record_at(
     Ok(record)
 }
 
+/// Streams exactly one catalog-addressed record payload into `writer` using a
+/// fixed-size buffer and returns its fully validated fixed metadata.
+///
+/// Before the first payload byte is exposed, this verifies the chunk header,
+/// record header, catalog-addressed byte range, and all metadata duplicated in
+/// [`ObjectLocation`].  It then validates the payload CRC, record footer, and
+/// alignment padding after streaming.  A caller must still compare the
+/// returned `content_id` with the catalog key it requested.
+pub fn stream_record_at<W: Write>(
+    path: impl AsRef<Path>,
+    location: ObjectLocation,
+    writer: &mut W,
+) -> Result<RecordMetadata, StoreError> {
+    let mut file = OpenOptions::new().read(true).open(path)?;
+    let file_length = file.metadata()?.len();
+    if location.offset < CHUNK_HEADER_LEN as u64 {
+        return Err(StoreError::LocationMismatch("offset"));
+    }
+    let record_end = location
+        .offset
+        .checked_add(location.record_length)
+        .ok_or(StoreError::OffsetOverflow)?;
+    if record_end > file_length {
+        return Err(StoreError::LocationMismatch("record_length"));
+    }
+
+    let mut chunk_header = [0_u8; CHUNK_HEADER_LEN];
+    file.read_exact(&mut chunk_header)?;
+    let chunk_header = ChunkHeader::decode(&chunk_header)?;
+    if chunk_header.generation != location.generation {
+        return Err(StoreError::LocationMismatch("generation"));
+    }
+    if chunk_header.chunk_id != location.chunk_id {
+        return Err(StoreError::LocationMismatch("chunk_id"));
+    }
+
+    file.seek(SeekFrom::Start(location.offset))?;
+    let mut record_header = [0_u8; RECORD_HEADER_LEN];
+    file.read_exact(&mut record_header)?;
+    let metadata = decode_record_metadata(&record_header)?;
+    validate_stream_location(metadata, location)?;
+    let expected_record_length = encoded_record_len_from_metadata(metadata)?;
+    if expected_record_length != location.record_length {
+        return Err(StoreError::LocationMismatch("record_length"));
+    }
+
+    let mut remaining = metadata.stored_length;
+    let mut buffer = [0_u8; STREAM_COPY_BUFFER_BYTES];
+    let mut payload_crc = Crc32c::new();
+    while remaining != 0 {
+        let chunk_length = usize::try_from(remaining.min(STREAM_COPY_BUFFER_BYTES as u64))
+            .expect("a bounded stream buffer length fits usize");
+        file.read_exact(&mut buffer[..chunk_length])?;
+        writer.write_all(&buffer[..chunk_length])?;
+        payload_crc.update(&buffer[..chunk_length]);
+        remaining -= chunk_length as u64;
+    }
+
+    let mut footer = [0_u8; RECORD_FOOTER_LEN];
+    file.read_exact(&mut footer)?;
+    let unpadded_length = (RECORD_HEADER_LEN as u64)
+        .checked_add(metadata.stored_length)
+        .and_then(|length| length.checked_add(RECORD_FOOTER_LEN as u64))
+        .ok_or(StoreError::OffsetOverflow)?;
+    validate_record_footer(&footer, payload_crc.finalize(), unpadded_length)?;
+    if payload_crc.finalize() != location.payload_crc32c {
+        return Err(StoreError::LocationMismatch("payload_crc32c"));
+    }
+
+    let padding_length = expected_record_length
+        .checked_sub(unpadded_length)
+        .ok_or(StoreError::OffsetOverflow)?;
+    let padding_length = usize::try_from(padding_length).map_err(|_| StoreError::OffsetOverflow)?;
+    debug_assert!(padding_length < RECORD_HEADER_LEN);
+    let mut padding = [0_u8; 8];
+    file.read_exact(&mut padding[..padding_length])?;
+    if padding[..padding_length].iter().any(|&byte| byte != 0) {
+        return Err(StoreError::Format(FormatError::NonZeroPadding));
+    }
+    Ok(metadata)
+}
+
+fn validate_stream_location(
+    metadata: RecordMetadata,
+    location: ObjectLocation,
+) -> Result<(), StoreError> {
+    if metadata.stored_length != location.stored_length {
+        return Err(StoreError::LocationMismatch("stored_length"));
+    }
+    if metadata.raw_length != location.raw_length {
+        return Err(StoreError::LocationMismatch("raw_length"));
+    }
+    if metadata.kind != location.kind {
+        return Err(StoreError::LocationMismatch("kind"));
+    }
+    if metadata.codec != location.codec {
+        return Err(StoreError::LocationMismatch("codec"));
+    }
+    if metadata.flags != location.flags {
+        return Err(StoreError::LocationMismatch("flags"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -392,6 +501,26 @@ mod tests {
             chunk_id: 1,
             created_unix_secs: 0,
             flags: 0,
+        }
+    }
+
+    #[derive(Default)]
+    struct ChunkObservingWriter {
+        writes: usize,
+        max_write: usize,
+        total: usize,
+    }
+
+    impl Write for ChunkObservingWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.writes += 1;
+            self.max_write = self.max_write.max(bytes.len());
+            self.total += bytes.len();
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
         }
     }
 
@@ -447,6 +576,39 @@ mod tests {
         assert_eq!(verify_chunk(&path).unwrap(), 1);
 
         drop(writer);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn stream_record_at_uses_a_bounded_copy_buffer_for_large_payloads() {
+        let (directory, path) = temporary_chunk();
+        let payload = vec![0x5a; STREAM_COPY_BUFFER_BYTES * 3 + 17];
+        let object = record(&payload);
+        let chunk_header = header();
+        let mut chunk = ChunkWriter::create(&path, chunk_header).unwrap();
+        let record_location = chunk.append(&object).unwrap();
+        chunk.sync_data().unwrap();
+        drop(chunk);
+        let location = ObjectLocation {
+            generation: chunk_header.generation,
+            chunk_id: chunk_header.chunk_id,
+            offset: record_location.offset,
+            record_length: record_location.record_length,
+            stored_length: payload.len() as u64,
+            raw_length: payload.len() as u64,
+            kind: ObjectKind::Blob,
+            codec: Codec::Raw,
+            flags: 0,
+            payload_crc32c: crc32c(&payload),
+        };
+        let mut observed = ChunkObservingWriter::default();
+
+        let metadata = stream_record_at(&path, location, &mut observed).unwrap();
+
+        assert_eq!(metadata.content_id, object.content_id);
+        assert_eq!(observed.total, payload.len());
+        assert_eq!(observed.max_write, STREAM_COPY_BUFFER_BYTES);
+        assert_eq!(observed.writes, 4);
         fs::remove_dir_all(directory).unwrap();
     }
 }

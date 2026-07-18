@@ -1302,7 +1302,7 @@ mod tests {
         use reflink_forest_backup::{
             checkpoint_cold_tier, restore_cold_tier, BackupError, CheckpointGuard,
             ChunkClassification, ColdChunkDescriptor, ColdTierAuthoritativePaths,
-            ColdTierCheckpointDescriptor,
+            ColdTierCheckpointDescriptor, ColdTierChunkPath, ColdTierChunkPaths,
         };
         use reflink_forest_cache::CacheError;
         use reflink_forest_checkout::MaterializeError;
@@ -1375,6 +1375,13 @@ mod tests {
         )
         .unwrap();
         let authoritative_digests = authoritative_paths.digests(&original).unwrap();
+        let chunk_paths = ColdTierChunkPaths::new(vec![ColdTierChunkPath {
+            generation: 1,
+            chunk_id: 1,
+            classification: ChunkClassification::Open,
+            relative: PathBuf::from("1.open"),
+        }])
+        .unwrap();
 
         let backup_parent = temp_root();
         fs::create_dir(&backup_parent).unwrap();
@@ -1403,6 +1410,7 @@ mod tests {
                 pins_manifest_digest: authoritative_digests.pins_manifest_digest,
             },
             &authoritative_paths,
+            &chunk_paths,
         )
         .unwrap();
         fs::remove_dir_all(&original).unwrap();
@@ -1418,7 +1426,14 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        restore_cold_tier(&backup, &manifest, &restored, &authoritative_paths).unwrap();
+        restore_cold_tier(
+            &backup,
+            &manifest,
+            &restored,
+            &authoritative_paths,
+            &chunk_paths,
+        )
+        .unwrap();
         let cache = Cache::open(restored.join("cache")).unwrap();
         let catalog = RocksDbCatalog::open(restored.join(authoritative_paths.catalog())).unwrap();
         assert!(catalog.oid_alias(repository, &commit_oid).is_some());

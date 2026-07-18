@@ -7,4 +7,5 @@ license = "MIT OR Apache-2.0"
 description = "Verified checkpoint, backup, and restore primitives for Reflink Forest"
 
 [dependencies]
+reflink-forest-format = { path = "../reflink-forest-format" }
 sha2 = "0.10"

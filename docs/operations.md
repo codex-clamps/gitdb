@@ -87,6 +87,15 @@ names chunk generations, sealed chunk sizes, the open valid prefix, checkpoint
 identity, schema version, and manifest digests. Writers may resume before
 immutable chunks are copied.
 
+The checkpoint descriptor stores chunk identities (generation, chunk ID,
+open/sealed class, and exact durable size), not deployment-specific filenames.
+Backup and restore therefore require the daemon to supply the same explicit,
+normalized relative identity-to-filename map. Each mapped file must be present
+in the generic backup inventory, have the expected suffix and chunk header,
+have exactly the recorded size, and pass a full record-boundary scan before a
+cold checkpoint is published or restored. Filenames are never inferred from a
+chunk ID by the backup layer.
+
 Restore copies the recorded chunks and catalog/checkpoint, validates their
 schema, performs full structural verification, and either restores the catalog
 or rebuilds it from chunks. It initializes a fresh verified Btrfs image and

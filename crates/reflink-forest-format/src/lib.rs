@@ -58,6 +58,21 @@ pub struct ObjectRecord {
     pub payload: Vec<u8>,
 }
 
+/// Fixed metadata parsed from an object record header without reading its
+/// payload.  Cold-store readers use this to validate catalog-addressed
+/// records before streaming their payloads instead of allocating an
+/// attacker-controlled stored length.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RecordMetadata {
+    pub kind: ObjectKind,
+    pub codec: Codec,
+    pub flags: u16,
+    pub raw_length: u64,
+    pub stored_length: u64,
+    pub content_id: ContentId,
+    pub primary_oid: GitOid,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FormatError {
     Truncated,
@@ -159,25 +174,9 @@ pub fn encode_record(record: &ObjectRecord) -> Result<Vec<u8>, FormatError> {
 
 /// Decodes one aligned record and returns it with the number of consumed bytes.
 pub fn decode_record(bytes: &[u8]) -> Result<(ObjectRecord, usize), FormatError> {
-    if bytes.len() < RECORD_HEADER_LEN {
-        return Err(FormatError::Truncated);
-    }
-    let header = &bytes[..RECORD_HEADER_LEN];
-    if &header[..4] != RECORD_MAGIC {
-        return Err(FormatError::BadMagic);
-    }
-    check_version(read_u16(header, 4))?;
-    check_header_len(read_u16(header, 6) as usize, RECORD_HEADER_LEN)?;
-    if read_u32(header, RECORD_CRC_OFFSET) != crc32c_with_zeroed_field(header, RECORD_CRC_OFFSET, 4)
-    {
-        return Err(FormatError::HeaderCrcMismatch);
-    }
-    if header[98..].iter().any(|&byte| byte != 0) {
-        return Err(FormatError::NonZeroReserved);
-    }
-    let kind = ObjectKind::from_tag(header[8]).ok_or(FormatError::InvalidObjectKind(header[8]))?;
-    let codec = Codec::from_tag(header[9]).ok_or(FormatError::InvalidCodec(header[9]))?;
-    let stored = usize::try_from(read_u64(header, 20)).map_err(|_| FormatError::LengthOverflow)?;
+    let metadata = decode_record_metadata(bytes)?;
+    let stored =
+        usize::try_from(metadata.stored_length).map_err(|_| FormatError::LengthOverflow)?;
     let total = RECORD_HEADER_LEN
         .checked_add(stored)
         .and_then(|n| n.checked_add(RECORD_FOOTER_LEN))
@@ -207,25 +206,24 @@ pub fn decode_record(bytes: &[u8]) -> Result<(ObjectRecord, usize), FormatError>
     if bytes[total..consumed].iter().any(|&byte| byte != 0) {
         return Err(FormatError::NonZeroPadding);
     }
-    let oid = decode_oid_fixed(&header[60..94])?;
     Ok((
         ObjectRecord {
-            kind,
-            codec,
-            flags: read_u16(header, 10),
-            raw_length: read_u64(header, 12),
-            content_id: ContentId(header[28..60].try_into().expect("fixed length")),
-            primary_oid: oid,
+            kind: metadata.kind,
+            codec: metadata.codec,
+            flags: metadata.flags,
+            raw_length: metadata.raw_length,
+            content_id: metadata.content_id,
+            primary_oid: metadata.primary_oid,
             payload: payload.to_vec(),
         },
         consumed,
     ))
 }
 
-/// Determines the complete aligned record size from its fixed header without
-/// allocating or inspecting its payload. Storage scanners use this before
-/// reading an untrusted record length.
-pub fn encoded_record_len_from_header(bytes: &[u8]) -> Result<usize, FormatError> {
+/// Decodes and validates a fixed record header without reading or allocating
+/// its payload.  The returned `stored_length` is still untrusted until a
+/// caller validates the complete record footer, padding, and payload CRC.
+pub fn decode_record_metadata(bytes: &[u8]) -> Result<RecordMetadata, FormatError> {
     if bytes.len() < RECORD_HEADER_LEN {
         return Err(FormatError::Truncated);
     }
@@ -239,12 +237,67 @@ pub fn encoded_record_len_from_header(bytes: &[u8]) -> Result<usize, FormatError
     {
         return Err(FormatError::HeaderCrcMismatch);
     }
-    let stored = usize::try_from(read_u64(header, 20)).map_err(|_| FormatError::LengthOverflow)?;
+    if header[98..].iter().any(|&byte| byte != 0) {
+        return Err(FormatError::NonZeroReserved);
+    }
+    Ok(RecordMetadata {
+        kind: ObjectKind::from_tag(header[8]).ok_or(FormatError::InvalidObjectKind(header[8]))?,
+        codec: Codec::from_tag(header[9]).ok_or(FormatError::InvalidCodec(header[9]))?,
+        flags: read_u16(header, 10),
+        raw_length: read_u64(header, 12),
+        stored_length: read_u64(header, 20),
+        content_id: ContentId(header[28..60].try_into().expect("fixed length")),
+        primary_oid: decode_oid_fixed(&header[60..94])?,
+    })
+}
+
+/// Determines the complete aligned record size from its fixed header without
+/// allocating or inspecting its payload. Storage scanners use this before
+/// reading an untrusted record length.
+pub fn encoded_record_len_from_header(bytes: &[u8]) -> Result<usize, FormatError> {
+    let metadata = decode_record_metadata(bytes)?;
+    let stored =
+        usize::try_from(metadata.stored_length).map_err(|_| FormatError::LengthOverflow)?;
     let total = RECORD_HEADER_LEN
         .checked_add(stored)
         .and_then(|length| length.checked_add(RECORD_FOOTER_LEN))
         .ok_or(FormatError::LengthOverflow)?;
     align(total)
+}
+
+/// Determines the complete aligned record size from validated metadata without
+/// narrowing its stored length to `usize`.  Streaming readers use this so a
+/// large but valid record is processed in fixed-size buffers.
+pub fn encoded_record_len_from_metadata(metadata: RecordMetadata) -> Result<u64, FormatError> {
+    let total = (RECORD_HEADER_LEN as u64)
+        .checked_add(metadata.stored_length)
+        .and_then(|length| length.checked_add(RECORD_FOOTER_LEN as u64))
+        .ok_or(FormatError::LengthOverflow)?;
+    align_u64(total)
+}
+
+/// Validates the fixed footer that terminates a streamed record payload.
+/// `payload_crc32c` must be computed over precisely the stored payload bytes,
+/// and `unpadded_record_length` includes the fixed header and footer.
+pub fn validate_record_footer(
+    bytes: &[u8],
+    payload_crc32c: u32,
+    unpadded_record_length: u64,
+) -> Result<(), FormatError> {
+    if bytes.len() < RECORD_FOOTER_LEN {
+        return Err(FormatError::Truncated);
+    }
+    let footer = &bytes[..RECORD_FOOTER_LEN];
+    if read_u32(footer, 0) != payload_crc32c {
+        return Err(FormatError::PayloadCrcMismatch);
+    }
+    if read_u64(footer, 4) != unpadded_record_length {
+        return Err(FormatError::InvalidRecordLength);
+    }
+    if &footer[12..20] != RECORD_END_MAGIC {
+        return Err(FormatError::FooterMagicMismatch);
+    }
+    Ok(())
 }
 
 fn encode_oid_fixed(oid: &GitOid, output: &mut [u8]) {
@@ -285,6 +338,12 @@ fn align(value: usize) -> Result<usize, FormatError> {
         .map(|n| n & !(RECORD_ALIGNMENT - 1))
         .ok_or(FormatError::LengthOverflow)
 }
+fn align_u64(value: u64) -> Result<u64, FormatError> {
+    value
+        .checked_add((RECORD_ALIGNMENT - 1) as u64)
+        .map(|n| n & !((RECORD_ALIGNMENT - 1) as u64))
+        .ok_or(FormatError::LengthOverflow)
+}
 fn put_u16(bytes: &mut [u8], offset: usize, value: u16) {
     bytes[offset..offset + 2].copy_from_slice(&value.to_be_bytes());
 }
@@ -318,14 +377,38 @@ fn read_u64(bytes: &[u8], offset: usize) -> u64 {
 
 /// Castagnoli CRC-32C, using the reflected polynomial mandated by iSCSI/SSE4.2.
 pub fn crc32c(bytes: &[u8]) -> u32 {
-    let mut crc = !0_u32;
-    for &byte in bytes {
-        crc ^= u32::from(byte);
-        for _ in 0..8 {
-            crc = (crc >> 1) ^ (0x82f6_3b78 & 0_u32.wrapping_sub(crc & 1));
+    let mut crc = Crc32c::new();
+    crc.update(bytes);
+    crc.finalize()
+}
+
+/// Incremental Castagnoli CRC-32C calculator for bounded streaming I/O.
+#[derive(Clone, Copy, Debug)]
+pub struct Crc32c(u32);
+
+impl Default for Crc32c {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Crc32c {
+    pub const fn new() -> Self {
+        Self(!0_u32)
+    }
+
+    pub fn update(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 ^= u32::from(byte);
+            for _ in 0..8 {
+                self.0 = (self.0 >> 1) ^ (0x82f6_3b78 & 0_u32.wrapping_sub(self.0 & 1));
+            }
         }
     }
-    !crc
+
+    pub const fn finalize(self) -> u32 {
+        !self.0
+    }
 }
 fn crc32c_with_zeroed_field(bytes: &[u8], offset: usize, len: usize) -> u32 {
     let mut copy = bytes.to_vec();

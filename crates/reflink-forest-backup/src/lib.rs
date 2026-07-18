@@ -4,8 +4,12 @@
 //! result is a self-describing snapshot tree that is published only after all
 //! files and its manifest have been synchronized.
 
+use reflink_forest_format::{
+    decode_record, encoded_record_len_from_header, ChunkHeader, CHUNK_HEADER_LEN, RECORD_HEADER_LEN,
+};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     num::TryFromIntError,
@@ -44,6 +48,9 @@ const MAX_COLD_DESCRIPTOR_BYTES: usize = COLD_DESCRIPTOR_HEADER_LEN
     + MAX_COLD_DESCRIPTOR_CHUNKS * COLD_DESCRIPTOR_CHUNK_LEN
     + COLD_DESCRIPTOR_DIGESTS_LEN
     + COLD_DESCRIPTOR_CHECKSUM_LEN;
+/// A checkpoint never allocates an unbounded record supplied by an untrusted
+/// cold-tier backup.  This matches the store recovery ceiling.
+const MAX_COLD_CHUNK_RECORD_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BackupFile {
@@ -76,6 +83,66 @@ pub struct ColdTierCheckpointDescriptor {
     pub catalog_digest: [u8; 32],
     pub config_digest: [u8; 32],
     pub pins_manifest_digest: [u8; 32],
+}
+
+/// One explicit cold chunk filename associated with a descriptor identity.
+///
+/// A checkpoint descriptor deliberately records stable chunk identities and
+/// sizes rather than local filenames.  The owning daemon supplies this map so
+/// the backup layer never guesses a storage layout from an ID.  Every path is
+/// relative to the cold-tier root and the checkpoint/restore boundary verifies
+/// both the declared classification and the chunk header before using it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ColdTierChunkPath {
+    pub generation: u32,
+    pub chunk_id: u64,
+    pub classification: ChunkClassification,
+    pub relative: PathBuf,
+}
+
+/// Explicit, validated filenames for every chunk in a cold-tier checkpoint.
+///
+/// This map is intentionally separate from [`ColdTierCheckpointDescriptor`]:
+/// identity and durable-prefix metadata can be transported independently of a
+/// deployment's private directory naming convention, while an operator must
+/// still make the mapping explicit at backup and restore time.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ColdTierChunkPaths {
+    entries: Vec<ColdTierChunkPath>,
+}
+
+impl ColdTierChunkPaths {
+    /// Builds an explicit chunk identity-to-filename map.
+    ///
+    /// Entries must be sorted by `(generation, chunk_id)`, have unique safe
+    /// normalized paths, and have unique identities. The suffix must agree with the declared
+    /// classification (`.open` or `.sealed`); this is checked again when the
+    /// map is bound to a descriptor.
+    pub fn new(entries: Vec<ColdTierChunkPath>) -> Result<Self, BackupError> {
+        if entries.len() > MAX_COLD_DESCRIPTOR_CHUNKS
+            || entries.windows(2).any(|pair| {
+                (pair[0].generation, pair[0].chunk_id) >= (pair[1].generation, pair[1].chunk_id)
+            })
+        {
+            return Err(BackupError::InvalidColdTierLayout);
+        }
+        let mut seen_paths = BTreeSet::new();
+        for entry in &entries {
+            path_to_bytes(&entry.relative).map_err(|_| BackupError::InvalidColdTierLayout)?;
+            if !chunk_path_has_classification(&entry.relative, entry.classification) {
+                return Err(BackupError::InvalidColdTierLayout);
+            }
+            if !seen_paths.insert(entry.relative.clone()) {
+                return Err(BackupError::InvalidColdTierLayout);
+            }
+        }
+        Ok(Self { entries })
+    }
+
+    /// The entries in their canonical identity order.
+    pub fn entries(&self) -> &[ColdTierChunkPath] {
+        &self.entries
+    }
 }
 
 /// The three authoritative metadata entries whose content digests are carried
@@ -220,23 +287,30 @@ impl std::fmt::Display for BackupError {
 ///
 /// The descriptor's catalog, configuration, and pin-manifest digests are
 /// compared with the caller-supplied authoritative files before copying and
-/// again in the checkpoint tree before publishing the descriptor.  The generic
-/// file inventory remains backward compatible; consumers requiring cold-tier
-/// recovery must also supply this same explicit layout to [`restore_cold_tier`].
+/// again in the checkpoint tree before publishing the descriptor. The explicit
+/// `chunk_paths` map binds every descriptor chunk to a safe source filename;
+/// its size, class, header identity, and complete structural prefix are
+/// validated before publication. The generic file inventory remains backward
+/// compatible; consumers requiring cold-tier recovery must also supply these
+/// same explicit layouts to [`restore_cold_tier`].
 pub fn checkpoint_cold_tier<G: CheckpointGuard>(
     guard: &G,
     source: impl AsRef<Path>,
     destination: impl AsRef<Path>,
     descriptor: &ColdTierCheckpointDescriptor,
     authoritative_paths: &ColdTierAuthoritativePaths,
+    chunk_paths: &ColdTierChunkPaths,
 ) -> Result<BackupManifest, BackupError> {
     guard.quiesce_and_sync()?;
     validate_cold_descriptor(descriptor)?;
     let source = source.as_ref();
+    validate_cold_tier_layout(descriptor, authoritative_paths, chunk_paths)?;
     verify_cold_descriptor_authority(source, descriptor, authoritative_paths)?;
+    verify_cold_descriptor_chunks(source, descriptor, chunk_paths, None)?;
     let manifest = checkpoint(source, &destination)?;
     let root = destination.as_ref();
     verify_cold_descriptor_authority(root, descriptor, authoritative_paths)?;
+    verify_cold_descriptor_chunks(root, descriptor, chunk_paths, Some(&manifest))?;
     let path = root.join(COLD_DESCRIPTOR_FILE_NAME);
     let bytes = encode_cold_descriptor(descriptor)?;
     let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
@@ -255,21 +329,29 @@ pub fn load_cold_tier_descriptor(
     decode_cold_descriptor(&bytes)
 }
 /// Requires generic inventory verification, a valid cold-tier descriptor, and
-/// descriptor-digest matches for the supplied authoritative files before
-/// accepting a restore.  The restored files are checked again after the generic
-/// restore publishes its destination.
+/// descriptor-digest and chunk-inventory matches for the supplied explicit
+/// layouts before accepting a restore. The restored files are checked again
+/// after the generic restore publishes its destination.
 pub fn restore_cold_tier(
     backup_root: impl AsRef<Path>,
     manifest: &BackupManifest,
     destination: impl AsRef<Path>,
     authoritative_paths: &ColdTierAuthoritativePaths,
+    chunk_paths: &ColdTierChunkPaths,
 ) -> Result<(), BackupError> {
     let backup_root = backup_root.as_ref();
     let descriptor = load_cold_tier_descriptor(backup_root)?;
+    validate_cold_tier_layout(&descriptor, authoritative_paths, chunk_paths)?;
+    // Do this before allocating or publishing a restore destination. A
+    // descriptor path which exists outside the generic inventory must never be
+    // accepted merely because it happens to look structurally valid.
+    verify_tree(backup_root, manifest)?;
     verify_cold_descriptor_authority(backup_root, &descriptor, authoritative_paths)?;
+    verify_cold_descriptor_chunks(backup_root, &descriptor, chunk_paths, Some(manifest))?;
     let destination = destination.as_ref();
     restore(backup_root, manifest, destination)?;
-    verify_cold_descriptor_authority(destination, &descriptor, authoritative_paths)
+    verify_cold_descriptor_authority(destination, &descriptor, authoritative_paths)?;
+    verify_cold_descriptor_chunks(destination, &descriptor, chunk_paths, Some(manifest))
 }
 impl std::error::Error for BackupError {}
 impl From<io::Error> for BackupError {
@@ -844,12 +926,193 @@ fn validate_cold_descriptor(descriptor: &ColdTierCheckpointDescriptor) -> Result
     if descriptor
         .chunks
         .iter()
-        .any(|chunk| chunk.valid_prefix == 0)
+        .any(|chunk| chunk.valid_prefix < CHUNK_HEADER_LEN as u64)
     {
         return Err(BackupError::InvalidManifest);
     }
     Ok(())
 }
+
+fn chunk_path_has_classification(path: &Path, classification: ChunkClassification) -> bool {
+    let expected = match classification {
+        ChunkClassification::Open => "open",
+        ChunkClassification::Sealed => "sealed",
+    };
+    path.extension()
+        .is_some_and(|extension| extension == std::ffi::OsStr::new(expected))
+}
+
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    left == right || left.starts_with(right) || right.starts_with(left)
+}
+
+/// Binds a transportable chunk descriptor to the caller's explicit layout.
+///
+/// The descriptor itself has no filename field by design.  This validates that
+/// the supplied filenames form an exact one-to-one mapping instead of letting
+/// backup code silently invent a convention from generation and chunk IDs.
+fn validate_cold_tier_layout(
+    descriptor: &ColdTierCheckpointDescriptor,
+    authoritative_paths: &ColdTierAuthoritativePaths,
+    chunk_paths: &ColdTierChunkPaths,
+) -> Result<(), BackupError> {
+    authoritative_paths.validate()?;
+    if descriptor.chunks.len() != chunk_paths.entries.len() {
+        return Err(BackupError::InvalidColdTierLayout);
+    }
+    for (chunk, entry) in descriptor.chunks.iter().zip(&chunk_paths.entries) {
+        if chunk.generation != entry.generation
+            || chunk.chunk_id != entry.chunk_id
+            || chunk.classification != entry.classification
+            || !chunk_path_has_classification(&entry.relative, chunk.classification)
+        {
+            return Err(BackupError::InvalidColdTierLayout);
+        }
+        if paths_overlap(&entry.relative, authoritative_paths.catalog())
+            || paths_overlap(&entry.relative, authoritative_paths.config())
+            || paths_overlap(&entry.relative, authoritative_paths.pins_manifest())
+            || entry.relative == Path::new(MANIFEST_FILE_NAME)
+            || entry.relative == Path::new(COLD_DESCRIPTOR_FILE_NAME)
+        {
+            return Err(BackupError::InvalidColdTierLayout);
+        }
+    }
+    Ok(())
+}
+
+/// Returns a regular, non-symlink chunk path below `root` after checking every
+/// component. `ColdTierChunkPaths::new` has already rejected absolute and
+/// traversal paths; checking each component here additionally rejects a
+/// symlinked directory that would otherwise escape the cold-tier tree.
+fn checked_cold_chunk_path(root: &Path, relative: &Path) -> Result<PathBuf, BackupError> {
+    let mut current = root.to_path_buf();
+    let components: Vec<_> = relative.components().collect();
+    for (index, component) in components.iter().enumerate() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(BackupError::InvalidColdTierLayout);
+        };
+        current.push(name);
+        let metadata = match fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(BackupError::VerificationFailed(relative.to_path_buf()))
+            }
+            Err(error) => return Err(BackupError::Io(error)),
+        };
+        if index + 1 == components.len() {
+            if !metadata.file_type().is_file() {
+                return Err(BackupError::VerificationFailed(relative.to_path_buf()));
+            }
+        } else if !metadata.file_type().is_dir() {
+            return Err(BackupError::VerificationFailed(relative.to_path_buf()));
+        }
+    }
+    Ok(current)
+}
+
+/// Confirms that every descriptor chunk exists in a verified generic inventory
+/// and that its visible bytes are exactly the declared durable prefix.
+///
+/// A cold checkpoint is not allowed to carry an arbitrary tail of the active
+/// `.open` file: the guard must first freeze the complete prefix represented by
+/// the descriptor.  Sealed chunks follow the same exact-size rule, with their
+/// full immutable size recorded as `valid_prefix`.
+fn verify_cold_descriptor_chunks(
+    root: &Path,
+    descriptor: &ColdTierCheckpointDescriptor,
+    chunk_paths: &ColdTierChunkPaths,
+    manifest: Option<&BackupManifest>,
+) -> Result<(), BackupError> {
+    let entries: BTreeMap<_, _> = chunk_paths
+        .entries
+        .iter()
+        .map(|entry| ((entry.generation, entry.chunk_id), entry))
+        .collect();
+    if entries.len() != descriptor.chunks.len() {
+        return Err(BackupError::InvalidColdTierLayout);
+    }
+
+    for chunk in &descriptor.chunks {
+        let relative = entries
+            .get(&(chunk.generation, chunk.chunk_id))
+            .ok_or(BackupError::InvalidColdTierLayout)?
+            .relative
+            .as_path();
+        if let Some(manifest) = manifest {
+            let entries: Vec<_> = manifest
+                .files
+                .iter()
+                .filter(|file| file.relative == relative)
+                .collect();
+            if entries.len() != 1 || entries[0].bytes != chunk.valid_prefix {
+                return Err(BackupError::VerificationFailed(relative.to_path_buf()));
+            }
+        }
+        verify_cold_chunk_file(root, relative, chunk)?;
+    }
+    Ok(())
+}
+
+fn verify_cold_chunk_file(
+    root: &Path,
+    relative: &Path,
+    expected: &ColdChunkDescriptor,
+) -> Result<(), BackupError> {
+    let path = checked_cold_chunk_path(root, relative)?;
+    let bytes = fs::metadata(&path)?.len();
+    if bytes != expected.valid_prefix {
+        return Err(BackupError::VerificationFailed(relative.to_path_buf()));
+    }
+
+    let mut file = File::open(&path)?;
+    let mut header = [0_u8; CHUNK_HEADER_LEN];
+    file.read_exact(&mut header)
+        .map_err(|_| BackupError::VerificationFailed(relative.to_path_buf()))?;
+    let header = ChunkHeader::decode(&header)
+        .map_err(|_| BackupError::VerificationFailed(relative.to_path_buf()))?;
+    if header.generation != expected.generation || header.chunk_id != expected.chunk_id {
+        return Err(BackupError::VerificationFailed(relative.to_path_buf()));
+    }
+
+    let mut offset = CHUNK_HEADER_LEN as u64;
+    while offset < bytes {
+        let remaining = bytes
+            .checked_sub(offset)
+            .ok_or_else(|| BackupError::VerificationFailed(relative.to_path_buf()))?;
+        if remaining < RECORD_HEADER_LEN as u64 {
+            return Err(BackupError::VerificationFailed(relative.to_path_buf()));
+        }
+        let mut record_header = [0_u8; RECORD_HEADER_LEN];
+        file.read_exact(&mut record_header)
+            .map_err(|_| BackupError::VerificationFailed(relative.to_path_buf()))?;
+        let record_len = encoded_record_len_from_header(&record_header)
+            .map_err(|_| BackupError::VerificationFailed(relative.to_path_buf()))?;
+        if record_len > MAX_COLD_CHUNK_RECORD_BYTES
+            || u64::try_from(record_len)
+                .map_err(|_| BackupError::VerificationFailed(relative.to_path_buf()))?
+                > remaining
+        {
+            return Err(BackupError::VerificationFailed(relative.to_path_buf()));
+        }
+        let mut encoded = vec![0_u8; record_len];
+        encoded[..RECORD_HEADER_LEN].copy_from_slice(&record_header);
+        file.read_exact(&mut encoded[RECORD_HEADER_LEN..])
+            .map_err(|_| BackupError::VerificationFailed(relative.to_path_buf()))?;
+        let (_, consumed) = decode_record(&encoded)
+            .map_err(|_| BackupError::VerificationFailed(relative.to_path_buf()))?;
+        if consumed != record_len {
+            return Err(BackupError::VerificationFailed(relative.to_path_buf()));
+        }
+        offset = offset
+            .checked_add(
+                u64::try_from(record_len)
+                    .map_err(|_| BackupError::VerificationFailed(relative.to_path_buf()))?,
+            )
+            .ok_or_else(|| BackupError::VerificationFailed(relative.to_path_buf()))?;
+    }
+    Ok(())
+}
+
 fn encode_cold_descriptor(
     descriptor: &ColdTierCheckpointDescriptor,
 ) -> Result<Vec<u8>, BackupError> {
@@ -1003,6 +1266,33 @@ mod tests {
         .unwrap()
     }
 
+    fn chunk_paths() -> ColdTierChunkPaths {
+        ColdTierChunkPaths::new(vec![ColdTierChunkPath {
+            generation: 7,
+            chunk_id: 1,
+            classification: ChunkClassification::Open,
+            relative: PathBuf::from("chunks/generation-7/0000000000000001.open"),
+        }])
+        .unwrap()
+    }
+
+    fn write_chunk(root: &Path, generation: u32, chunk_id: u64) -> PathBuf {
+        let path = root.join("chunks/generation-7/0000000000000001.open");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            ChunkHeader {
+                generation,
+                chunk_id,
+                created_unix_secs: 0,
+                flags: 0,
+            }
+            .encode(),
+        )
+        .unwrap();
+        path
+    }
+
     fn write_authoritative_files(root: &Path, paths: &ColdTierAuthoritativePaths) {
         fs::create_dir_all(root.join("metadata")).unwrap();
         fs::write(root.join(paths.catalog()), b"catalog bytes").unwrap();
@@ -1013,16 +1303,18 @@ mod tests {
     fn descriptor_for(
         root: &Path,
         paths: &ColdTierAuthoritativePaths,
+        chunk_paths: &ColdTierChunkPaths,
     ) -> ColdTierCheckpointDescriptor {
         let digests = paths.digests(root).unwrap();
+        let chunk = &chunk_paths.entries()[0];
         ColdTierCheckpointDescriptor {
             catalog_schema_version: 1,
             active_generation: 7,
             chunks: vec![ColdChunkDescriptor {
-                generation: 7,
-                chunk_id: 1,
-                classification: ChunkClassification::Open,
-                valid_prefix: 4096,
+                generation: chunk.generation,
+                chunk_id: chunk.chunk_id,
+                classification: chunk.classification,
+                valid_prefix: fs::metadata(root.join(&chunk.relative)).unwrap().len(),
             }],
             catalog_digest: digests.catalog_digest,
             config_digest: digests.config_digest,
@@ -1046,22 +1338,29 @@ mod tests {
     fn guarded_cold_checkpoint_verifies_authoritative_files_and_restores_fresh_root() {
         let source = dir("cold-source");
         let parent = dir("cold-parent");
-        fs::create_dir_all(source.join("chunks")).unwrap();
         fs::create_dir(&parent).unwrap();
-        fs::write(source.join("chunks/a"), b"cold").unwrap();
+        let chunk_paths = chunk_paths();
+        write_chunk(&source, 7, 1);
         let paths = authoritative_paths();
         write_authoritative_files(&source, &paths);
-        let descriptor = descriptor_for(&source, &paths);
+        let descriptor = descriptor_for(&source, &paths, &chunk_paths);
         let checkpoint_root = parent.join("checkpoint");
-        let manifest =
-            checkpoint_cold_tier(&Guard, &source, &checkpoint_root, &descriptor, &paths).unwrap();
+        let manifest = checkpoint_cold_tier(
+            &Guard,
+            &source,
+            &checkpoint_root,
+            &descriptor,
+            &paths,
+            &chunk_paths,
+        )
+        .unwrap();
         assert_eq!(
             load_cold_tier_descriptor(&checkpoint_root).unwrap(),
             descriptor
         );
         fs::remove_dir_all(source).unwrap();
         let restore = parent.join("restore");
-        restore_cold_tier(&checkpoint_root, &manifest, &restore, &paths).unwrap();
+        restore_cold_tier(&checkpoint_root, &manifest, &restore, &paths, &chunk_paths).unwrap();
         assert_eq!(
             fs::read(restore.join(paths.catalog())).unwrap(),
             b"catalog bytes"
@@ -1081,15 +1380,22 @@ mod tests {
     fn cold_checkpoint_rejects_descriptor_that_does_not_match_authoritative_files() {
         let source = dir("cold-mismatch-source");
         let parent = dir("cold-mismatch-parent");
-        fs::create_dir_all(source.join("chunks")).unwrap();
         fs::create_dir(&parent).unwrap();
-        fs::write(source.join("chunks/a"), b"cold").unwrap();
+        let chunk_paths = chunk_paths();
+        write_chunk(&source, 7, 1);
         let paths = authoritative_paths();
         write_authoritative_files(&source, &paths);
         let checkpoint = parent.join("checkpoint");
 
         assert!(matches!(
-            checkpoint_cold_tier(&Guard, &source, &checkpoint, &descriptor(), &paths),
+            checkpoint_cold_tier(
+                &Guard,
+                &source,
+                &checkpoint,
+                &descriptor(),
+                &paths,
+                &chunk_paths,
+            ),
             Err(BackupError::VerificationFailed(path)) if path == paths.catalog()
         ));
         assert!(!checkpoint.exists());
@@ -1101,25 +1407,187 @@ mod tests {
     fn cold_restore_rejects_tampered_authoritative_file_before_publication() {
         let source = dir("cold-tamper-source");
         let parent = dir("cold-tamper-parent");
-        fs::create_dir_all(source.join("chunks")).unwrap();
         fs::create_dir(&parent).unwrap();
-        fs::write(source.join("chunks/a"), b"cold").unwrap();
+        let chunk_paths = chunk_paths();
+        write_chunk(&source, 7, 1);
         let paths = authoritative_paths();
         write_authoritative_files(&source, &paths);
-        let descriptor = descriptor_for(&source, &paths);
+        let descriptor = descriptor_for(&source, &paths, &chunk_paths);
         let checkpoint = parent.join("checkpoint");
-        let manifest =
-            checkpoint_cold_tier(&Guard, &source, &checkpoint, &descriptor, &paths).unwrap();
+        let manifest = checkpoint_cold_tier(
+            &Guard,
+            &source,
+            &checkpoint,
+            &descriptor,
+            &paths,
+            &chunk_paths,
+        )
+        .unwrap();
         fs::write(checkpoint.join(paths.config()), b"tampered config").unwrap();
 
         let restore = parent.join("restore");
         assert!(matches!(
-            restore_cold_tier(&checkpoint, &manifest, &restore, &paths),
+            restore_cold_tier(&checkpoint, &manifest, &restore, &paths, &chunk_paths),
             Err(BackupError::VerificationFailed(path)) if path == paths.config()
         ));
         assert!(!restore.exists());
         fs::remove_dir_all(source).unwrap();
         fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn cold_checkpoint_rejects_missing_declared_chunk_before_publication() {
+        let source = dir("cold-missing-source");
+        let parent = dir("cold-missing-parent");
+        fs::create_dir(&parent).unwrap();
+        let chunk_paths = chunk_paths();
+        write_chunk(&source, 7, 1);
+        let paths = authoritative_paths();
+        write_authoritative_files(&source, &paths);
+        let descriptor = descriptor_for(&source, &paths, &chunk_paths);
+        let relative = &chunk_paths.entries()[0].relative;
+        fs::remove_file(source.join(relative)).unwrap();
+
+        let checkpoint = parent.join("checkpoint");
+        assert!(matches!(
+            checkpoint_cold_tier(
+                &Guard,
+                &source,
+                &checkpoint,
+                &descriptor,
+                &paths,
+                &chunk_paths,
+            ),
+            Err(BackupError::VerificationFailed(path)) if path == *relative
+        ));
+        assert!(!checkpoint.exists());
+        fs::remove_dir_all(source).unwrap();
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn cold_checkpoint_rejects_chunk_header_identity_mismatch() {
+        let source = dir("cold-identity-source");
+        let parent = dir("cold-identity-parent");
+        fs::create_dir(&parent).unwrap();
+        let chunk_paths = chunk_paths();
+        // The explicit filename alone is not an identity: the header must
+        // independently match the descriptor's generation and chunk ID.
+        write_chunk(&source, 8, 1);
+        let paths = authoritative_paths();
+        write_authoritative_files(&source, &paths);
+        let descriptor = descriptor_for(&source, &paths, &chunk_paths);
+        let checkpoint = parent.join("checkpoint");
+        let relative = &chunk_paths.entries()[0].relative;
+
+        assert!(matches!(
+            checkpoint_cold_tier(
+                &Guard,
+                &source,
+                &checkpoint,
+                &descriptor,
+                &paths,
+                &chunk_paths,
+            ),
+            Err(BackupError::VerificationFailed(path)) if path == *relative
+        ));
+        assert!(!checkpoint.exists());
+        fs::remove_dir_all(source).unwrap();
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn cold_restore_rejects_truncated_or_tampered_chunk_inventory() {
+        let source = dir("cold-inventory-source");
+        let parent = dir("cold-inventory-parent");
+        fs::create_dir(&parent).unwrap();
+        let chunk_paths = chunk_paths();
+        write_chunk(&source, 7, 1);
+        let paths = authoritative_paths();
+        write_authoritative_files(&source, &paths);
+        let descriptor = descriptor_for(&source, &paths, &chunk_paths);
+        let checkpoint = parent.join("checkpoint");
+        let mut manifest = checkpoint_cold_tier(
+            &Guard,
+            &source,
+            &checkpoint,
+            &descriptor,
+            &paths,
+            &chunk_paths,
+        )
+        .unwrap();
+        let relative = &chunk_paths.entries()[0].relative;
+        let chunk = checkpoint.join(relative);
+
+        // Model an authenticated generic inventory supplied by a backup
+        // transport after its chunk payload was truncated. The cold descriptor
+        // still commits to the original durable prefix, so restore rejects it
+        // before a destination is created.
+        let file = OpenOptions::new().write(true).open(&chunk).unwrap();
+        file.set_len(CHUNK_HEADER_LEN as u64 - 1).unwrap();
+        let (bytes, sha256) = hash_file(&chunk).unwrap();
+        let inventory = manifest
+            .files
+            .iter_mut()
+            .find(|file| file.relative == *relative)
+            .unwrap();
+        inventory.bytes = bytes;
+        inventory.sha256 = sha256;
+        let restore = parent.join("truncated-restore");
+        assert!(matches!(
+            restore_cold_tier(&checkpoint, &manifest, &restore, &paths, &chunk_paths),
+            Err(BackupError::VerificationFailed(path)) if path == *relative
+        ));
+        assert!(!restore.exists());
+
+        // Recreate a valid checkpoint, then make the generic inventory agree
+        // with a malformed chunk header. This makes the structural chunk scan,
+        // rather than only the generic file hash, prove the rejection.
+        fs::remove_dir_all(&checkpoint).unwrap();
+        write_chunk(&source, 7, 1);
+        let mut manifest = checkpoint_cold_tier(
+            &Guard,
+            &source,
+            &checkpoint,
+            &descriptor,
+            &paths,
+            &chunk_paths,
+        )
+        .unwrap();
+        let chunk = checkpoint.join(relative);
+        let mut bytes = fs::read(&chunk).unwrap();
+        bytes[0] ^= 1;
+        fs::write(&chunk, &bytes).unwrap();
+        let (bytes, sha256) = hash_file(&chunk).unwrap();
+        let inventory = manifest
+            .files
+            .iter_mut()
+            .find(|file| file.relative == *relative)
+            .unwrap();
+        inventory.bytes = bytes;
+        inventory.sha256 = sha256;
+        let restore = parent.join("tampered-restore");
+        assert!(matches!(
+            restore_cold_tier(&checkpoint, &manifest, &restore, &paths, &chunk_paths),
+            Err(BackupError::VerificationFailed(path)) if path == *relative
+        ));
+        assert!(!restore.exists());
+
+        fs::remove_dir_all(source).unwrap();
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn explicit_chunk_paths_require_a_matching_open_or_sealed_suffix() {
+        assert!(matches!(
+            ColdTierChunkPaths::new(vec![ColdTierChunkPath {
+                generation: 7,
+                chunk_id: 1,
+                classification: ChunkClassification::Open,
+                relative: PathBuf::from("chunks/generation-7/0000000000000001.sealed"),
+            }]),
+            Err(BackupError::InvalidColdTierLayout)
+        ));
     }
 
     #[test]

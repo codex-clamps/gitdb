@@ -23,10 +23,10 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use reflink_forest_core::{ContentId, ObjectKind};
+use reflink_forest_core::{ContentHasher, ContentId, ObjectKind};
 use reflink_forest_format::Codec;
 use reflink_forest_index::{Catalog, ObjectLocation};
-use reflink_forest_store::{read_record_at, StoreError};
+use reflink_forest_store::{stream_record_at, StoreError};
 
 const FICLONE: std::ffi::c_ulong = 0x4004_9409;
 
@@ -664,6 +664,75 @@ impl Cache {
         }
         result?;
         self.verified_path(id)
+    }
+
+    /// Streams a pre-validated blob into a temporary cache file, checks its
+    /// incremental content ID, then uses the same durable hard-link
+    /// publication protocol as [`Self::publish_blob`].
+    ///
+    /// The caller receives the temporary file only through `write`; a failed
+    /// cold-record validation leaves no cache entry behind.
+    fn publish_blob_streamed<F>(&self, id: ContentId, write: F) -> Result<PathBuf, HydrationError>
+    where
+        F: FnOnce(&mut File) -> Result<ContentId, HydrationError>,
+    {
+        let lock = self.entry_lock(id);
+        let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.publish_blob_streamed_locked(id, write)
+    }
+
+    fn publish_blob_streamed_locked<F>(
+        &self,
+        id: ContentId,
+        write: F,
+    ) -> Result<PathBuf, HydrationError>
+    where
+        F: FnOnce(&mut File) -> Result<ContentId, HydrationError>,
+    {
+        let destination = self.path_for(id);
+        if destination.exists() {
+            return self.verified_path(id).map_err(Into::into);
+        }
+        let parent = destination.parent().expect("cache filename has parent");
+        fs::create_dir_all(parent).map_err(CacheError::Io)?;
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).map_err(CacheError::Io)?;
+        let temporary = parent.join(format!(".{}.{}", process::id(), nonce()));
+        let result = (|| -> Result<(), HydrationError> {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)
+                .map_err(CacheError::Io)?;
+            let actual = write(&mut file)?;
+            if actual != id {
+                return Err(HydrationError::ContentMismatch {
+                    expected: id,
+                    actual,
+                });
+            }
+            file.sync_all().map_err(CacheError::Io)?;
+            fs::set_permissions(&temporary, fs::Permissions::from_mode(0o444))
+                .map_err(CacheError::Io)?;
+            match fs::hard_link(&temporary, &destination) {
+                Ok(()) => {
+                    fs::remove_file(&temporary).map_err(CacheError::Io)?;
+                    File::open(parent)
+                        .and_then(|directory| directory.sync_all())
+                        .map_err(CacheError::Io)?;
+                    Ok(())
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    fs::remove_file(&temporary).map_err(CacheError::Io)?;
+                    Ok(())
+                }
+                Err(error) => Err(CacheError::Io(error).into()),
+            }
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result?;
+        self.verified_path(id).map_err(Into::into)
     }
 
     /// Revalidates all regular cache leaves and moves invalid leaves to
@@ -1449,43 +1518,26 @@ fn hydrate_raw_blob_from_chunk_inner<C: Catalog>(
         .object_location(id)
         .ok_or(HydrationError::MissingLocation(id))?;
     validate_raw_blob_location(location)?;
-    let record = read_record_at(chunk_path, location)?;
-    if record.kind != ObjectKind::Blob {
-        return Err(HydrationError::NotBlob(record.kind));
-    }
-    if record.codec != Codec::Raw {
-        return Err(HydrationError::UnsupportedCodec(record.codec));
-    }
-    let actual_length =
-        u64::try_from(record.payload.len()).map_err(|_| HydrationError::RawLengthMismatch {
-            expected: record.raw_length,
-            actual: u64::MAX,
-        })?;
-    if record.raw_length != actual_length {
-        return Err(HydrationError::RawLengthMismatch {
-            expected: record.raw_length,
-            actual: actual_length,
-        });
-    }
-    let actual = ContentId::for_object(ObjectKind::Blob, &record.payload);
-    if actual != id || record.content_id != id {
-        return Err(HydrationError::ContentMismatch {
-            expected: id,
-            actual,
-        });
-    }
-
-    // An existing corrupt cache file can only be derived state.  Remove it
-    // after the authoritative cold record is fully validated, then retry the
-    // atomic publication once.  If another hydrator won with valid content,
-    // `publish_blob` returns that verified entry instead.
-    match cache.publish_blob(id, &record.payload) {
+    // An existing corrupt cache file can only be derived state.  Stream the
+    // authoritative raw bytes into a temporary file while incrementally
+    // hashing them; no full blob payload is materialized in memory before the
+    // usual atomic publication protocol runs.
+    // A racing publisher can install a corrupt derived entry after the first
+    // verification.  Discard it and retry once; if another hydrator won with
+    // valid content, the second publication returns that verified entry.
+    match cache.publish_blob_streamed(id, |file| {
+        stream_raw_blob_into_cache(file, chunk_path, location, id)
+    }) {
         Ok(path) => Ok(path),
-        Err(CacheError::ContentMismatch { .. } | CacheError::UnsafeEntry(_)) => {
+        Err(HydrationError::Cache(
+            CacheError::ContentMismatch { .. } | CacheError::UnsafeEntry(_),
+        )) => {
             cache.discard_invalid_blob(id)?;
-            cache.publish_blob(id, &record.payload).map_err(Into::into)
+            cache.publish_blob_streamed(id, |file| {
+                stream_raw_blob_into_cache(file, chunk_path, location, id)
+            })
         }
-        Err(error) => Err(error.into()),
+        Err(error) => Err(error),
     }
 }
 
@@ -1497,6 +1549,76 @@ fn validate_raw_blob_location(location: ObjectLocation) -> Result<(), HydrationE
         return Err(HydrationError::UnsupportedCodec(location.codec));
     }
     Ok(())
+}
+
+fn stream_raw_blob_into_cache(
+    file: &mut File,
+    chunk_path: &Path,
+    location: ObjectLocation,
+    expected_id: ContentId,
+) -> Result<ContentId, HydrationError> {
+    let mut writer = ContentHashingWriter::new(file, location.raw_length);
+    let metadata = stream_record_at(chunk_path, location, &mut writer)?;
+    let (actual, actual_length) = writer.finish();
+    if metadata.kind != ObjectKind::Blob {
+        return Err(HydrationError::NotBlob(metadata.kind));
+    }
+    if metadata.codec != Codec::Raw {
+        return Err(HydrationError::UnsupportedCodec(metadata.codec));
+    }
+    if metadata.raw_length != actual_length {
+        return Err(HydrationError::RawLengthMismatch {
+            expected: metadata.raw_length,
+            actual: actual_length,
+        });
+    }
+    if actual != expected_id || metadata.content_id != expected_id {
+        return Err(HydrationError::ContentMismatch {
+            expected: expected_id,
+            actual,
+        });
+    }
+    Ok(actual)
+}
+
+/// A cache temporary-file writer that updates the raw blob's canonical
+/// content ID as the cold-store reader supplies bounded chunks.
+struct ContentHashingWriter<'a> {
+    file: &'a mut File,
+    hasher: ContentHasher,
+    written: u64,
+}
+
+impl<'a> ContentHashingWriter<'a> {
+    fn new(file: &'a mut File, raw_length: u64) -> Self {
+        Self {
+            file,
+            hasher: ContentHasher::new(ObjectKind::Blob, raw_length),
+            written: 0,
+        }
+    }
+
+    fn finish(self) -> (ContentId, u64) {
+        (self.hasher.finalize(), self.written)
+    }
+}
+
+impl Write for ContentHashingWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let written = self.file.write(bytes)?;
+        self.hasher.update(&bytes[..written]);
+        self.written = self.written.checked_add(written as u64).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cold blob byte count overflowed u64",
+            )
+        })?;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
 }
 
 fn nonce() -> u128 {
@@ -1523,7 +1645,7 @@ mod tests {
     use reflink_forest_index::{
         Catalog, CatalogBatch, CatalogError, ChunkMetadata, InMemoryCatalog, RepoId, WorkspaceId,
     };
-    use reflink_forest_store::{ChunkWriter, RecordLocation};
+    use reflink_forest_store::{ChunkWriter, RecordLocation, STREAM_COPY_BUFFER_BYTES};
     use std::{
         collections::VecDeque,
         io::{Seek, SeekFrom},
@@ -1973,6 +2095,24 @@ mod tests {
 
         assert_eq!(fs::read(&path).unwrap(), b"authoritative cold bytes");
         assert_eq!(fixture.cache.verified_path(fixture.id).unwrap(), path);
+        fs::remove_dir_all(fixture.directory).unwrap();
+    }
+
+    #[test]
+    fn hydration_streams_a_large_raw_blob_through_the_bounded_store_reader() {
+        let payload = vec![0x6d; STREAM_COPY_BUFFER_BYTES * 3 + 29];
+        let fixture = cold_blob_fixture(&payload);
+
+        let path = hydrate_raw_blob_from_chunk(
+            &fixture.cache,
+            &fixture.catalog,
+            fixture.id,
+            &fixture.chunk,
+        )
+        .unwrap();
+
+        assert_eq!(fs::metadata(&path).unwrap().len(), payload.len() as u64);
+        assert_eq!(fs::read(&path).unwrap(), payload);
         fs::remove_dir_all(fixture.directory).unwrap();
     }
 

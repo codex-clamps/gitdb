@@ -202,16 +202,39 @@ impl ContentId {
     /// intentionally not included so identical objects deduplicate across
     /// SHA-1 and SHA-256 repositories.
     pub fn for_object(kind: ObjectKind, raw_payload: &[u8]) -> Self {
-        let mut digest = Sha256::new();
-        digest.update(CONTENT_ID_DOMAIN);
-        digest.update([kind.tag()]);
-        digest.update((raw_payload.len() as u64).to_be_bytes());
-        digest.update(raw_payload);
-        Self(digest.finalize().into())
+        let mut hasher = ContentHasher::new(kind, raw_payload.len() as u64);
+        hasher.update(raw_payload);
+        hasher.finalize()
     }
 
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
+    }
+}
+
+/// Incremental hasher for a canonical [`ContentId`].
+///
+/// Supplying the known raw length up front preserves the same canonical byte
+/// sequence as [`ContentId::for_object`] while allowing cold hydration to hash
+/// a large raw blob in bounded I/O buffers.
+#[derive(Clone, Debug)]
+pub struct ContentHasher(Sha256);
+
+impl ContentHasher {
+    pub fn new(kind: ObjectKind, raw_length: u64) -> Self {
+        let mut digest = Sha256::new();
+        digest.update(CONTENT_ID_DOMAIN);
+        digest.update([kind.tag()]);
+        digest.update(raw_length.to_be_bytes());
+        Self(digest)
+    }
+
+    pub fn update(&mut self, bytes: &[u8]) {
+        self.0.update(bytes);
+    }
+
+    pub fn finalize(self) -> ContentId {
+        ContentId(self.0.finalize().into())
     }
 }
 
@@ -331,6 +354,19 @@ mod tests {
         assert_ne!(
             ContentId::for_object(ObjectKind::Blob, b"a"),
             ContentId::for_object(ObjectKind::Blob, b"a\0")
+        );
+    }
+
+    #[test]
+    fn content_hasher_matches_one_shot_content_id() {
+        let payload = b"a payload split across several bounded cold reads";
+        let mut hasher = ContentHasher::new(ObjectKind::Blob, payload.len() as u64);
+        for part in payload.chunks(7) {
+            hasher.update(part);
+        }
+        assert_eq!(
+            hasher.finalize(),
+            ContentId::for_object(ObjectKind::Blob, payload)
         );
     }
 
