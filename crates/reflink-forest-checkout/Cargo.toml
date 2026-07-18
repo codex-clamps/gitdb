@@ -8,3 +8,4 @@ description = "Byte-safe raw Git checkout planning for Reflink Forest"
 
 [dependencies]
 reflink-forest-core = { path = "../reflink-forest-core" }
+reflink-forest-cache = { path = "../reflink-forest-cache" }

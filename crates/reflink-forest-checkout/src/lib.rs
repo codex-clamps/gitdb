@@ -5,10 +5,17 @@
 //! fd-relative byte APIs without first passing a path through UTF-8.  It does
 //! not create files, follow symlinks, or apply Git worktree transforms.
 
-use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    ffi::OsString,
+    fs, io,
+    os::unix::{ffi::OsStringExt, fs::PermissionsExt},
+    path::{Path, PathBuf},
+};
 
-use reflink_forest_core::GitOid;
+use reflink_forest_cache::{Cache, CacheError};
+use reflink_forest_core::{ContentId, GitOid};
 
 /// Conservative limits enforced before checkout planning allocates a large
 /// amount of memory or constructs an impractical workspace tree.
@@ -354,6 +361,119 @@ pub struct PlannedEntry {
 pub struct CheckoutPlan {
     directories: Vec<RelativePath>,
     entries: Vec<PlannedEntry>,
+}
+
+/// Resolves a planned native Git object ID to the data required by raw mode.
+/// Implementations commonly read an object-location alias from the cold tier
+/// and hydrate its `ContentId` into [`Cache`] before returning it.
+pub trait RawCheckoutSource {
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    fn blob_content_id(&self, oid: &GitOid) -> Result<ContentId, Self::Error>;
+    fn blob_bytes(&self, oid: &GitOid) -> Result<Vec<u8>, Self::Error>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GitlinkPolicy {
+    Reject,
+    EmptyDirectory,
+}
+
+#[derive(Debug)]
+pub enum MaterializeError<E: std::error::Error + Send + Sync + 'static> {
+    Source(E),
+    Cache(CacheError),
+    Io(io::Error),
+    StageNotEmpty,
+    InvalidStage,
+    Gitlink(GitOid),
+    InvalidSymlinkTarget,
+}
+
+impl<E: std::error::Error + Send + Sync + 'static> fmt::Display for MaterializeError<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Source(error) => write!(f, "checkout source error: {error}"),
+            Self::Cache(error) => write!(f, "checkout cache error: {error}"),
+            Self::Io(error) => write!(f, "checkout filesystem error: {error}"),
+            Self::StageNotEmpty => write!(f, "staging workspace must be empty"),
+            Self::InvalidStage => write!(f, "staging workspace must be an existing directory"),
+            Self::Gitlink(oid) => write!(f, "raw checkout rejects gitlink {oid:?}"),
+            Self::InvalidSymlinkTarget => write!(f, "symlink target contains a NUL byte"),
+        }
+    }
+}
+
+impl<E: std::error::Error + Send + Sync + 'static> std::error::Error for MaterializeError<E> {}
+impl<E: std::error::Error + Send + Sync + 'static> From<io::Error> for MaterializeError<E> {
+    fn from(value: io::Error) -> Self {
+        Self::Io(value)
+    }
+}
+
+/// Materializes a plan only inside a private, empty staging directory. It
+/// never performs publication or copy fallback. Source and staging must have
+/// passed the exact FICLONE clone-domain probe before calling this function.
+pub fn materialize_raw<S: RawCheckoutSource>(
+    plan: &CheckoutPlan,
+    source: &S,
+    cache: &Cache,
+    staging: impl AsRef<Path>,
+    gitlink_policy: GitlinkPolicy,
+) -> Result<(), MaterializeError<S::Error>> {
+    let staging = staging.as_ref();
+    if !staging.is_dir() {
+        return Err(MaterializeError::InvalidStage);
+    }
+    if fs::read_dir(staging)?.next().is_some() {
+        return Err(MaterializeError::StageNotEmpty);
+    }
+    for directory in plan.directories() {
+        let path = checkout_path(staging, directory);
+        fs::create_dir(&path)?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755))?;
+    }
+    for entry in plan.entries() {
+        let path = checkout_path(staging, &entry.path);
+        match entry.object.mode {
+            TreeEntryMode::Regular | TreeEntryMode::Executable => {
+                let id = source
+                    .blob_content_id(&entry.object.oid)
+                    .map_err(MaterializeError::Source)?;
+                cache
+                    .clone_blob(id, &path)
+                    .map_err(MaterializeError::Cache)?;
+                let mode = if entry.object.mode == TreeEntryMode::Executable {
+                    0o755
+                } else {
+                    0o644
+                };
+                fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+            }
+            TreeEntryMode::Symlink => {
+                let target = source
+                    .blob_bytes(&entry.object.oid)
+                    .map_err(MaterializeError::Source)?;
+                if target.contains(&0) {
+                    return Err(MaterializeError::InvalidSymlinkTarget);
+                }
+                std::os::unix::fs::symlink(OsString::from_vec(target), path)?;
+            }
+            TreeEntryMode::Gitlink => match gitlink_policy {
+                GitlinkPolicy::Reject => return Err(MaterializeError::Gitlink(entry.object.oid)),
+                GitlinkPolicy::EmptyDirectory => fs::create_dir(path)?,
+            },
+        }
+    }
+    Ok(())
+}
+
+fn checkout_path(root: &Path, relative: &RelativePath) -> PathBuf {
+    let mut path = root.to_path_buf();
+    for component in relative.components() {
+        path.push(OsString::from_vec(component.as_bytes().to_vec()));
+    }
+    path
 }
 
 impl CheckoutPlan {

@@ -103,6 +103,62 @@ pub fn verify_tree(root: impl AsRef<Path>, manifest: &BackupManifest) -> Result<
     Ok(())
 }
 
+/// Restores a verified checkpoint to a new destination. The manifest must come
+/// from the caller's authenticated backup metadata; an existing destination is
+/// never overwritten.
+pub fn restore(
+    backup_root: impl AsRef<Path>,
+    manifest: &BackupManifest,
+    destination: impl AsRef<Path>,
+) -> Result<(), BackupError> {
+    let backup_root = backup_root.as_ref();
+    let destination = destination.as_ref();
+    if destination.exists() {
+        return Err(BackupError::DestinationExists);
+    }
+    verify_tree(backup_root, manifest)?;
+    let parent = destination.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "restore destination has no parent",
+        )
+    })?;
+    let temporary = parent.join(format!(".restore-{}-{}", process::id(), nonce()));
+    fs::create_dir(&temporary)?;
+    let result = (|| -> Result<(), BackupError> {
+        for entry in &manifest.files {
+            if entry
+                .relative
+                .components()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+            {
+                return Err(BackupError::InvalidManifest);
+            }
+            let source = backup_root.join(&entry.relative);
+            let target = temporary.join(&entry.relative);
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let mut input = File::open(source)?;
+            let mut output = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(target)?;
+            io::copy(&mut input, &mut output)?;
+            output.sync_all()?;
+        }
+        verify_tree(&temporary, manifest)?;
+        File::open(&temporary)?.sync_all()?;
+        fs::rename(&temporary, destination)?;
+        File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&temporary);
+    }
+    result
+}
+
 fn copy_tree(
     source_root: &Path,
     current: &Path,
@@ -219,6 +275,9 @@ mod tests {
         let manifest = checkpoint(&source, &destination).unwrap();
         assert_eq!(manifest.files.len(), 1);
         verify_tree(&destination, &manifest).unwrap();
+        let restored = parent.join("restored");
+        restore(&destination, &manifest, &restored).unwrap();
+        verify_tree(&restored, &manifest).unwrap();
         fs::remove_dir_all(source).unwrap();
         fs::remove_dir_all(parent).unwrap();
     }
