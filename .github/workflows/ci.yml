@@ -4,6 +4,13 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      run_privileged_btrfs:
+        description: Run the ignored loopback Btrfs integration test on the dedicated privileged runner
+        required: true
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -26,10 +33,15 @@ jobs:
         run: cargo test -p reflink-forest-index --features rocksdb-backend
 
   privileged-btrfs:
-    # This is a capability check: the runner must have an unshared Btrfs
-    # scratch device, loop support, and mount privilege. The ordinary CI image
-    # intentionally does not receive those powers.
-    if: ${{ false }}
-    runs-on: ubuntu-latest
+    # This runs only when an operator explicitly dispatches the workflow. The
+    # label must designate an isolated VM with loop support and CAP_SYS_ADMIN;
+    # ordinary hosted CI remains unprivileged and never queues this job.
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_privileged_btrfs }}
+    runs-on: [self-hosted, linux, btrfs-privileged]
     steps:
-      - run: echo 'Run the Btrfs/loop fault-injection suite in a dedicated VM.'
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run isolated loopback Btrfs integration test
+        env:
+          REFLINK_FOREST_RUN_PRIVILEGED_BTRFS_TESTS: "1"
+        run: cargo test -p reflink-forest-btrfs --test privileged_loopback -- --ignored --exact

@@ -374,6 +374,7 @@ dependencies = [
  "reflink-forest-core",
  "reflink-forest-format",
  "reflink-forest-index",
+ "reflink-forest-store",
 ]
 
 [[package]]

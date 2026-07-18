@@ -10,3 +10,6 @@ description = "Generation leases and atomic maintenance state for Reflink Forest
 reflink-forest-index = { path = "../reflink-forest-index" }
 reflink-forest-core = { path = "../reflink-forest-core" }
 reflink-forest-format = { path = "../reflink-forest-format" }
+
+[dev-dependencies]
+reflink-forest-store = { path = "../reflink-forest-store" }

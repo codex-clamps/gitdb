@@ -37,3 +37,12 @@ cargo run -p reflink-forest-probe -- /path/to/cache /path/to/workspaces
 `ficlone: supported` means the probe successfully cloned a file and verified
 that mutating the destination did not alter the source. Any error means that
 pair of directories is not usable as a Reflink Forest clone domain.
+
+The real loopback Btrfs lifecycle test is deliberately ignored. It creates and
+formats a disposable image, so run it only on a dedicated VM as root with
+`CAP_SYS_ADMIN` and loop-device support:
+
+```sh
+REFLINK_FOREST_RUN_PRIVILEGED_BTRFS_TESTS=1 \
+  cargo test -p reflink-forest-btrfs --test privileged_loopback -- --ignored
+```
