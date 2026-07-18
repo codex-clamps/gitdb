@@ -19,6 +19,8 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
 /// The filename containing a checkpoint's authenticated inventory.
 pub const MANIFEST_FILE_NAME: &str = "manifest-v1";
+pub const COLD_DESCRIPTOR_FILE_NAME: &str = "cold-tier-v1";
+const COLD_DESCRIPTOR_MAGIC: &[u8; 8] = b"RFCOLD01";
 
 const MANIFEST_MAGIC: &[u8; 8] = b"RFBKMAN1";
 const MANIFEST_HEADER_LEN: usize = MANIFEST_MAGIC.len() + 8;
@@ -38,6 +40,33 @@ pub struct BackupFile {
 pub struct BackupManifest {
     pub files: Vec<BackupFile>,
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChunkClassification {
+    Open,
+    Sealed,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ColdChunkDescriptor {
+    pub generation: u32,
+    pub chunk_id: u64,
+    pub classification: ChunkClassification,
+    /// Complete durable prefix for an open chunk; sealed chunks use their full size.
+    pub valid_prefix: u64,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ColdTierCheckpointDescriptor {
+    pub catalog_schema_version: u32,
+    pub active_generation: u32,
+    pub chunks: Vec<ColdChunkDescriptor>,
+    pub catalog_digest: [u8; 32],
+    pub config_digest: [u8; 32],
+    pub pins_manifest_digest: [u8; 32],
+}
+/// The daemon supplies this guard to pause writers and force the catalog/chunk
+/// durability boundary before authoritative cold-tier paths are copied.
+pub trait CheckpointGuard {
+    fn quiesce_and_sync(&self) -> Result<(), BackupError>;
+}
 #[derive(Debug)]
 pub enum BackupError {
     Io(io::Error),
@@ -45,6 +74,7 @@ pub enum BackupError {
     InvalidManifest,
     VerificationFailed(PathBuf),
     DestinationExists,
+    UnsafeDestination(PathBuf),
 }
 impl std::fmt::Display for BackupError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -60,8 +90,51 @@ impl std::fmt::Display for BackupError {
                 write!(f, "backup verification failed: {}", path.display())
             }
             Self::DestinationExists => write!(f, "backup destination already exists"),
+            Self::UnsafeDestination(path) => write!(
+                f,
+                "unsafe restore/checkpoint destination: {}",
+                path.display()
+            ),
         }
     }
+}
+
+/// Writes an authenticated v1 cold-tier descriptor next to a generic checkpoint.
+/// The generic file inventory remains backward compatible; consumers requiring
+/// cold-tier recovery must load and validate this descriptor before restore.
+pub fn checkpoint_cold_tier<G: CheckpointGuard>(
+    guard: &G,
+    source: impl AsRef<Path>,
+    destination: impl AsRef<Path>,
+    descriptor: &ColdTierCheckpointDescriptor,
+) -> Result<BackupManifest, BackupError> {
+    guard.quiesce_and_sync()?;
+    validate_cold_descriptor(descriptor)?;
+    let manifest = checkpoint(source, &destination)?;
+    let root = destination.as_ref();
+    let path = root.join(COLD_DESCRIPTOR_FILE_NAME);
+    let bytes = encode_cold_descriptor(descriptor)?;
+    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    File::open(root)?.sync_all()?;
+    Ok(manifest)
+}
+pub fn load_cold_tier_descriptor(
+    root: impl AsRef<Path>,
+) -> Result<ColdTierCheckpointDescriptor, BackupError> {
+    decode_cold_descriptor(&fs::read(root.as_ref().join(COLD_DESCRIPTOR_FILE_NAME))?)
+}
+/// Requires both generic inventory verification and a valid cold-tier descriptor
+/// before delegating to the compatible generic restore path.
+pub fn restore_cold_tier(
+    backup_root: impl AsRef<Path>,
+    manifest: &BackupManifest,
+    destination: impl AsRef<Path>,
+) -> Result<(), BackupError> {
+    let backup_root = backup_root.as_ref();
+    let _ = load_cold_tier_descriptor(backup_root)?;
+    restore(backup_root, manifest, destination)
 }
 impl std::error::Error for BackupError {}
 impl From<io::Error> for BackupError {
@@ -86,6 +159,9 @@ pub fn checkpoint(
             "backup destination has no parent",
         )
     })?;
+    if fs::symlink_metadata(parent)?.file_type().is_symlink() || !parent.is_dir() {
+        return Err(BackupError::UnsafeDestination(parent.to_path_buf()));
+    }
     let temporary = parent.join(format!(".checkpoint-{}-{}", process::id(), nonce()));
     fs::create_dir(&temporary)?;
     let result = (|| {
@@ -163,6 +239,9 @@ pub fn restore(
             "restore destination has no parent",
         )
     })?;
+    if fs::symlink_metadata(parent)?.file_type().is_symlink() || !parent.is_dir() {
+        return Err(BackupError::UnsafeDestination(parent.to_path_buf()));
+    }
     let temporary = parent.join(format!(".restore-{}-{}", process::id(), nonce()));
     fs::create_dir(&temporary)?;
     let result = (|| -> Result<(), BackupError> {
@@ -452,11 +531,167 @@ fn nonce() -> u128 {
         .as_nanos()
 }
 
+fn validate_cold_descriptor(descriptor: &ColdTierCheckpointDescriptor) -> Result<(), BackupError> {
+    if descriptor.chunks.windows(2).any(|pair| {
+        (pair[0].generation, pair[0].chunk_id) >= (pair[1].generation, pair[1].chunk_id)
+    }) {
+        return Err(BackupError::InvalidManifest);
+    }
+    if descriptor
+        .chunks
+        .iter()
+        .any(|chunk| chunk.valid_prefix == 0)
+    {
+        return Err(BackupError::InvalidManifest);
+    }
+    Ok(())
+}
+fn encode_cold_descriptor(
+    descriptor: &ColdTierCheckpointDescriptor,
+) -> Result<Vec<u8>, BackupError> {
+    validate_cold_descriptor(descriptor)?;
+    let count: u32 = descriptor
+        .chunks
+        .len()
+        .try_into()
+        .map_err(|_: TryFromIntError| BackupError::InvalidManifest)?;
+    let mut out = Vec::with_capacity(8 + 2 + 4 + 4 + 4 + descriptor.chunks.len() * 24 + 96 + 32);
+    out.extend_from_slice(COLD_DESCRIPTOR_MAGIC);
+    out.extend_from_slice(&1_u16.to_be_bytes());
+    out.extend_from_slice(&descriptor.catalog_schema_version.to_be_bytes());
+    out.extend_from_slice(&descriptor.active_generation.to_be_bytes());
+    out.extend_from_slice(&count.to_be_bytes());
+    for chunk in &descriptor.chunks {
+        out.extend_from_slice(&chunk.generation.to_be_bytes());
+        out.extend_from_slice(&chunk.chunk_id.to_be_bytes());
+        out.push(match chunk.classification {
+            ChunkClassification::Open => 1,
+            ChunkClassification::Sealed => 2,
+        });
+        out.extend_from_slice(&[0; 3]);
+        out.extend_from_slice(&chunk.valid_prefix.to_be_bytes());
+    }
+    out.extend_from_slice(&descriptor.catalog_digest);
+    out.extend_from_slice(&descriptor.config_digest);
+    out.extend_from_slice(&descriptor.pins_manifest_digest);
+    let digest = Sha256::digest(&out);
+    out.extend_from_slice(&digest);
+    Ok(out)
+}
+fn decode_cold_descriptor(bytes: &[u8]) -> Result<ColdTierCheckpointDescriptor, BackupError> {
+    if bytes.len() < 22 + 96 + 32 {
+        return Err(BackupError::InvalidManifest);
+    }
+    let (payload, stored) = bytes.split_at(bytes.len() - 32);
+    if Sha256::digest(payload).as_slice() != stored
+        || &payload[..8] != COLD_DESCRIPTOR_MAGIC
+        || u16::from_be_bytes([payload[8], payload[9]]) != 1
+    {
+        return Err(BackupError::InvalidManifest);
+    }
+    let mut offset = 10;
+    let schema = read_u32(payload, &mut offset)?;
+    let active = read_u32(payload, &mut offset)?;
+    let count = read_u32(payload, &mut offset)? as usize;
+    let expected = 22usize
+        .checked_add(count.checked_mul(24).ok_or(BackupError::InvalidManifest)?)
+        .and_then(|n| n.checked_add(96))
+        .ok_or(BackupError::InvalidManifest)?;
+    if payload.len() != expected {
+        return Err(BackupError::InvalidManifest);
+    }
+    let mut chunks = Vec::with_capacity(count);
+    for _ in 0..count {
+        let generation = read_u32(payload, &mut offset)?;
+        let chunk_id = read_u64(payload, &mut offset)?;
+        let classification = match *read_bytes(payload, &mut offset, 1)?.first().unwrap() {
+            1 => ChunkClassification::Open,
+            2 => ChunkClassification::Sealed,
+            _ => return Err(BackupError::InvalidManifest),
+        };
+        if read_bytes(payload, &mut offset, 3)? != [0; 3] {
+            return Err(BackupError::InvalidManifest);
+        }
+        let valid_prefix = read_u64(payload, &mut offset)?;
+        chunks.push(ColdChunkDescriptor {
+            generation,
+            chunk_id,
+            classification,
+            valid_prefix,
+        });
+    }
+    let catalog_digest = read_bytes(payload, &mut offset, 32)?.try_into().unwrap();
+    let config_digest = read_bytes(payload, &mut offset, 32)?.try_into().unwrap();
+    let pins_manifest_digest = read_bytes(payload, &mut offset, 32)?.try_into().unwrap();
+    let descriptor = ColdTierCheckpointDescriptor {
+        catalog_schema_version: schema,
+        active_generation: active,
+        chunks,
+        catalog_digest,
+        config_digest,
+        pins_manifest_digest,
+    };
+    validate_cold_descriptor(&descriptor)?;
+    Ok(descriptor)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     fn dir(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!("reflink-forest-backup-{label}-{}", nonce()))
+    }
+    struct Guard;
+    impl CheckpointGuard for Guard {
+        fn quiesce_and_sync(&self) -> Result<(), BackupError> {
+            Ok(())
+        }
+    }
+    fn descriptor() -> ColdTierCheckpointDescriptor {
+        ColdTierCheckpointDescriptor {
+            catalog_schema_version: 1,
+            active_generation: 7,
+            chunks: vec![ColdChunkDescriptor {
+                generation: 7,
+                chunk_id: 1,
+                classification: ChunkClassification::Open,
+                valid_prefix: 4096,
+            }],
+            catalog_digest: [1; 32],
+            config_digest: [2; 32],
+            pins_manifest_digest: [3; 32],
+        }
+    }
+
+    #[test]
+    fn cold_descriptor_round_trips_and_rejects_corruption() {
+        let encoded = encode_cold_descriptor(&descriptor()).unwrap();
+        assert_eq!(decode_cold_descriptor(&encoded).unwrap(), descriptor());
+        let mut corrupt = encoded;
+        corrupt[15] ^= 1;
+        assert!(matches!(
+            decode_cold_descriptor(&corrupt),
+            Err(BackupError::InvalidManifest)
+        ));
+    }
+
+    #[test]
+    fn guarded_cold_checkpoint_requires_descriptor_for_restore() {
+        let source = dir("cold-source");
+        let parent = dir("cold-parent");
+        fs::create_dir_all(source.join("chunks")).unwrap();
+        fs::create_dir(&parent).unwrap();
+        fs::write(source.join("chunks/a"), b"cold").unwrap();
+        let checkpoint_root = parent.join("checkpoint");
+        let manifest =
+            checkpoint_cold_tier(&Guard, &source, &checkpoint_root, &descriptor()).unwrap();
+        assert_eq!(
+            load_cold_tier_descriptor(&checkpoint_root).unwrap(),
+            descriptor()
+        );
+        restore_cold_tier(&checkpoint_root, &manifest, parent.join("restore")).unwrap();
+        fs::remove_dir_all(source).unwrap();
+        fs::remove_dir_all(parent).unwrap();
     }
     #[test]
     fn checkpoint_is_verified_and_rejects_symlinks() {

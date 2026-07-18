@@ -11,3 +11,4 @@ reflink-forest-core = { path = "../reflink-forest-core" }
 reflink-forest-format = { path = "../reflink-forest-format" }
 reflink-forest-index = { path = "../reflink-forest-index" }
 reflink-forest-store = { path = "../reflink-forest-store" }
+libc = "0.2"

@@ -13,4 +13,5 @@ reflink-forest-core = { path = "../reflink-forest-core" }
 reflink-forest-format = { path = "../reflink-forest-format" }
 reflink-forest-git = { path = "../reflink-forest-git" }
 reflink-forest-index = { path = "../reflink-forest-index" }
+reflink-forest-maintenance = { path = "../reflink-forest-maintenance" }
 reflink-forest-store = { path = "../reflink-forest-store" }

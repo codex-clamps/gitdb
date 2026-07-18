@@ -302,6 +302,7 @@ dependencies = [
 name = "reflink-forest-cache"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "reflink-forest-core",
  "reflink-forest-format",
  "reflink-forest-index",
@@ -312,6 +313,7 @@ dependencies = [
 name = "reflink-forest-checkout"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "reflink-forest-cache",
  "reflink-forest-core",
 ]
@@ -328,6 +330,7 @@ name = "reflink-forest-daemon"
 version = "0.1.0"
 dependencies = [
  "reflink-forest-format",
+ "reflink-forest-index",
 ]
 
 [[package]]
@@ -367,6 +370,11 @@ dependencies = [
 [[package]]
 name = "reflink-forest-maintenance"
 version = "0.1.0"
+dependencies = [
+ "reflink-forest-core",
+ "reflink-forest-format",
+ "reflink-forest-index",
+]
 
 [[package]]
 name = "reflink-forest-probe"
@@ -391,6 +399,7 @@ dependencies = [
  "reflink-forest-format",
  "reflink-forest-git",
  "reflink-forest-index",
+ "reflink-forest-maintenance",
  "reflink-forest-store",
 ]
 

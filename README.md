@@ -5,9 +5,11 @@ publish complete raw Git workspaces that share Btrfs extents with a derived
 cache. It is intentionally not a Git worktree implementation or a process
 sandbox.
 
-The project is in active construction. The current focus is **M1: the durable
-cold object store**. Git graph import, Btrfs orchestration, cache hydration,
-and checkout remain staged behind the M1 durability gate.
+The project is in active construction. The durable cold-store foundation is
+complete, and the current work covers the M2–M8 operational path: offline Git
+snapshots, verified Btrfs materialization, cache hydration, raw workspaces,
+daemon recovery, capacity controls, and cold-tier checkpoints. Privileged
+loop/mount fault injection remains gated to a dedicated Btrfs VM.
 
 ## Project contracts
 
@@ -22,6 +24,7 @@ and checkout remain staged behind the M1 durability gate.
 ```sh
 cargo fmt --check
 cargo test --workspace
+cargo test -p reflink-forest-index --features rocksdb-backend
 ```
 
 The runtime clone-domain probe must be run against the planned Btrfs cache and

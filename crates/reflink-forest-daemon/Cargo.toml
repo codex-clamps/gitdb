@@ -8,3 +8,4 @@ description = "Per-user local daemon primitives for Reflink Forest"
 
 [dependencies]
 reflink-forest-format = { path = "../reflink-forest-format" }
+reflink-forest-index = { path = "../reflink-forest-index" }

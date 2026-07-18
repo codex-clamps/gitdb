@@ -5,13 +5,14 @@
 //! those remain a fixed-purpose privileged-helper concern.
 
 use reflink_forest_format::crc32c;
+use reflink_forest_index::{Catalog, CatalogBatch, CatalogError};
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, BufRead, BufReader, Read, Write},
     os::{
         fd::AsRawFd,
         unix::{
-            fs::{FileTypeExt, OpenOptionsExt, PermissionsExt},
+            fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
             net::{UnixListener, UnixStream},
         },
     },
@@ -236,6 +237,12 @@ impl JobStore {
     /// Opens the durable queue and reconciles interrupted work. `Running`
     /// records become `Queued`, retaining their attempt count for retry.
     pub fn open(state_root: impl AsRef<Path>) -> Result<Self, JobError> {
+        Self::open_with_recovery(state_root).map(|(store, _)| store)
+    }
+
+    /// Opens the durable queue and reports how many interrupted `Running`
+    /// records were made retryable before the caller can accept work.
+    pub fn open_with_recovery(state_root: impl AsRef<Path>) -> Result<(Self, usize), JobError> {
         let jobs_dir = state_root.as_ref().join("jobs");
         let created = !jobs_dir.exists();
         fs::create_dir_all(&jobs_dir)?;
@@ -247,8 +254,8 @@ impl JobStore {
             jobs_dir,
             mutation_lock: Mutex::new(()),
         };
-        store.recover_startup()?;
-        Ok(store)
+        let recovered = store.recover_startup()?;
+        Ok((store, recovered))
     }
 
     pub fn directory(&self) -> &Path {
@@ -506,6 +513,165 @@ impl JobStore {
     }
 }
 
+/// Catalog-v1 `jobs` column-family journal for durable daemon job snapshots.
+///
+/// The filesystem [`JobStore`] remains API-compatible and owns its own atomic
+/// record replacement. This journal is the catalog's authoritative durable
+/// mirror/persistence hook: its mutation helpers write the filesystem record
+/// first, then synchronously publish the complete versioned snapshot under the
+/// opaque [`JobId`]. These are deliberately not a cross-store transaction. If
+/// catalog publication fails, the filesystem mutation remains durable and a
+/// caller must retry [`Self::mirror_record`] or [`Self::mirror_store`].
+pub struct CatalogJobJournal<'a, C: Catalog> {
+    catalog: &'a mut C,
+}
+
+impl<'a, C: Catalog> CatalogJobJournal<'a, C> {
+    pub fn new(catalog: &'a mut C) -> Self {
+        Self { catalog }
+    }
+
+    /// Writes one complete, validated snapshot through the catalog's atomic
+    /// batch interface. The inner job encoding is explicitly versioned; the
+    /// catalog independently wraps its opaque value in its catalog-v1 format.
+    pub fn mirror_record(&mut self, record: &JobRecord) -> Result<(), CatalogJobJournalError> {
+        let snapshot = encode_job_record(record)?;
+        let mut batch = CatalogBatch::new();
+        batch.put_job(record.id.as_bytes(), snapshot);
+        self.catalog.apply(batch)?;
+        Ok(())
+    }
+
+    /// Mirrors every visible filesystem job. This is suitable for startup
+    /// reconciliation after [`JobStore::open_with_recovery`] requeues work.
+    pub fn mirror_store(&mut self, store: &JobStore) -> Result<usize, CatalogJobJournalError> {
+        let records = store.list()?;
+        for record in &records {
+            self.mirror_record(record)?;
+        }
+        Ok(records.len())
+    }
+
+    /// Reads and fully validates one catalog snapshot. Missing, corrupt,
+    /// unknown-version, or key/record-ID mismatched values are never exposed
+    /// as a usable job record.
+    pub fn read_snapshot(&self, id: JobId) -> Result<JobRecord, CatalogJobJournalError> {
+        let snapshot = self
+            .catalog
+            .job(id.as_bytes())
+            .ok_or(CatalogJobJournalError::MissingSnapshot(id))?;
+        let record = decode_job_record(&snapshot)?;
+        if record.id != id {
+            return Err(CatalogJobJournalError::SnapshotIdMismatch {
+                key: id,
+                record: record.id,
+            });
+        }
+        Ok(record)
+    }
+
+    /// Persists a newly enqueued job into the catalog only after the local
+    /// record has been atomically published.
+    pub fn enqueue(
+        &mut self,
+        store: &JobStore,
+        kind: impl AsRef<[u8]>,
+        payload: impl AsRef<[u8]>,
+    ) -> Result<JobRecord, CatalogJobJournalError> {
+        let record = store.enqueue(kind, payload)?;
+        self.mirror_record(&record)?;
+        Ok(record)
+    }
+
+    /// Equivalent to [`Self::enqueue`] with a higher-level caller-owned job
+    /// identity.
+    pub fn enqueue_with_id(
+        &mut self,
+        store: &JobStore,
+        id: JobId,
+        kind: impl AsRef<[u8]>,
+        payload: impl AsRef<[u8]>,
+    ) -> Result<JobRecord, CatalogJobJournalError> {
+        let record = store.enqueue_with_id(id, kind, payload)?;
+        self.mirror_record(&record)?;
+        Ok(record)
+    }
+
+    pub fn start(
+        &mut self,
+        store: &JobStore,
+        id: JobId,
+    ) -> Result<JobRecord, CatalogJobJournalError> {
+        let record = store.start(id)?;
+        self.mirror_record(&record)?;
+        Ok(record)
+    }
+
+    pub fn succeed(
+        &mut self,
+        store: &JobStore,
+        id: JobId,
+    ) -> Result<JobRecord, CatalogJobJournalError> {
+        let record = store.succeed(id)?;
+        self.mirror_record(&record)?;
+        Ok(record)
+    }
+
+    pub fn fail(
+        &mut self,
+        store: &JobStore,
+        id: JobId,
+        error: impl AsRef<[u8]>,
+    ) -> Result<JobRecord, CatalogJobJournalError> {
+        let record = store.fail(id, error)?;
+        self.mirror_record(&record)?;
+        Ok(record)
+    }
+
+    pub fn retry(
+        &mut self,
+        store: &JobStore,
+        id: JobId,
+    ) -> Result<JobRecord, CatalogJobJournalError> {
+        let record = store.retry(id)?;
+        self.mirror_record(&record)?;
+        Ok(record)
+    }
+}
+
+#[derive(Debug)]
+pub enum CatalogJobJournalError {
+    Job(JobError),
+    Catalog(CatalogError),
+    MissingSnapshot(JobId),
+    SnapshotIdMismatch { key: JobId, record: JobId },
+}
+
+impl std::fmt::Display for CatalogJobJournalError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Job(error) => write!(formatter, "catalog job snapshot is invalid: {error}"),
+            Self::Catalog(error) => write!(formatter, "catalog job publication failed: {error:?}"),
+            Self::MissingSnapshot(id) => write!(formatter, "catalog has no job snapshot for {id}"),
+            Self::SnapshotIdMismatch { key, record } => write!(
+                formatter,
+                "catalog job snapshot key {key} contains record {record}"
+            ),
+        }
+    }
+}
+impl std::error::Error for CatalogJobJournalError {}
+impl From<JobError> for CatalogJobJournalError {
+    fn from(value: JobError) -> Self {
+        Self::Job(value)
+    }
+}
+impl From<CatalogError> for CatalogJobJournalError {
+    fn from(value: CatalogError) -> Self {
+        Self::Catalog(value)
+    }
+}
+
 fn require_transition(
     record: &JobRecord,
     expected: JobState,
@@ -689,6 +855,7 @@ const LOCK_NB: std::ffi::c_int = 4;
 const LOCK_UN: std::ffi::c_int = 8;
 const SOL_SOCKET: std::ffi::c_int = 1;
 const SO_PEERCRED: std::ffi::c_int = 17;
+const MAX_SOCKET_REQUEST_LEN: usize = 16 * 1024;
 #[repr(C)]
 struct UCred {
     pid: i32,
@@ -731,6 +898,155 @@ impl From<io::Error> for DaemonError {
     }
 }
 
+/// Typed local-daemon directory configuration. The runtime and durable state
+/// roots are intentionally separate: deleting a stale socket must never be
+/// able to affect authoritative job records.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DaemonConfig {
+    runtime_dir: PathBuf,
+    state_root: PathBuf,
+}
+
+impl DaemonConfig {
+    pub fn new(runtime_dir: impl AsRef<Path>, state_root: impl AsRef<Path>) -> Self {
+        Self {
+            runtime_dir: runtime_dir.as_ref().to_path_buf(),
+            state_root: state_root.as_ref().to_path_buf(),
+        }
+    }
+
+    pub fn runtime_dir(&self) -> &Path {
+        &self.runtime_dir
+    }
+
+    pub fn state_root(&self) -> &Path {
+        &self.state_root
+    }
+
+    /// Validates already-created directories without changing their modes.
+    pub fn validate(&self) -> Result<(), DaemonConfigError> {
+        validate_owned_private_directory(&self.runtime_dir)?;
+        validate_owned_private_directory(&self.state_root)?;
+        Ok(())
+    }
+
+    /// Creates missing daemon roots with mode 0700, then validates ownership,
+    /// type, and permissions before use.
+    pub fn prepare(&self) -> Result<(), DaemonConfigError> {
+        create_owned_private_directory(&self.runtime_dir)?;
+        create_owned_private_directory(&self.state_root)?;
+        self.validate()
+    }
+}
+
+#[derive(Debug)]
+pub enum DaemonConfigError {
+    Io(io::Error),
+    MissingDirectory(PathBuf),
+    SymlinkDirectory(PathBuf),
+    NotDirectory(PathBuf),
+    WrongOwner {
+        path: PathBuf,
+        expected_uid: u32,
+        actual_uid: u32,
+    },
+    UnsafePermissions {
+        path: PathBuf,
+        mode: u32,
+    },
+}
+
+impl std::fmt::Display for DaemonConfigError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(error) => write!(formatter, "daemon configuration I/O error: {error}"),
+            Self::MissingDirectory(path) => {
+                write!(formatter, "daemon directory is missing: {}", path.display())
+            }
+            Self::SymlinkDirectory(path) => {
+                write!(
+                    formatter,
+                    "daemon directory may not be a symlink: {}",
+                    path.display()
+                )
+            }
+            Self::NotDirectory(path) => {
+                write!(
+                    formatter,
+                    "daemon path is not a directory: {}",
+                    path.display()
+                )
+            }
+            Self::WrongOwner {
+                path,
+                expected_uid,
+                actual_uid,
+            } => write!(
+                formatter,
+                "daemon directory {} belongs to uid {actual_uid}, expected uid {expected_uid}",
+                path.display()
+            ),
+            Self::UnsafePermissions { path, mode } => write!(
+                formatter,
+                "daemon directory {} has unsafe mode {:o}",
+                path.display(),
+                mode & 0o777
+            ),
+        }
+    }
+}
+impl std::error::Error for DaemonConfigError {}
+impl From<io::Error> for DaemonConfigError {
+    fn from(value: io::Error) -> Self {
+        Self::Io(value)
+    }
+}
+
+fn create_owned_private_directory(path: &Path) -> Result<(), DaemonConfigError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir_all(path)?;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    validate_owned_private_directory(path)
+}
+
+fn validate_owned_private_directory(path: &Path) -> Result<(), DaemonConfigError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(DaemonConfigError::MissingDirectory(path.to_path_buf()))
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(DaemonConfigError::SymlinkDirectory(path.to_path_buf()));
+    }
+    if !metadata.is_dir() {
+        return Err(DaemonConfigError::NotDirectory(path.to_path_buf()));
+    }
+    let expected_uid = current_uid();
+    let actual_uid = metadata.uid();
+    if actual_uid != expected_uid {
+        return Err(DaemonConfigError::WrongOwner {
+            path: path.to_path_buf(),
+            expected_uid,
+            actual_uid,
+        });
+    }
+    let mode = metadata.mode();
+    if mode & 0o077 != 0 || mode & 0o700 != 0o700 {
+        return Err(DaemonConfigError::UnsafePermissions {
+            path: path.to_path_buf(),
+            mode,
+        });
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 pub struct InstanceLock {
     file: File,
@@ -758,6 +1074,163 @@ pub fn acquire_lock(path: impl AsRef<Path>) -> Result<InstanceLock, DaemonError>
         return Err(error.into());
     }
     Ok(InstanceLock { file })
+}
+
+fn current_uid() -> u32 {
+    // SAFETY: getuid has no preconditions and cannot fail.
+    unsafe { getuid() }
+}
+
+/// A parsed local control command. Commands are deliberately limited to
+/// durable job state transitions; no Git, mount, or workspace side effect can
+/// be reached through this protocol.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DaemonCommand {
+    Status,
+    Enqueue { kind: Vec<u8>, payload: Vec<u8> },
+    Get { id: JobId },
+    Start { id: JobId },
+    Succeed { id: JobId },
+    Fail { id: JobId, error: Vec<u8> },
+    Retry { id: JobId },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DaemonCommandParseError {
+    Invalid,
+    Unsupported,
+}
+
+impl std::fmt::Display for DaemonCommandParseError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid => write!(formatter, "invalid daemon command"),
+            Self::Unsupported => write!(formatter, "unsupported daemon command"),
+        }
+    }
+}
+impl std::error::Error for DaemonCommandParseError {}
+
+/// Parses the strict, one-line local socket protocol. Byte fields use lower
+/// case hexadecimal so requests remain line-safe without treating job paths
+/// or names as UTF-8.
+pub fn parse_daemon_command(request: &str) -> Result<DaemonCommand, DaemonCommandParseError> {
+    if request.is_empty()
+        || request
+            .bytes()
+            .any(|byte| matches!(byte, b'\n' | b'\r' | b'\t'))
+    {
+        return Err(DaemonCommandParseError::Invalid);
+    }
+    let fields: Vec<_> = request.split(' ').collect();
+    if fields.iter().any(|field| field.is_empty()) {
+        return Err(DaemonCommandParseError::Invalid);
+    }
+    match fields.as_slice() {
+        ["status"] => Ok(DaemonCommand::Status),
+        ["job", "enqueue", kind, payload] => Ok(DaemonCommand::Enqueue {
+            kind: parse_hex_bytes(kind, false)?,
+            payload: parse_hex_bytes(payload, true)?,
+        }),
+        ["job", "get", id] => Ok(DaemonCommand::Get {
+            id: parse_command_job_id(id)?,
+        }),
+        ["job", "start", id] => Ok(DaemonCommand::Start {
+            id: parse_command_job_id(id)?,
+        }),
+        ["job", "succeed", id] => Ok(DaemonCommand::Succeed {
+            id: parse_command_job_id(id)?,
+        }),
+        ["job", "fail", id, error] => Ok(DaemonCommand::Fail {
+            id: parse_command_job_id(id)?,
+            error: parse_hex_bytes(error, false)?,
+        }),
+        ["job", "retry", id] => Ok(DaemonCommand::Retry {
+            id: parse_command_job_id(id)?,
+        }),
+        ["job", ..] => Err(DaemonCommandParseError::Unsupported),
+        _ => Err(DaemonCommandParseError::Unsupported),
+    }
+}
+
+fn parse_command_job_id(value: &str) -> Result<JobId, DaemonCommandParseError> {
+    JobId::parse_hex(value).ok_or(DaemonCommandParseError::Invalid)
+}
+
+fn parse_hex_bytes(value: &str, allow_empty: bool) -> Result<Vec<u8>, DaemonCommandParseError> {
+    if (!allow_empty && value.is_empty()) || value.len() % 2 != 0 {
+        return Err(DaemonCommandParseError::Invalid);
+    }
+    let mut bytes = Vec::with_capacity(value.len() / 2);
+    for pair in value.as_bytes().chunks_exact(2) {
+        let high = hex_nibble(pair[0]).ok_or(DaemonCommandParseError::Invalid)?;
+        let low = hex_nibble(pair[1]).ok_or(DaemonCommandParseError::Invalid)?;
+        bytes.push((high << 4) | low);
+    }
+    Ok(bytes)
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct JobStateCounts {
+    pub queued: u64,
+    pub running: u64,
+    pub succeeded: u64,
+    pub failed: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DaemonMetricsSnapshot {
+    pub jobs: JobStateCounts,
+    pub recovered_on_startup: u64,
+    pub accepted_requests: u64,
+    pub rejected_requests: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DaemonStatus {
+    pub runtime_dir: PathBuf,
+    pub state_root: PathBuf,
+    pub socket_path: PathBuf,
+    pub metrics: DaemonMetricsSnapshot,
+}
+
+#[derive(Debug)]
+pub enum DaemonServiceError {
+    Config(DaemonConfigError),
+    Daemon(DaemonError),
+    Job(JobError),
+    StoreAlreadyInUse(PathBuf),
+}
+
+impl std::fmt::Display for DaemonServiceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Config(error) => write!(formatter, "daemon configuration failed: {error}"),
+            Self::Daemon(error) => write!(formatter, "daemon startup failed: {error}"),
+            Self::Job(error) => write!(formatter, "daemon job recovery failed: {error}"),
+            Self::StoreAlreadyInUse(path) => write!(
+                formatter,
+                "daemon state root is already owned by another instance: {}",
+                path.display()
+            ),
+        }
+    }
+}
+impl std::error::Error for DaemonServiceError {}
+impl From<DaemonConfigError> for DaemonServiceError {
+    fn from(value: DaemonConfigError) -> Self {
+        Self::Config(value)
+    }
+}
+impl From<DaemonError> for DaemonServiceError {
+    fn from(value: DaemonError) -> Self {
+        Self::Daemon(value)
+    }
+}
+impl From<JobError> for DaemonServiceError {
+    fn from(value: JobError) -> Self {
+        Self::Job(value)
+    }
 }
 
 pub struct Daemon {
@@ -789,19 +1262,43 @@ impl Daemon {
     pub fn socket_path(&self) -> &Path {
         &self.socket
     }
+
     /// Handles one line-oriented diagnostic request. Protocol commands are
     /// deliberately small until an authenticated typed protocol replaces it.
     pub fn serve_one(&self) -> Result<(), DaemonError> {
+        self.serve_one_with(|request| match request {
+            "status" => "ok\n".to_owned(),
+            _ => "error unsupported-request\n".to_owned(),
+        })
+    }
+
+    fn serve_one_with<F>(&self, handler: F) -> Result<(), DaemonError>
+    where
+        F: FnOnce(&str) -> String,
+    {
         let (stream, _) = self.listener.accept()?;
         ensure_same_uid(&stream)?;
         let mut reader = BufReader::new(stream.try_clone()?);
-        let mut request = String::new();
-        reader.read_line(&mut request)?;
+        let mut request = Vec::new();
+        reader
+            .by_ref()
+            .take((MAX_SOCKET_REQUEST_LEN + 1) as u64)
+            .read_until(b'\n', &mut request)?;
         let mut stream = stream;
-        match request.trim_end() {
-            "status" => stream.write_all(b"ok\n")?,
-            _ => stream.write_all(b"error unsupported-request\n")?,
-        }
+        let response = match request.strip_suffix(b"\n") {
+            Some(line)
+                if line.len() <= MAX_SOCKET_REQUEST_LEN
+                    && !line.contains(&b'\n')
+                    && !line.contains(&b'\r') =>
+            {
+                match std::str::from_utf8(line) {
+                    Ok(request) => handler(request),
+                    Err(_) => "error invalid-request\n".to_owned(),
+                }
+            }
+            _ => "error invalid-request\n".to_owned(),
+        };
+        stream.write_all(response.as_bytes())?;
         stream.flush()?;
         Ok(())
     }
@@ -830,15 +1327,180 @@ fn ensure_same_uid(stream: &UnixStream) -> Result<(), DaemonError> {
     {
         return Err(io::Error::last_os_error().into());
     }
-    if length != std::mem::size_of::<UCred>() as u32 || credential.uid != unsafe { getuid() } {
+    if length != std::mem::size_of::<UCred>() as u32 || credential.uid != current_uid() {
         return Err(DaemonError::UnauthorizedPeer);
     }
     Ok(())
 }
 
+/// Owns a verified state root, durable job queue, and local control socket.
+/// Startup takes the state-root lock and completes job recovery before the
+/// listener is bound, so no request can observe unreconciled work.
+pub struct DaemonService {
+    config: DaemonConfig,
+    daemon: Daemon,
+    jobs: JobStore,
+    _store_lock: InstanceLock,
+    recovered_on_startup: u64,
+    accepted_requests: AtomicU64,
+    rejected_requests: AtomicU64,
+}
+
+impl DaemonService {
+    pub fn start(config: DaemonConfig) -> Result<Self, DaemonServiceError> {
+        config.prepare()?;
+        let lock_path = config.state_root.join("instance.lock");
+        let store_lock = match acquire_lock(&lock_path) {
+            Ok(lock) => lock,
+            Err(DaemonError::AlreadyRunning) => {
+                return Err(DaemonServiceError::StoreAlreadyInUse(
+                    config.state_root.clone(),
+                ))
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let (jobs, recovered) = JobStore::open_with_recovery(&config.state_root)?;
+        let daemon = Daemon::bind(&config.runtime_dir)?;
+        Ok(Self {
+            config,
+            daemon,
+            jobs,
+            _store_lock: store_lock,
+            recovered_on_startup: recovered as u64,
+            accepted_requests: AtomicU64::new(0),
+            rejected_requests: AtomicU64::new(0),
+        })
+    }
+
+    pub fn socket_path(&self) -> &Path {
+        self.daemon.socket_path()
+    }
+
+    pub fn job_store(&self) -> &JobStore {
+        &self.jobs
+    }
+
+    pub fn status(&self) -> Result<DaemonStatus, DaemonServiceError> {
+        Ok(DaemonStatus {
+            runtime_dir: self.config.runtime_dir.clone(),
+            state_root: self.config.state_root.clone(),
+            socket_path: self.socket_path().to_path_buf(),
+            metrics: self.metrics_snapshot()?,
+        })
+    }
+
+    pub fn metrics_snapshot(&self) -> Result<DaemonMetricsSnapshot, DaemonServiceError> {
+        let mut jobs = JobStateCounts::default();
+        for record in self.jobs.list()? {
+            match record.state {
+                JobState::Queued => jobs.queued += 1,
+                JobState::Running => jobs.running += 1,
+                JobState::Succeeded => jobs.succeeded += 1,
+                JobState::Failed => jobs.failed += 1,
+            }
+        }
+        Ok(DaemonMetricsSnapshot {
+            jobs,
+            recovered_on_startup: self.recovered_on_startup,
+            accepted_requests: self.accepted_requests.load(Ordering::Relaxed),
+            rejected_requests: self.rejected_requests.load(Ordering::Relaxed),
+        })
+    }
+
+    /// Serves exactly one same-UID local control request.
+    pub fn serve_one(&self) -> Result<(), DaemonError> {
+        self.daemon
+            .serve_one_with(|request| self.handle_socket_command(request))
+    }
+
+    fn handle_socket_command(&self, request: &str) -> String {
+        match parse_daemon_command(request) {
+            Ok(command) => match self.execute(command) {
+                Ok(response) => {
+                    self.accepted_requests.fetch_add(1, Ordering::Relaxed);
+                    response
+                }
+                Err(error) => {
+                    self.rejected_requests.fetch_add(1, Ordering::Relaxed);
+                    job_error_response(&error)
+                }
+            },
+            Err(DaemonCommandParseError::Unsupported) => {
+                self.rejected_requests.fetch_add(1, Ordering::Relaxed);
+                "error unsupported-request\n".to_owned()
+            }
+            Err(DaemonCommandParseError::Invalid) => {
+                self.rejected_requests.fetch_add(1, Ordering::Relaxed);
+                "error invalid-request\n".to_owned()
+            }
+        }
+    }
+
+    fn execute(&self, command: DaemonCommand) -> Result<String, JobError> {
+        match command {
+            DaemonCommand::Status => {
+                let snapshot = self.metrics_snapshot().map_err(|error| match error {
+                    DaemonServiceError::Job(error) => error,
+                    _ => JobError::InvalidRecord("daemon metrics are unavailable"),
+                })?;
+                Ok(format!(
+                    "ok status queued={} running={} succeeded={} failed={} recovered={} accepted={} rejected={}\n",
+                    snapshot.jobs.queued,
+                    snapshot.jobs.running,
+                    snapshot.jobs.succeeded,
+                    snapshot.jobs.failed,
+                    snapshot.recovered_on_startup,
+                    snapshot.accepted_requests,
+                    snapshot.rejected_requests,
+                ))
+            }
+            DaemonCommand::Enqueue { kind, payload } => {
+                self.jobs.enqueue(kind, payload).map(render_job_response)
+            }
+            DaemonCommand::Get { id } => self.jobs.get(id).map(render_job_response),
+            DaemonCommand::Start { id } => self.jobs.start(id).map(render_job_response),
+            DaemonCommand::Succeed { id } => self.jobs.succeed(id).map(render_job_response),
+            DaemonCommand::Fail { id, error } => self.jobs.fail(id, error).map(render_job_response),
+            DaemonCommand::Retry { id } => self.jobs.retry(id).map(render_job_response),
+        }
+    }
+}
+
+fn render_job_response(record: JobRecord) -> String {
+    format!(
+        "ok job id={} state={} attempts={}\n",
+        record.id,
+        job_state_name(record.state),
+        record.attempts
+    )
+}
+
+const fn job_state_name(state: JobState) -> &'static str {
+    match state {
+        JobState::Queued => "queued",
+        JobState::Running => "running",
+        JobState::Succeeded => "succeeded",
+        JobState::Failed => "failed",
+    }
+}
+
+fn job_error_response(error: &JobError) -> String {
+    match error {
+        JobError::NotFound(_) => "error job-not-found\n",
+        JobError::InvalidTransition { .. } => "error invalid-transition\n",
+        JobError::InvalidRecord(_) | JobError::UnsupportedVersion(_) => "error invalid-job\n",
+        JobError::Io(_)
+        | JobError::AlreadyExists(_)
+        | JobError::AttemptOverflow(_)
+        | JobError::UnsafeJobDirectoryEntry(_) => "error job-store\n",
+    }
+    .to_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reflink_forest_index::{Catalog, CatalogBatch, InMemoryCatalog};
     use std::{
         sync::Arc,
         thread,
@@ -852,6 +1514,18 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    fn service_config(root: &Path) -> DaemonConfig {
+        DaemonConfig::new(root.join("runtime"), root.join("state"))
+    }
+
+    fn socket_request(socket: &Path, request: &str) -> String {
+        let mut client = UnixStream::connect(socket).unwrap();
+        client.write_all(request.as_bytes()).unwrap();
+        let mut response = String::new();
+        BufReader::new(client).read_line(&mut response).unwrap();
+        response
     }
     #[test]
     fn per_user_socket_and_lock_serve_status() {
@@ -895,6 +1569,60 @@ mod tests {
         assert_eq!(bytes[10..26], *id.as_bytes());
         drop(store);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn catalog_journal_mirrors_durable_job_state_transitions() {
+        let root = dir();
+        let store = JobStore::open(&root).unwrap();
+        let id = job_id(0x12);
+        let mut catalog = InMemoryCatalog::default();
+        let mut journal = CatalogJobJournal::new(&mut catalog);
+
+        let queued = journal
+            .enqueue_with_id(&store, id, b"import", b"source\x00path")
+            .unwrap();
+        assert_eq!(queued.state, JobState::Queued);
+        assert_eq!(journal.read_snapshot(id).unwrap(), queued);
+
+        let running = journal.start(&store, id).unwrap();
+        assert_eq!(running.state, JobState::Running);
+        assert_eq!(journal.read_snapshot(id).unwrap(), running);
+
+        let failed = journal.fail(&store, id, b"temporary failure").unwrap();
+        assert_eq!(failed.state, JobState::Failed);
+        assert_eq!(journal.read_snapshot(id).unwrap(), failed);
+
+        let queued_again = journal.retry(&store, id).unwrap();
+        assert_eq!(queued_again.state, JobState::Queued);
+        assert_eq!(journal.read_snapshot(id).unwrap(), queued_again);
+        assert!(catalog.job(id.as_bytes()).is_some());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn catalog_journal_rejects_invalid_or_mismatched_snapshots() {
+        let id = job_id(0x13);
+        let mut catalog = InMemoryCatalog::default();
+        let mut batch = CatalogBatch::new();
+        batch.put_job(id.as_bytes(), b"not a durable job record");
+        catalog.apply(batch).unwrap();
+        let journal = CatalogJobJournal::new(&mut catalog);
+        assert!(matches!(
+            journal.read_snapshot(id),
+            Err(CatalogJobJournalError::Job(JobError::InvalidRecord(_)))
+        ));
+        let other = job_id(0x14);
+        let record = JobRecord::queued(other, b"hydrate".to_vec(), b"payload".to_vec());
+        let mut batch = CatalogBatch::new();
+        batch.put_job(id.as_bytes(), encode_job_record(&record).unwrap());
+        catalog.apply(batch).unwrap();
+        let journal = CatalogJobJournal::new(&mut catalog);
+        assert!(matches!(
+            journal.read_snapshot(id),
+            Err(CatalogJobJournalError::SnapshotIdMismatch { key, record: found })
+                if key == id && found == other
+        ));
     }
 
     #[test]
@@ -996,6 +1724,130 @@ mod tests {
         assert_eq!(record.state, JobState::Running);
         assert_eq!(record.attempts, 1);
         drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn managed_startup_recovers_jobs_and_locks_the_state_root() {
+        let root = dir();
+        let config = service_config(&root);
+        let id;
+        {
+            let service = DaemonService::start(config.clone()).unwrap();
+            assert_eq!(service.status().unwrap().metrics.recovered_on_startup, 0);
+            let record = service
+                .job_store()
+                .enqueue_with_id(job_id(0x66), b"checkout", b"payload")
+                .unwrap();
+            id = record.id;
+            service.job_store().start(id).unwrap();
+
+            let competing = DaemonConfig::new(root.join("other-runtime"), root.join("state"));
+            assert!(matches!(
+                DaemonService::start(competing),
+                Err(DaemonServiceError::StoreAlreadyInUse(_))
+            ));
+        }
+
+        let restarted = DaemonService::start(config).unwrap();
+        let status = restarted.status().unwrap();
+        assert_eq!(status.metrics.recovered_on_startup, 1);
+        assert_eq!(status.metrics.jobs.queued, 1);
+        assert_eq!(
+            restarted.job_store().get(id).unwrap().state,
+            JobState::Queued
+        );
+        drop(restarted);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn typed_socket_commands_are_strict_and_report_structured_status() {
+        let root = dir();
+        let service = DaemonService::start(service_config(&root)).unwrap();
+        let socket = service.socket_path().to_path_buf();
+        let server = thread::spawn(move || {
+            for _ in 0..4 {
+                service.serve_one().unwrap();
+            }
+            service
+        });
+
+        let queued = socket_request(&socket, "job enqueue 696d706f7274 7061796c6f6164\n");
+        assert!(queued.starts_with("ok job id="));
+        let id = queued
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix("id="))
+            .unwrap();
+        let running = socket_request(&socket, &format!("job start {id}\n"));
+        assert!(running.contains("state=running"));
+        let status = socket_request(&socket, "status\n");
+        assert!(status.starts_with("ok status"));
+        assert!(status.contains("running=1"));
+        assert_eq!(
+            socket_request(&socket, "job destroy everything\n"),
+            "error unsupported-request\n"
+        );
+
+        let service = server.join().unwrap();
+        let metrics = service.metrics_snapshot().unwrap();
+        assert_eq!(metrics.jobs.running, 1);
+        assert_eq!(metrics.accepted_requests, 3);
+        assert_eq!(metrics.rejected_requests, 1);
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn service_serializes_concurrent_same_uid_clients() {
+        let root = dir();
+        let service = DaemonService::start(service_config(&root)).unwrap();
+        let socket = service.socket_path().to_path_buf();
+        let server = thread::spawn(move || {
+            for _ in 0..9 {
+                service.serve_one().unwrap();
+            }
+            service
+        });
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let mut clients = Vec::new();
+        for _ in 0..8 {
+            let socket = socket.clone();
+            let barrier = Arc::clone(&barrier);
+            clients.push(thread::spawn(move || {
+                barrier.wait();
+                socket_request(&socket, "job enqueue 68796472617465 7061796c6f6164\n")
+            }));
+        }
+        for client in clients {
+            assert!(client.join().unwrap().starts_with("ok job id="));
+        }
+        let status = socket_request(&socket, "status\n");
+        assert!(status.contains("queued=8"));
+
+        let service = server.join().unwrap();
+        let metrics = service.metrics_snapshot().unwrap();
+        assert_eq!(metrics.jobs.queued, 8);
+        assert_eq!(metrics.accepted_requests, 9);
+        assert_eq!(metrics.rejected_requests, 0);
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn configuration_rejects_public_state_directory() {
+        let root = dir();
+        let runtime = root.join("runtime");
+        let state = root.join("state");
+        fs::create_dir_all(&runtime).unwrap();
+        fs::create_dir_all(&state).unwrap();
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o755)).unwrap();
+        let config = DaemonConfig::new(&runtime, &state);
+        assert!(matches!(
+            config.validate(),
+            Err(DaemonConfigError::UnsafePermissions { path, .. }) if path == state
+        ));
         fs::remove_dir_all(root).unwrap();
     }
 }

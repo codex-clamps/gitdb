@@ -8,18 +8,16 @@
 use std::fmt;
 use std::{
     collections::{BTreeMap, BTreeSet},
-    ffi::{CString, OsString},
+    ffi::CString,
     fs::{self, File},
     io,
-    os::unix::{
-        ffi::{OsStrExt, OsStringExt},
-        fs::PermissionsExt,
-    },
+    os::unix::{ffi::OsStrExt, fs::PermissionsExt},
     path::{Path, PathBuf},
 };
 
 const AT_FDCWD: std::ffi::c_int = -100;
 const RENAME_EXCHANGE: u32 = 2;
+const FICLONE: libc::c_ulong = 0x4004_9409;
 unsafe extern "C" {
     fn renameat2(
         olddirfd: std::ffi::c_int,
@@ -438,33 +436,30 @@ pub fn materialize_raw<S: RawCheckoutSource>(
     gitlink_policy: GitlinkPolicy,
 ) -> Result<(), MaterializeError<S::Error>> {
     let staging = staging.as_ref();
-    if !staging.is_dir() {
+    let stage_metadata = fs::symlink_metadata(staging)?;
+    if stage_metadata.file_type().is_symlink() || !stage_metadata.is_dir() {
         return Err(MaterializeError::InvalidStage);
     }
     if fs::read_dir(staging)?.next().is_some() {
         return Err(MaterializeError::StageNotEmpty);
     }
+    let stage = open_directory_no_follow(staging)?;
     for directory in plan.directories() {
-        let path = checkout_path(staging, directory);
-        fs::create_dir(&path)?;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o755))?;
+        create_directory_at(&stage, directory, 0o755)?;
     }
     for entry in plan.entries() {
-        let path = checkout_path(staging, &entry.path);
         match entry.object.mode {
             TreeEntryMode::Regular | TreeEntryMode::Executable => {
                 let id = source
                     .blob_content_id(&entry.object.oid)
                     .map_err(MaterializeError::Source)?;
-                cache
-                    .clone_blob(id, &path)
-                    .map_err(MaterializeError::Cache)?;
+                clone_blob_at(cache, id, &stage, &entry.path).map_err(MaterializeError::Cache)?;
                 let mode = if entry.object.mode == TreeEntryMode::Executable {
                     0o755
                 } else {
                     0o644
                 };
-                fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+                set_file_mode_at(&stage, &entry.path, mode)?;
             }
             TreeEntryMode::Symlink => {
                 let target = source
@@ -473,23 +468,133 @@ pub fn materialize_raw<S: RawCheckoutSource>(
                 if target.contains(&0) {
                     return Err(MaterializeError::InvalidSymlinkTarget);
                 }
-                std::os::unix::fs::symlink(OsString::from_vec(target), path)?;
+                create_symlink_at(&stage, &entry.path, &target)?;
             }
             TreeEntryMode::Gitlink => match gitlink_policy {
                 GitlinkPolicy::Reject => return Err(MaterializeError::Gitlink(entry.object.oid)),
-                GitlinkPolicy::EmptyDirectory => fs::create_dir(path)?,
+                GitlinkPolicy::EmptyDirectory => create_directory_at(&stage, &entry.path, 0o755)?,
             },
         }
     }
     Ok(())
 }
 
-fn checkout_path(root: &Path, relative: &RelativePath) -> PathBuf {
-    let mut path = root.to_path_buf();
-    for component in relative.components() {
-        path.push(OsString::from_vec(component.as_bytes().to_vec()));
+fn c_name(name: &[u8]) -> io::Result<CString> {
+    CString::new(name)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in validated name"))
+}
+fn open_directory_no_follow(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+}
+fn duplicate_fd(file: &File) -> io::Result<File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let fd = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
     }
-    path
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+fn open_child_directory(parent: &File, name: &[u8]) -> io::Result<File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let name = c_name(name)?;
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+fn parent_directory(stage: &File, relative: &RelativePath) -> io::Result<(File, Vec<u8>)> {
+    let components: Vec<_> = relative.components().collect();
+    let leaf = components
+        .last()
+        .expect("validated nonempty path")
+        .as_bytes()
+        .to_vec();
+    let mut directory = duplicate_fd(stage)?;
+    for component in &components[..components.len() - 1] {
+        directory = open_child_directory(&directory, component.as_bytes())?;
+    }
+    Ok((directory, leaf))
+}
+fn create_directory_at(stage: &File, relative: &RelativePath, mode: u32) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let (parent, name) = parent_directory(stage, relative)?;
+    let name = c_name(&name)?;
+    if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), mode) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+fn create_file_at(stage: &File, relative: &RelativePath, mode: u32) -> io::Result<File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let (parent, name) = parent_directory(stage, relative)?;
+    let name = c_name(&name)?;
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_CREAT | libc::O_EXCL | libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            mode,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+fn set_file_mode_at(stage: &File, relative: &RelativePath, mode: u32) -> io::Result<()> {
+    let file = open_file_at(stage, relative)?;
+    file.set_permissions(fs::Permissions::from_mode(mode))
+}
+fn open_file_at(stage: &File, relative: &RelativePath) -> io::Result<File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let (parent, name) = parent_directory(stage, relative)?;
+    let name = c_name(&name)?;
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+fn create_symlink_at(stage: &File, relative: &RelativePath, target: &[u8]) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let (parent, name) = parent_directory(stage, relative)?;
+    let name = c_name(&name)?;
+    let target = c_name(target)?;
+    if unsafe { libc::symlinkat(target.as_ptr(), parent.as_raw_fd(), name.as_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+fn clone_blob_at(
+    cache: &Cache,
+    id: ContentId,
+    stage: &File,
+    relative: &RelativePath,
+) -> Result<(), CacheError> {
+    use std::os::fd::AsRawFd;
+    let source = File::open(cache.verified_path(id)?)?;
+    let destination = create_file_at(stage, relative, 0o644)?;
+    if unsafe { libc::ioctl(destination.as_raw_fd(), FICLONE, source.as_raw_fd()) } != 0 {
+        return Err(CacheError::Io(io::Error::last_os_error()));
+    }
+    Ok(())
 }
 
 /// A workspace directory name. It is intentionally narrower than an arbitrary
@@ -756,6 +861,32 @@ mod tests {
                 "{input:?}"
             );
         }
+    }
+
+    #[test]
+    fn fd_relative_construction_rejects_symlinked_parent_and_cannot_escape() {
+        use std::os::unix::fs::symlink;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let base = std::env::temp_dir().join(format!(
+            "rfs-checkout-fd-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let staging = base.join("staging");
+        let outside = base.join("outside");
+        fs::create_dir_all(&staging).unwrap();
+        fs::create_dir(&outside).unwrap();
+        let stage = open_directory_no_follow(&staging).unwrap();
+        let directory = RelativePath::parse(b"safe", DEFAULT_CHECKOUT_LIMITS).unwrap();
+        create_directory_at(&stage, &directory, 0o755).unwrap();
+        fs::remove_dir(staging.join("safe")).unwrap();
+        symlink(&outside, staging.join("safe")).unwrap();
+        let hostile = RelativePath::parse(b"safe/escape", DEFAULT_CHECKOUT_LIMITS).unwrap();
+        assert!(create_file_at(&stage, &hostile, 0o644).is_err());
+        assert!(!outside.join("escape").exists());
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

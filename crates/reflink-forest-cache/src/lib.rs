@@ -5,11 +5,20 @@
 //! cold store; it only receives already-verified blob bytes.
 
 use std::{
+    collections::HashMap,
+    ffi::{CString, OsStr},
     fs::{self, File, OpenOptions},
-    io::{self, Write},
-    os::{fd::AsRawFd, unix::fs::PermissionsExt},
+    io::{self, Read, Write},
+    os::{
+        fd::AsRawFd,
+        unix::{
+            ffi::OsStrExt,
+            fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
+        },
+    },
     path::{Path, PathBuf},
     process,
+    sync::{Arc, Condvar, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -27,19 +36,23 @@ unsafe extern "C" {
 #[derive(Debug)]
 pub enum CacheError {
     Io(io::Error),
+    AccountingOverflow,
     ContentMismatch {
         expected: ContentId,
         actual: ContentId,
     },
+    UnsafeEntry(ContentId),
     NotCached(ContentId),
 }
 impl std::fmt::Display for CacheError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(error) => write!(f, "cache I/O error: {error}"),
+            Self::AccountingOverflow => write!(f, "cache byte accounting overflowed u64"),
             Self::ContentMismatch { .. } => {
                 write!(f, "cache payload does not match its content ID")
             }
+            Self::UnsafeEntry(_) => write!(f, "cache entry is not a regular file"),
             Self::NotCached(_) => write!(f, "cache entry is missing"),
         }
     }
@@ -51,9 +64,209 @@ impl From<io::Error> for CacheError {
     }
 }
 
+/// One canonical, regular cache leaf discovered beneath the two-level fanout.
+///
+/// `logical_bytes` is the file's logical length. Btrfs sharing and compression
+/// make physical reclamation filesystem-dependent, so callers should remeasure
+/// free space after eviction rather than treating this value as allocated bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CacheEntry {
+    pub content_id: ContentId,
+    pub logical_bytes: u64,
+}
+
+/// Logical-byte accounting for canonical regular leaves in the cache fanout.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CacheUsage {
+    pub entries: u64,
+    pub logical_bytes: u64,
+    /// Entries ignored because they are malformed, non-regular, symlinks, or
+    /// disappeared while the scan was in progress.
+    pub skipped: u64,
+}
+
+/// Result of a deterministic cache eviction pass.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CacheEviction {
+    pub target_logical_bytes: u64,
+    pub before: CacheUsage,
+    pub after: CacheUsage,
+    pub evicted_entries: u64,
+    pub evicted_logical_bytes: u64,
+    /// Candidates that changed into an unsafe/missing entry before deletion.
+    pub skipped_entries: u64,
+}
+
+impl CacheEviction {
+    /// Whether the post-eviction logical cache usage is at or below the target.
+    pub const fn target_reached(self) -> bool {
+        self.after.logical_bytes <= self.target_logical_bytes
+    }
+}
+
+/// Per-domain free-space floors enforced before allocating more derived data.
+///
+/// The same projected allocation is checked against both domains. This is
+/// conservative for a sparse Btrfs image, where guest allocation can consume
+/// host capacity as well as guest free capacity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReservePolicy {
+    pub host_reserve_bytes: u64,
+    pub guest_reserve_bytes: u64,
+}
+
+impl ReservePolicy {
+    pub const fn new(host_reserve_bytes: u64, guest_reserve_bytes: u64) -> Self {
+        Self {
+            host_reserve_bytes,
+            guest_reserve_bytes,
+        }
+    }
+
+    /// Admits an allocation only if both host and guest retain their required
+    /// reserve after the caller's projected allocation.
+    pub fn admit(
+        self,
+        host_available_bytes: u64,
+        guest_available_bytes: u64,
+        projected_allocation_bytes: u64,
+    ) -> Result<(), AdmissionError> {
+        let host = ReserveViolation::new(
+            host_available_bytes,
+            projected_allocation_bytes,
+            self.host_reserve_bytes,
+        );
+        let guest = ReserveViolation::new(
+            guest_available_bytes,
+            projected_allocation_bytes,
+            self.guest_reserve_bytes,
+        );
+        match (host, guest) {
+            (None, None) => Ok(()),
+            (Some(host), None) => Err(AdmissionError::HostReserve(host)),
+            (None, Some(guest)) => Err(AdmissionError::GuestReserve(guest)),
+            (Some(host), Some(guest)) => Err(AdmissionError::HostAndGuestReserve { host, guest }),
+        }
+    }
+}
+
+/// Exact shortfall for a capacity domain after an attempted allocation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReserveViolation {
+    pub available_bytes: u64,
+    pub projected_allocation_bytes: u64,
+    pub reserve_bytes: u64,
+    pub available_after_allocation_bytes: u64,
+    pub shortfall_bytes: u64,
+}
+
+impl ReserveViolation {
+    fn new(
+        available_bytes: u64,
+        projected_allocation_bytes: u64,
+        reserve_bytes: u64,
+    ) -> Option<Self> {
+        let available_after_allocation_bytes =
+            available_bytes.saturating_sub(projected_allocation_bytes);
+        if available_after_allocation_bytes >= reserve_bytes {
+            return None;
+        }
+        Some(Self {
+            available_bytes,
+            projected_allocation_bytes,
+            reserve_bytes,
+            available_after_allocation_bytes,
+            shortfall_bytes: reserve_bytes - available_after_allocation_bytes,
+        })
+    }
+}
+
+/// Precise reason an allocation was rejected by [`ReservePolicy`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdmissionError {
+    HostReserve(ReserveViolation),
+    GuestReserve(ReserveViolation),
+    HostAndGuestReserve {
+        host: ReserveViolation,
+        guest: ReserveViolation,
+    },
+}
+
+impl std::fmt::Display for AdmissionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::HostReserve(violation) => write!(
+                f,
+                "host reserve would be short by {} bytes after allocating {} bytes",
+                violation.shortfall_bytes, violation.projected_allocation_bytes
+            ),
+            Self::GuestReserve(violation) => write!(
+                f,
+                "guest reserve would be short by {} bytes after allocating {} bytes",
+                violation.shortfall_bytes, violation.projected_allocation_bytes
+            ),
+            Self::HostAndGuestReserve { host, guest } => write!(
+                f,
+                "host and guest reserves would be short by {} and {} bytes after allocation",
+                host.shortfall_bytes, guest.shortfall_bytes
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AdmissionError {}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CacheReconciliation {
+    /// Valid, content-addressed blobs retained in the cache.
+    pub retained: u64,
+    /// Invalid leaf entries moved to the cache-local quarantine directory.
+    pub quarantined: u64,
+    /// Paths deliberately ignored because they are outside the cache fanout
+    /// layout, or disappeared while the scan was running.
+    pub skipped: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct Cache {
     root: PathBuf,
+    state: Arc<CacheState>,
+}
+
+#[derive(Debug)]
+struct CacheState {
+    /// A small, fixed lock stripe set serializes publication and invalid-entry
+    /// recovery for the same content ID without retaining one mutex per blob.
+    entry_locks: Vec<Mutex<()>>,
+    hydrations: Mutex<HashMap<ContentId, Arc<HydrationFlight>>>,
+}
+
+#[derive(Debug)]
+struct HydrationFlight {
+    completed: Mutex<bool>,
+    completed_wakeup: Condvar,
+}
+
+impl CacheState {
+    const ENTRY_LOCK_STRIPES: usize = 64;
+
+    fn new() -> Self {
+        Self {
+            entry_locks: (0..Self::ENTRY_LOCK_STRIPES)
+                .map(|_| Mutex::new(()))
+                .collect(),
+            hydrations: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl HydrationFlight {
+    fn new() -> Self {
+        Self {
+            completed: Mutex::new(false),
+            completed_wakeup: Condvar::new(),
+        }
+    }
 }
 
 impl Cache {
@@ -63,7 +276,10 @@ impl Cache {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(&root)?;
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            state: Arc::new(CacheState::new()),
+        })
     }
 
     pub fn path_for(&self, id: ContentId) -> PathBuf {
@@ -74,13 +290,7 @@ impl Cache {
     /// Returns an entry only after recomputing its blob content ID.
     pub fn verified_path(&self, id: ContentId) -> Result<PathBuf, CacheError> {
         let path = self.path_for(id);
-        let bytes = fs::read(&path).map_err(|error| {
-            if error.kind() == io::ErrorKind::NotFound {
-                CacheError::NotCached(id)
-            } else {
-                CacheError::Io(error)
-            }
-        })?;
+        let bytes = self.read_entry(&path, id)?;
         let actual = ContentId::for_object(ObjectKind::Blob, &bytes);
         if actual != id {
             return Err(CacheError::ContentMismatch {
@@ -94,22 +304,39 @@ impl Cache {
     /// Removes a cache file only when it fails the cache's content-ID check.
     ///
     /// This is the recovery operation used by cold hydration after an
-    /// interrupted or corrupt prior publication.  A concurrently repaired
-    /// entry is retained: the content is checked again immediately before any
-    /// removal.
+    /// interrupted or corrupt prior publication. A candidate is first moved
+    /// to a private quarantine name. If it became valid before that move, it
+    /// is restored without overwriting a concurrently repaired entry.
     pub fn discard_invalid_blob(&self, id: ContentId) -> Result<bool, CacheError> {
+        let lock = self.entry_lock(id);
+        let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.discard_invalid_blob_locked(id)
+    }
+
+    fn discard_invalid_blob_locked(&self, id: ContentId) -> Result<bool, CacheError> {
         let path = self.path_for(id);
-        let bytes = match fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(CacheError::Io(error)),
+        match self.entry_status(&path, id)? {
+            EntryStatus::Missing | EntryStatus::Valid => return Ok(false),
+            EntryStatus::Invalid => {}
+        }
+
+        let Some(quarantined) = self.move_to_quarantine(&path)? else {
+            return Ok(false);
         };
-        if ContentId::for_object(ObjectKind::Blob, &bytes) == id {
+
+        // The name can have changed between inspection and the atomic rename.
+        // Never destroy a valid entry that a concurrent repair put in place.
+        if self.entry_status(&quarantined, id)? == EntryStatus::Valid {
+            self.restore_quarantined(&quarantined, &path)?;
             return Ok(false);
         }
-        fs::remove_file(&path)?;
-        let parent = path.parent().expect("cache filename has parent");
-        File::open(parent)?.sync_all()?;
+
+        fs::remove_file(&quarantined)?;
+        self.sync_directory(
+            quarantined
+                .parent()
+                .expect("cache quarantine filename has parent"),
+        )?;
         Ok(true)
     }
 
@@ -124,6 +351,12 @@ impl Cache {
                 actual,
             });
         }
+        let lock = self.entry_lock(id);
+        let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.publish_blob_locked(id, bytes)
+    }
+
+    fn publish_blob_locked(&self, id: ContentId, bytes: &[u8]) -> Result<PathBuf, CacheError> {
         let destination = self.path_for(id);
         if destination.exists() {
             return self.verified_path(id);
@@ -160,6 +393,486 @@ impl Cache {
         self.verified_path(id)
     }
 
+    /// Revalidates all regular cache leaves and moves invalid leaves to
+    /// `.quarantine` below the cache root. Fanout directory symlinks are
+    /// quarantined as entries and are never descended into.
+    pub fn reconcile(&self) -> Result<CacheReconciliation, CacheError> {
+        let mut report = CacheReconciliation::default();
+        for first in fs::read_dir(&self.root)? {
+            let first = first?;
+            let first_name = first.file_name();
+            if first_name.as_bytes() == b".quarantine" || !is_hex_name(&first_name, 2) {
+                report.skipped += 1;
+                continue;
+            }
+            let first_path = first.path();
+            if !is_real_directory(&first_path)? {
+                self.quarantine_untrusted(&first_path, &mut report)?;
+                continue;
+            }
+
+            for second in fs::read_dir(&first_path)? {
+                let second = second?;
+                let second_name = second.file_name();
+                if !is_hex_name(&second_name, 2) {
+                    report.skipped += 1;
+                    continue;
+                }
+                let second_path = second.path();
+                if !is_real_directory(&second_path)? {
+                    self.quarantine_untrusted(&second_path, &mut report)?;
+                    continue;
+                }
+
+                for leaf in fs::read_dir(&second_path)? {
+                    let leaf = leaf?;
+                    self.reconcile_leaf(&leaf.path(), &leaf.file_name(), &mut report)?;
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    /// Lists canonical regular leaves in deterministic ContentId-byte order.
+    ///
+    /// The scanner opens every fanout directory with `O_NOFOLLOW` and only
+    /// accounts for a leaf after opening it with `O_NOFOLLOW` as a regular
+    /// file. Symlinks, malformed paths, and concurrently removed entries are
+    /// skipped rather than traversed.
+    pub fn fanout_entries(&self) -> Result<Vec<CacheEntry>, CacheError> {
+        Ok(self.scan_fanout()?.entries)
+    }
+
+    /// Returns logical-byte accounting for safe canonical cache leaves.
+    pub fn usage(&self) -> Result<CacheUsage, CacheError> {
+        Ok(self.scan_fanout()?.usage)
+    }
+
+    /// Evicts canonical regular leaves in deterministic ContentId-byte order
+    /// until logical cache usage is at or below `target_logical_bytes`.
+    ///
+    /// Every unlink is relative to an already-open fanout directory and is
+    /// followed by a directory sync. The result reports a target miss rather
+    /// than guessing if concurrent publication or Btrfs sharing prevents the
+    /// caller from reclaiming the expected space.
+    pub fn evict_to(&self, target_logical_bytes: u64) -> Result<CacheEviction, CacheError> {
+        let scan = self.scan_fanout()?;
+        let before = scan.usage;
+        let mut remaining_logical_bytes = before.logical_bytes;
+        let mut evicted_entries = 0_u64;
+        let mut evicted_logical_bytes = 0_u64;
+        let mut skipped_entries = 0_u64;
+
+        for entry in scan.entries {
+            if remaining_logical_bytes <= target_logical_bytes {
+                break;
+            }
+            match self.evict_entry(entry.content_id)? {
+                Some(logical_bytes) => {
+                    remaining_logical_bytes = remaining_logical_bytes.saturating_sub(logical_bytes);
+                    evicted_entries = evicted_entries
+                        .checked_add(1)
+                        .ok_or(CacheError::AccountingOverflow)?;
+                    evicted_logical_bytes = evicted_logical_bytes
+                        .checked_add(logical_bytes)
+                        .ok_or(CacheError::AccountingOverflow)?;
+                }
+                None => {
+                    skipped_entries = skipped_entries
+                        .checked_add(1)
+                        .ok_or(CacheError::AccountingOverflow)?;
+                }
+            }
+        }
+
+        let after = self.usage()?;
+        Ok(CacheEviction {
+            target_logical_bytes,
+            before,
+            after,
+            evicted_entries,
+            evicted_logical_bytes,
+            skipped_entries,
+        })
+    }
+
+    /// Converts a caller-measured free-space deficit into a logical cache
+    /// target and evicts toward it. Because Btrfs extent sharing and
+    /// compression can make physical reclamation smaller than the deleted
+    /// logical length, callers must remeasure available bytes before admitting
+    /// the next allocation.
+    pub fn evict_for_reserve(
+        &self,
+        available_bytes: u64,
+        reserve_bytes: u64,
+    ) -> Result<CacheEviction, CacheError> {
+        let usage = self.usage()?;
+        let required_reclaim = reserve_bytes.saturating_sub(available_bytes);
+        self.evict_to(usage.logical_bytes.saturating_sub(required_reclaim))
+    }
+
+    fn scan_fanout(&self) -> Result<FanoutScan, CacheError> {
+        let root = open_directory_no_follow(&self.root)?;
+        let root_path = directory_fd_path(&root);
+        let mut scan = FanoutScan::default();
+
+        for first in fs::read_dir(&root_path)? {
+            let first = match first {
+                Ok(first) => first,
+                Err(error) if is_missing_or_unsafe(&error) => {
+                    scan.skip()?;
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let first_name = first.file_name();
+            if first_name.as_bytes() == b".quarantine" {
+                continue;
+            }
+            if !is_hex_name(&first_name, 2) {
+                scan.skip()?;
+                continue;
+            }
+            let first_directory = match open_directory_no_follow(&root_path.join(&first_name)) {
+                Ok(directory) => directory,
+                Err(error) if is_missing_or_unsafe(&error) => {
+                    scan.skip()?;
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            self.scan_second_fanout(&first_name, &first_directory, &mut scan)?;
+        }
+
+        scan.entries.sort_unstable_by(|left, right| {
+            left.content_id.as_bytes().cmp(right.content_id.as_bytes())
+        });
+        Ok(scan)
+    }
+
+    fn scan_second_fanout(
+        &self,
+        first_name: &OsStr,
+        first_directory: &File,
+        scan: &mut FanoutScan,
+    ) -> Result<(), CacheError> {
+        let first_path = directory_fd_path(first_directory);
+        for second in fs::read_dir(&first_path)? {
+            let second = match second {
+                Ok(second) => second,
+                Err(error) if is_missing_or_unsafe(&error) => {
+                    scan.skip()?;
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let second_name = second.file_name();
+            if !is_hex_name(&second_name, 2) {
+                scan.skip()?;
+                continue;
+            }
+            let second_directory = match open_directory_no_follow(&first_path.join(&second_name)) {
+                Ok(directory) => directory,
+                Err(error) if is_missing_or_unsafe(&error) => {
+                    scan.skip()?;
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            self.scan_fanout_leaves(first_name, &second_name, &second_directory, scan)?;
+        }
+        Ok(())
+    }
+
+    fn scan_fanout_leaves(
+        &self,
+        first_name: &OsStr,
+        second_name: &OsStr,
+        second_directory: &File,
+        scan: &mut FanoutScan,
+    ) -> Result<(), CacheError> {
+        let second_path = directory_fd_path(second_directory);
+        for leaf in fs::read_dir(&second_path)? {
+            let leaf = match leaf {
+                Ok(leaf) => leaf,
+                Err(error) if is_missing_or_unsafe(&error) => {
+                    scan.skip()?;
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let leaf_name = leaf.file_name();
+            let Some(content_id) = content_id_from_hex_name(&leaf_name) else {
+                scan.skip()?;
+                continue;
+            };
+            let encoded = hex(content_id.as_bytes());
+            if first_name.as_bytes() != &encoded.as_bytes()[..2]
+                || second_name.as_bytes() != &encoded.as_bytes()[2..4]
+                || leaf_name.as_bytes() != encoded.as_bytes()
+            {
+                scan.skip()?;
+                continue;
+            }
+            let logical_bytes = match regular_file_size_no_follow(&second_path.join(&leaf_name)) {
+                Ok(bytes) => bytes,
+                Err(error) if is_missing_or_unsafe(&error) => {
+                    scan.skip()?;
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            scan.push(CacheEntry {
+                content_id,
+                logical_bytes,
+            })?;
+        }
+        Ok(())
+    }
+
+    fn evict_entry(&self, id: ContentId) -> Result<Option<u64>, CacheError> {
+        let lock = self.entry_lock(id);
+        let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let parent = match self.open_fanout_parent_no_follow(id) {
+            Ok(parent) => parent,
+            Err(error) if is_missing_or_unsafe(&error) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let name = hex(id.as_bytes());
+        let leaf = directory_fd_path(&parent).join(&name);
+        let logical_bytes = match regular_file_size_no_follow(&leaf) {
+            Ok(logical_bytes) => logical_bytes,
+            Err(error) if is_missing_or_unsafe(&error) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        match unlink_file_at(&parent, &name) {
+            Ok(()) => {
+                parent.sync_all()?;
+                Ok(Some(logical_bytes))
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn open_fanout_parent_no_follow(&self, id: ContentId) -> io::Result<File> {
+        let encoded = hex(id.as_bytes());
+        let root = open_directory_no_follow(&self.root)?;
+        let first = open_directory_no_follow(&directory_fd_path(&root).join(&encoded[..2]))?;
+        open_directory_no_follow(&directory_fd_path(&first).join(&encoded[2..4]))
+    }
+
+    fn reconcile_leaf(
+        &self,
+        path: &Path,
+        leaf: &OsStr,
+        report: &mut CacheReconciliation,
+    ) -> Result<(), CacheError> {
+        let Some(id) = content_id_from_hex_name(leaf) else {
+            return self.quarantine_untrusted(path, report);
+        };
+        let expected = self.path_for(id);
+        if expected != path {
+            return self.quarantine_untrusted(path, report);
+        }
+
+        let lock = self.entry_lock(id);
+        let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        match self.entry_status(path, id)? {
+            EntryStatus::Valid => report.retained += 1,
+            EntryStatus::Missing => report.skipped += 1,
+            EntryStatus::Invalid => self.quarantine_untrusted(path, report)?,
+        }
+        Ok(())
+    }
+
+    fn quarantine_untrusted(
+        &self,
+        path: &Path,
+        report: &mut CacheReconciliation,
+    ) -> Result<(), CacheError> {
+        if self.move_to_quarantine(path)?.is_some() {
+            report.quarantined += 1;
+        } else {
+            report.skipped += 1;
+        }
+        Ok(())
+    }
+
+    fn read_entry(&self, path: &Path, id: ContentId) -> Result<Vec<u8>, CacheError> {
+        match read_regular_file_no_follow(path) {
+            Ok(bytes) => Ok(bytes),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Err(CacheError::NotCached(id)),
+            Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                Err(CacheError::UnsafeEntry(id))
+            }
+            Err(error) => Err(CacheError::Io(error)),
+        }
+    }
+
+    fn entry_status(&self, path: &Path, id: ContentId) -> Result<EntryStatus, CacheError> {
+        match self.read_entry(path, id) {
+            Ok(bytes) if ContentId::for_object(ObjectKind::Blob, &bytes) == id => {
+                Ok(EntryStatus::Valid)
+            }
+            Ok(_) | Err(CacheError::UnsafeEntry(_)) | Err(CacheError::ContentMismatch { .. }) => {
+                Ok(EntryStatus::Invalid)
+            }
+            Err(CacheError::NotCached(_)) => Ok(EntryStatus::Missing),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn entry_lock(&self, id: ContentId) -> &Mutex<()> {
+        let stripe = usize::from(id.as_bytes()[0]) % self.state.entry_locks.len();
+        &self.state.entry_locks[stripe]
+    }
+
+    fn move_to_quarantine(&self, path: &Path) -> Result<Option<PathBuf>, CacheError> {
+        let quarantine = self.quarantine_directory()?;
+        let leaf = path
+            .file_name()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "cache path has no name"))?;
+        let name = format!("{}.{}.{}", hex(leaf.as_bytes()), process::id(), nonce());
+        let destination = quarantine.join(name);
+        match fs::rename(path, &destination) {
+            Ok(()) => {
+                self.sync_directory(path.parent().expect("cache path has parent"))?;
+                self.sync_directory(&quarantine)?;
+                Ok(Some(destination))
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(CacheError::Io(error)),
+        }
+    }
+
+    fn restore_quarantined(
+        &self,
+        quarantined: &Path,
+        destination: &Path,
+    ) -> Result<(), CacheError> {
+        match fs::hard_link(quarantined, destination) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(CacheError::Io(error)),
+        }
+        fs::remove_file(quarantined)?;
+        self.sync_directory(destination.parent().expect("cache path has parent"))?;
+        self.sync_directory(
+            quarantined
+                .parent()
+                .expect("cache quarantine filename has parent"),
+        )?;
+        Ok(())
+    }
+
+    fn quarantine_directory(&self) -> Result<PathBuf, CacheError> {
+        let directory = self.root.join(".quarantine");
+        match fs::symlink_metadata(&directory) {
+            Ok(metadata) if metadata.file_type().is_dir() => return Ok(directory),
+            Ok(_) => {
+                return Err(CacheError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "cache quarantine path is not a directory",
+                )));
+            }
+            Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error.into()),
+            Err(_) => {}
+        }
+
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700);
+        match builder.create(&directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+        if !is_real_directory(&directory)? {
+            return Err(CacheError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cache quarantine path is not a directory",
+            )));
+        }
+        Ok(directory)
+    }
+
+    fn sync_directory(&self, path: &Path) -> Result<(), CacheError> {
+        File::open(path)?.sync_all()?;
+        Ok(())
+    }
+
+    fn singleflight_hydrate<F>(&self, id: ContentId, hydrate: F) -> Result<PathBuf, HydrationError>
+    where
+        F: FnOnce() -> Result<PathBuf, HydrationError>,
+    {
+        let mut hydrate = Some(hydrate);
+        loop {
+            match self.verified_path(id) {
+                Ok(path) => return Ok(path),
+                Err(
+                    CacheError::NotCached(_)
+                    | CacheError::ContentMismatch { .. }
+                    | CacheError::UnsafeEntry(_),
+                ) => {}
+                Err(error) => return Err(error.into()),
+            }
+
+            let (flight, leader) = {
+                let mut active = self
+                    .state
+                    .hydrations
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                match active.get(&id) {
+                    Some(flight) => (Arc::clone(flight), false),
+                    None => {
+                        let flight = Arc::new(HydrationFlight::new());
+                        active.insert(id, Arc::clone(&flight));
+                        (flight, true)
+                    }
+                }
+            };
+
+            if leader {
+                let result = hydrate
+                    .take()
+                    .expect("a singleflight leader owns exactly one hydration closure")(
+                );
+                {
+                    let mut completed = flight
+                        .completed
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    *completed = true;
+                    flight.completed_wakeup.notify_all();
+                }
+                let mut active = self
+                    .state
+                    .hydrations
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if active
+                    .get(&id)
+                    .is_some_and(|current| Arc::ptr_eq(current, &flight))
+                {
+                    active.remove(&id);
+                }
+                return result;
+            }
+
+            let mut completed = flight
+                .completed
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            while !*completed {
+                completed = flight
+                    .completed_wakeup
+                    .wait(completed)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+        }
+    }
+
     /// Creates a Btrfs reflink at `destination`. It never falls back to a
     /// payload copy: that policy decision belongs to checkout orchestration.
     pub fn clone_blob(
@@ -180,6 +893,171 @@ impl Cache {
             return Err(CacheError::Io(io::Error::last_os_error()));
         }
         Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EntryStatus {
+    Missing,
+    Valid,
+    Invalid,
+}
+
+#[derive(Default)]
+struct FanoutScan {
+    entries: Vec<CacheEntry>,
+    usage: CacheUsage,
+}
+
+impl FanoutScan {
+    fn push(&mut self, entry: CacheEntry) -> Result<(), CacheError> {
+        self.usage.entries = self
+            .usage
+            .entries
+            .checked_add(1)
+            .ok_or(CacheError::AccountingOverflow)?;
+        self.usage.logical_bytes = self
+            .usage
+            .logical_bytes
+            .checked_add(entry.logical_bytes)
+            .ok_or(CacheError::AccountingOverflow)?;
+        self.entries.push(entry);
+        Ok(())
+    }
+
+    fn skip(&mut self) -> Result<(), CacheError> {
+        self.usage.skipped = self
+            .usage
+            .skipped
+            .checked_add(1)
+            .ok_or(CacheError::AccountingOverflow)?;
+        Ok(())
+    }
+}
+
+/// Opens a directory without following a symlink in its final component.
+///
+/// The caller derives descendants from `/proc/self/fd/<fd>`, keeping the
+/// already-checked directory descriptor as the parent during fanout traversal.
+fn open_directory_no_follow(path: &Path) -> io::Result<File> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "cache fanout component is not a directory",
+        ));
+    }
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    if !directory.metadata()?.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "cache fanout directory changed while opening",
+        ));
+    }
+    Ok(directory)
+}
+
+/// Returns a path that resolves through a retained directory descriptor, not
+/// through a mutable fanout ancestor. Reflink Forest's Btrfs deployment is
+/// Linux-only, where procfs provides these stable descriptor paths.
+fn directory_fd_path(directory: &File) -> PathBuf {
+    PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()))
+}
+
+fn regular_file_size_no_follow(path: &Path) -> io::Result<u64> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "cache entry is not a regular file",
+        ));
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "cache entry changed while opening",
+        ));
+    }
+    Ok(metadata.len())
+}
+
+fn unlink_file_at(parent: &File, name: &str) -> io::Result<()> {
+    let name = CString::new(name).expect("canonical content ID name contains no NUL");
+    // SAFETY: `parent` is an open directory descriptor and `name` is a
+    // NUL-terminated canonical hexadecimal filename with no path separator.
+    let result = unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+fn is_missing_or_unsafe(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory | io::ErrorKind::InvalidData
+    ) || error.raw_os_error() == Some(libc::ELOOP)
+}
+
+fn read_regular_file_no_follow(path: &Path) -> io::Result<Vec<u8>> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "cache entry is not a regular file",
+        ));
+    }
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "cache entry changed while opening",
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn is_real_directory(path: &Path) -> Result<bool, CacheError> {
+    Ok(fs::symlink_metadata(path)?.file_type().is_dir())
+}
+
+fn is_hex_name(name: &OsStr, expected_len: usize) -> bool {
+    let bytes = name.as_bytes();
+    bytes.len() == expected_len && bytes.iter().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn content_id_from_hex_name(name: &OsStr) -> Option<ContentId> {
+    let bytes = name.as_bytes();
+    if bytes.len() != 64 || !bytes.iter().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut output = [0_u8; 32];
+    for (index, pair) in bytes.chunks_exact(2).enumerate() {
+        output[index] = (hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?;
+    }
+    Some(ContentId(output))
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -248,10 +1126,22 @@ pub fn hydrate_raw_blob_from_chunk<C: Catalog>(
     id: ContentId,
     chunk_path: impl AsRef<Path>,
 ) -> Result<PathBuf, HydrationError> {
+    let chunk_path = chunk_path.as_ref().to_path_buf();
+    cache.singleflight_hydrate(id, || {
+        hydrate_raw_blob_from_chunk_inner(cache, catalog, id, &chunk_path)
+    })
+}
+
+fn hydrate_raw_blob_from_chunk_inner<C: Catalog>(
+    cache: &Cache,
+    catalog: &C,
+    id: ContentId,
+    chunk_path: &Path,
+) -> Result<PathBuf, HydrationError> {
     match cache.verified_path(id) {
         Ok(path) => return Ok(path),
         Err(CacheError::NotCached(_)) => {}
-        Err(CacheError::ContentMismatch { .. }) => {
+        Err(CacheError::ContentMismatch { .. } | CacheError::UnsafeEntry(_)) => {
             cache.discard_invalid_blob(id)?;
         }
         Err(error) => return Err(error.into()),
@@ -293,7 +1183,7 @@ pub fn hydrate_raw_blob_from_chunk<C: Catalog>(
     // `publish_blob` returns that verified entry instead.
     match cache.publish_blob(id, &record.payload) {
         Ok(path) => Ok(path),
-        Err(CacheError::ContentMismatch { .. }) => {
+        Err(CacheError::ContentMismatch { .. } | CacheError::UnsafeEntry(_)) => {
             cache.discard_invalid_blob(id)?;
             cache.publish_blob(id, &record.payload).map_err(Into::into)
         }
@@ -332,12 +1222,19 @@ mod tests {
     use super::*;
     use reflink_forest_core::{GitOid, HashAlgorithm};
     use reflink_forest_format::{ChunkHeader, ObjectRecord, RECORD_HEADER_LEN};
-    use reflink_forest_index::{Catalog, CatalogBatch, InMemoryCatalog};
+    use reflink_forest_index::{
+        Catalog, CatalogBatch, CatalogError, ChunkMetadata, InMemoryCatalog, RepoId, WorkspaceId,
+    };
     use reflink_forest_store::{ChunkWriter, RecordLocation};
     use std::{
         io::{Seek, SeekFrom},
-        sync::Arc,
+        os::unix::fs::symlink,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Barrier,
+        },
         thread,
+        time::Duration,
     };
 
     fn directory() -> PathBuf {
@@ -351,6 +1248,59 @@ mod tests {
         catalog: InMemoryCatalog,
         id: ContentId,
         location: ObjectLocation,
+    }
+
+    struct CountingCatalog {
+        inner: InMemoryCatalog,
+        location_reads: AtomicUsize,
+    }
+
+    impl CountingCatalog {
+        fn new(inner: InMemoryCatalog) -> Self {
+            Self {
+                inner,
+                location_reads: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl Catalog for CountingCatalog {
+        fn apply(&mut self, batch: CatalogBatch) -> Result<(), CatalogError> {
+            self.inner.apply(batch)
+        }
+
+        fn object_location(&self, id: ContentId) -> Option<ObjectLocation> {
+            self.location_reads.fetch_add(1, Ordering::SeqCst);
+            self.inner.object_location(id)
+        }
+
+        fn oid_alias(&self, repo: RepoId, oid: &GitOid) -> Option<ContentId> {
+            self.inner.oid_alias(repo, oid)
+        }
+
+        fn chunk(&self, generation: u32, chunk_id: u64) -> Option<ChunkMetadata> {
+            self.inner.chunk(generation, chunk_id)
+        }
+
+        fn meta(&self, key: &[u8]) -> Option<Vec<u8>> {
+            self.inner.meta(key)
+        }
+
+        fn workspace(&self, id: WorkspaceId) -> Option<Vec<u8>> {
+            self.inner.workspace(id)
+        }
+
+        fn workspace_name(&self, name: &[u8]) -> Option<WorkspaceId> {
+            self.inner.workspace_name(name)
+        }
+
+        fn workspace_pin(&self, id: WorkspaceId) -> Option<u32> {
+            self.inner.workspace_pin(id)
+        }
+
+        fn job(&self, job_id: &[u8]) -> Option<Vec<u8>> {
+            self.inner.job(job_id)
+        }
     }
 
     fn cold_blob_fixture(payload: &[u8]) -> ColdBlobFixture {
@@ -437,6 +1387,130 @@ mod tests {
         ));
         assert!(!cache.path_for(id).exists());
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn fanout_accounting_and_eviction_use_stable_content_id_order() {
+        let directory = directory();
+        let cache = Cache::open(&directory).unwrap();
+        let payloads: [&[u8]; 3] = [b"seven!!", b"three", b"twelve bytes"];
+        let mut ids = Vec::new();
+        for payload in payloads {
+            let id = ContentId::for_object(ObjectKind::Blob, payload);
+            cache.publish_blob(id, payload).unwrap();
+            ids.push(id);
+        }
+
+        let entries = cache.fanout_entries().unwrap();
+        assert_eq!(entries.len(), 3);
+        assert!(entries
+            .windows(2)
+            .all(|pair| { pair[0].content_id.as_bytes() < pair[1].content_id.as_bytes() }));
+        let usage = cache.usage().unwrap();
+        assert_eq!(usage.entries, 3);
+        assert_eq!(usage.skipped, 0);
+        assert_eq!(
+            usage.logical_bytes,
+            payloads.iter().map(|payload| payload.len() as u64).sum()
+        );
+
+        let first = entries[0];
+        let report = cache
+            .evict_to(usage.logical_bytes - first.logical_bytes)
+            .unwrap();
+        assert_eq!(report.before, usage);
+        assert_eq!(report.evicted_entries, 1);
+        assert_eq!(report.evicted_logical_bytes, first.logical_bytes);
+        assert!(report.target_reached());
+        assert!(matches!(
+            cache.verified_path(first.content_id),
+            Err(CacheError::NotCached(_))
+        ));
+        for id in ids.into_iter().filter(|id| *id != first.content_id) {
+            assert!(cache.verified_path(id).is_ok());
+        }
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn fanout_scan_never_follows_leaf_or_directory_symlinks() {
+        let directory = directory();
+        let cache = Cache::open(&directory).unwrap();
+
+        let outside_file = directory.join("outside-file");
+        let outside_bytes = b"outside cache";
+        fs::write(&outside_file, outside_bytes).unwrap();
+        let symlink_id = ContentId::for_object(ObjectKind::Blob, outside_bytes);
+        let symlink_path = cache.path_for(symlink_id);
+        fs::create_dir_all(symlink_path.parent().unwrap()).unwrap();
+        symlink(&outside_file, &symlink_path).unwrap();
+
+        let outside_directory = directory.join("outside-directory");
+        fs::create_dir(&outside_directory).unwrap();
+        fs::write(outside_directory.join("unrelated"), b"must not scan").unwrap();
+        symlink(&outside_directory, cache.root.join("aa")).unwrap();
+
+        let usage = cache.usage().unwrap();
+        assert_eq!(usage.entries, 0);
+        assert_eq!(usage.logical_bytes, 0);
+        assert!(usage.skipped >= 2);
+        assert!(cache.fanout_entries().unwrap().is_empty());
+        assert_eq!(fs::read(&outside_file).unwrap(), outside_bytes);
+        assert_eq!(
+            fs::read(outside_directory.join("unrelated")).unwrap(),
+            b"must not scan"
+        );
+        assert!(fs::symlink_metadata(&symlink_path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn reserve_policy_reports_exact_host_and_guest_shortfalls() {
+        let policy = ReservePolicy::new(100, 80);
+        assert_eq!(policy.admit(180, 160, 60), Ok(()));
+
+        assert_eq!(
+            policy.admit(150, 200, 60),
+            Err(AdmissionError::HostReserve(ReserveViolation {
+                available_bytes: 150,
+                projected_allocation_bytes: 60,
+                reserve_bytes: 100,
+                available_after_allocation_bytes: 90,
+                shortfall_bytes: 10,
+            }))
+        );
+        assert_eq!(
+            policy.admit(200, 120, 60),
+            Err(AdmissionError::GuestReserve(ReserveViolation {
+                available_bytes: 120,
+                projected_allocation_bytes: 60,
+                reserve_bytes: 80,
+                available_after_allocation_bytes: 60,
+                shortfall_bytes: 20,
+            }))
+        );
+        assert_eq!(
+            policy.admit(150, 120, 60),
+            Err(AdmissionError::HostAndGuestReserve {
+                host: ReserveViolation {
+                    available_bytes: 150,
+                    projected_allocation_bytes: 60,
+                    reserve_bytes: 100,
+                    available_after_allocation_bytes: 90,
+                    shortfall_bytes: 10,
+                },
+                guest: ReserveViolation {
+                    available_bytes: 120,
+                    projected_allocation_bytes: 60,
+                    reserve_bytes: 80,
+                    available_after_allocation_bytes: 60,
+                    shortfall_bytes: 20,
+                },
+            })
+        );
     }
 
     #[test]
@@ -546,7 +1620,7 @@ mod tests {
     fn concurrent_hydration_publishes_one_verified_cache_entry() {
         let fixture = cold_blob_fixture(b"shared concurrent blob");
         let cache = Arc::new(fixture.cache);
-        let catalog = Arc::new(fixture.catalog);
+        let catalog = Arc::new(CountingCatalog::new(fixture.catalog));
         let chunk = Arc::new(fixture.chunk);
         let mut workers = Vec::new();
         for _ in 0..8 {
@@ -567,6 +1641,120 @@ mod tests {
             fs::read(cache.verified_path(fixture.id).unwrap()).unwrap(),
             b"shared concurrent blob"
         );
+        assert_eq!(catalog.location_reads.load(Ordering::SeqCst), 1);
         fs::remove_dir_all(fixture.directory).unwrap();
+    }
+
+    #[test]
+    fn singleflight_invokes_one_authoritative_hydration_source() {
+        let directory = directory();
+        let cache = Arc::new(Cache::open(&directory).unwrap());
+        let id = ContentId::for_object(ObjectKind::Blob, b"singleflight source");
+        let source_calls = Arc::new(AtomicUsize::new(0));
+        let start = Arc::new(Barrier::new(8));
+        let mut workers = Vec::new();
+
+        for _ in 0..8 {
+            let cache = Arc::clone(&cache);
+            let source_calls = Arc::clone(&source_calls);
+            let start = Arc::clone(&start);
+            workers.push(thread::spawn(move || {
+                start.wait();
+                cache
+                    .singleflight_hydrate(id, || {
+                        source_calls.fetch_add(1, Ordering::SeqCst);
+                        thread::sleep(Duration::from_millis(25));
+                        cache
+                            .publish_blob(id, b"singleflight source")
+                            .map_err(Into::into)
+                    })
+                    .unwrap()
+            }));
+        }
+
+        let paths: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        assert!(paths.iter().all(|path| path == &paths[0]));
+        assert_eq!(source_calls.load(Ordering::SeqCst), 1);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn concurrent_invalid_discard_never_removes_a_repaired_entry() {
+        let directory = directory();
+        let cache = Arc::new(Cache::open(&directory).unwrap());
+        let id = ContentId::for_object(ObjectKind::Blob, b"concurrent repair");
+        let path = cache.path_for(id);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"corrupt cache entry").unwrap();
+        let start = Arc::new(Barrier::new(2));
+
+        let discarder_cache = Arc::clone(&cache);
+        let discarder_start = Arc::clone(&start);
+        let discarder = thread::spawn(move || {
+            discarder_start.wait();
+            discarder_cache.discard_invalid_blob(id).unwrap();
+        });
+        let repairer_cache = Arc::clone(&cache);
+        let repairer = thread::spawn(move || {
+            start.wait();
+            loop {
+                match repairer_cache.publish_blob(id, b"concurrent repair") {
+                    Ok(path) => break path,
+                    Err(CacheError::ContentMismatch { .. } | CacheError::UnsafeEntry(_)) => {
+                        repairer_cache.discard_invalid_blob(id).unwrap();
+                    }
+                    Err(error) => panic!("unexpected repair error: {error}"),
+                }
+            }
+        });
+
+        discarder.join().unwrap();
+        let repaired = repairer.join().unwrap();
+        assert_eq!(cache.verified_path(id).unwrap(), repaired);
+        assert_eq!(fs::read(repaired).unwrap(), b"concurrent repair");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn reconcile_quarantines_invalid_leaves_without_following_symlinks() {
+        let directory = directory();
+        let cache = Cache::open(&directory).unwrap();
+        let valid_id = ContentId::for_object(ObjectKind::Blob, b"valid cache entry");
+        cache.publish_blob(valid_id, b"valid cache entry").unwrap();
+
+        let corrupt_id = ContentId::for_object(ObjectKind::Blob, b"expected corrupt entry");
+        let corrupt_path = cache.path_for(corrupt_id);
+        fs::create_dir_all(corrupt_path.parent().unwrap()).unwrap();
+        fs::write(&corrupt_path, b"wrong cache bytes").unwrap();
+
+        let target_bytes = b"outside cache target";
+        let target = directory.join("outside-target");
+        fs::write(&target, target_bytes).unwrap();
+        let symlink_id = ContentId::for_object(ObjectKind::Blob, target_bytes);
+        let symlink_path = cache.path_for(symlink_id);
+        fs::create_dir_all(symlink_path.parent().unwrap()).unwrap();
+        symlink(&target, &symlink_path).unwrap();
+
+        let report = cache.reconcile().unwrap();
+        assert_eq!(report.retained, 1);
+        assert_eq!(report.quarantined, 2);
+        assert_eq!(fs::read(&target).unwrap(), target_bytes);
+        assert!(matches!(
+            cache.verified_path(corrupt_id),
+            Err(CacheError::NotCached(_))
+        ));
+        assert!(matches!(
+            cache.verified_path(symlink_id),
+            Err(CacheError::NotCached(_))
+        ));
+        assert!(cache.verified_path(valid_id).is_ok());
+        assert_eq!(
+            fs::read_dir(directory.join(".quarantine")).unwrap().count(),
+            2
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 }
