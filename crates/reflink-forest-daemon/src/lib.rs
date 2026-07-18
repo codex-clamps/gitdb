@@ -34,6 +34,22 @@ const JOB_TRAILER_LEN: usize = 4;
 const MAX_JOB_RECORD_LEN: usize = 64 * 1024 * 1024;
 const JOB_TEMP_PREFIX: &str = ".reflink-forest-job-";
 const JOB_TEMP_SUFFIX: &str = ".tmp";
+const SCRUB_RECORD_VERSION: u8 = 1;
+const SCRUB_RECORD_MAGIC: [u8; 8] = *b"RFSSCRB1";
+const SCRUB_RECORD_LEN: usize = 64;
+const SCRUB_RECORD_FILE: &str = "scrub-schedule-v1";
+const SCRUB_TEMP_PREFIX: &str = ".reflink-forest-scrub-";
+const SCRUB_TEMP_SUFFIX: &str = ".tmp";
+const SCRUB_FLAG_LAST_STARTED: u8 = 1;
+const SCRUB_FLAG_LAST_COMPLETED: u8 = 2;
+const SCRUB_KNOWN_FLAGS: u8 = SCRUB_FLAG_LAST_STARTED | SCRUB_FLAG_LAST_COMPLETED;
+
+/// Scrubs are deliberately rate limited even when a caller provides a bad
+/// configuration. The daemon owns this scheduling state; it does not rely on
+/// a user crontab, systemd timer, or another external scheduler.
+pub const MIN_SCRUB_INTERVAL_SECONDS: u64 = 60;
+pub const MAX_SCRUB_INTERVAL_SECONDS: u64 = 366 * 24 * 60 * 60;
+const MAX_CONSECUTIVE_SCRUB_FAILURES: u32 = 1_000_000;
 static TEMP_NONCE: AtomicU64 = AtomicU64::new(0);
 
 /// A stable, opaque job identifier. Its lower-case hexadecimal rendering is
@@ -688,7 +704,7 @@ fn require_transition(
     }
 }
 
-fn lock_unpoisoned(lock: &Mutex<()>) -> std::sync::MutexGuard<'_, ()> {
+fn lock_unpoisoned<T>(lock: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
@@ -701,6 +717,455 @@ fn sync_parent_directory(path: &Path) -> io::Result<()> {
         Some(parent) => sync_directory(parent),
         None => Ok(()),
     }
+}
+
+/// The state of one scheduled scrub execution. A running scrub is never
+/// resumed blindly after a process crash: startup returns it to `Idle` and
+/// makes it due immediately, so the implementation can begin from its own
+/// verified checkpoint.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum ScrubRunState {
+    Idle = 1,
+    Running = 2,
+}
+
+impl ScrubRunState {
+    const fn from_tag(tag: u8) -> Option<Self> {
+        match tag {
+            1 => Some(Self::Idle),
+            2 => Some(Self::Running),
+            _ => None,
+        }
+    }
+}
+
+/// Durable scheduling and recovery state for the cold-store scrubber.
+///
+/// Timestamps are Unix seconds supplied by the caller. They are deliberately
+/// plain unsigned values so this record remains portable and can be recovered
+/// without parsing a locale- or platform-specific time representation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScrubScheduleState {
+    pub interval_seconds: u64,
+    pub next_due_unix_seconds: u64,
+    pub run_state: ScrubRunState,
+    pub last_started_unix_seconds: Option<u64>,
+    pub last_completed_unix_seconds: Option<u64>,
+    pub consecutive_failures: u32,
+    /// Number of in-progress scrubs converted to due work during recovery.
+    pub recovered_interrupted_runs: u64,
+}
+
+impl ScrubScheduleState {
+    fn configured(
+        interval_seconds: u64,
+        now_unix_seconds: u64,
+    ) -> Result<Self, ScrubScheduleError> {
+        validate_scrub_interval(interval_seconds)?;
+        let next_due_unix_seconds = now_unix_seconds
+            .checked_add(interval_seconds)
+            .ok_or(ScrubScheduleError::TimestampOverflow)?;
+        Ok(Self {
+            interval_seconds,
+            next_due_unix_seconds,
+            run_state: ScrubRunState::Idle,
+            last_started_unix_seconds: None,
+            last_completed_unix_seconds: None,
+            consecutive_failures: 0,
+            recovered_interrupted_runs: 0,
+        })
+    }
+
+    fn validate(&self) -> Result<(), ScrubScheduleError> {
+        validate_scrub_interval(self.interval_seconds)?;
+        if self.run_state == ScrubRunState::Running && self.last_started_unix_seconds.is_none() {
+            return Err(ScrubScheduleError::InvalidRecord(
+                "running scrub has no start timestamp",
+            ));
+        }
+        if self.consecutive_failures > MAX_CONSECUTIVE_SCRUB_FAILURES {
+            return Err(ScrubScheduleError::InvalidRecord(
+                "scrub failure count exceeds the durable limit",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Status embedded in the daemon's structured status snapshot. `due` is true
+/// only for an idle configured scrub, never for a possibly interrupted run.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ScrubScheduleStatus {
+    pub schedule: Option<ScrubScheduleState>,
+    pub due: bool,
+}
+
+#[derive(Debug)]
+pub enum ScrubScheduleError {
+    Io(io::Error),
+    InvalidInterval(u64),
+    TimestampOverflow,
+    NotConfigured,
+    AlreadyRunning,
+    InvalidRecord(&'static str),
+    UnsupportedVersion(u8),
+    UnsafeScheduleFile(PathBuf),
+    CounterOverflow,
+}
+
+impl std::fmt::Display for ScrubScheduleError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(error) => write!(formatter, "scrub schedule I/O error: {error}"),
+            Self::InvalidInterval(interval) => write!(
+                formatter,
+                "scrub interval {interval}s is outside {}..={}s",
+                MIN_SCRUB_INTERVAL_SECONDS, MAX_SCRUB_INTERVAL_SECONDS
+            ),
+            Self::TimestampOverflow => write!(formatter, "scrub schedule timestamp overflow"),
+            Self::NotConfigured => write!(formatter, "scrub schedule is not configured"),
+            Self::AlreadyRunning => write!(formatter, "a scrub is already marked running"),
+            Self::InvalidRecord(reason) => {
+                write!(formatter, "invalid durable scrub schedule record: {reason}")
+            }
+            Self::UnsupportedVersion(version) => {
+                write!(
+                    formatter,
+                    "unsupported scrub schedule record version {version}"
+                )
+            }
+            Self::UnsafeScheduleFile(path) => {
+                write!(formatter, "unsafe scrub schedule file: {}", path.display())
+            }
+            Self::CounterOverflow => {
+                write!(formatter, "scrub recovery or failure counter overflow")
+            }
+        }
+    }
+}
+impl std::error::Error for ScrubScheduleError {}
+impl From<io::Error> for ScrubScheduleError {
+    fn from(value: io::Error) -> Self {
+        Self::Io(value)
+    }
+}
+
+/// File-backed durable state for the internal scrub scheduler.
+///
+/// The record is a fixed-size, versioned, checksummed binary value. Every
+/// update uses `write + sync + rename + directory sync`, so recovery observes
+/// either the old complete schedule or the new complete schedule, never a
+/// partially written timer setting.
+#[derive(Debug)]
+pub struct ScrubScheduleStore {
+    state_root: PathBuf,
+    record_path: PathBuf,
+    state: Mutex<Option<ScrubScheduleState>>,
+}
+
+impl ScrubScheduleStore {
+    /// Opens the store and converts an interrupted running scrub into idle,
+    /// immediately-due work before returning control to the daemon.
+    pub fn open(
+        state_root: impl AsRef<Path>,
+        now_unix_seconds: u64,
+    ) -> Result<Self, ScrubScheduleError> {
+        let state_root = state_root.as_ref().to_path_buf();
+        let record_path = state_root.join(SCRUB_RECORD_FILE);
+        let state = read_scrub_schedule_record(&record_path)?;
+        let store = Self {
+            state_root,
+            record_path,
+            state: Mutex::new(state),
+        };
+        store.remove_stale_temporaries()?;
+        store.recover_startup_at(now_unix_seconds)?;
+        Ok(store)
+    }
+
+    pub fn record_path(&self) -> &Path {
+        &self.record_path
+    }
+
+    /// Creates or replaces the configured cadence. This never starts a scrub;
+    /// a worker must claim due work with [`Self::begin_if_due_at`].
+    pub fn configure_at(
+        &self,
+        interval_seconds: u64,
+        now_unix_seconds: u64,
+    ) -> Result<ScrubScheduleState, ScrubScheduleError> {
+        let mut state = lock_unpoisoned(&self.state);
+        let configured = ScrubScheduleState::configured(interval_seconds, now_unix_seconds)?;
+        self.write_locked(&configured)?;
+        *state = Some(configured.clone());
+        Ok(configured)
+    }
+
+    pub fn state(&self) -> Option<ScrubScheduleState> {
+        lock_unpoisoned(&self.state).clone()
+    }
+
+    pub fn status_at(&self, now_unix_seconds: u64) -> ScrubScheduleStatus {
+        let schedule = self.state();
+        let due = schedule.as_ref().is_some_and(|state| {
+            state.run_state == ScrubRunState::Idle
+                && state.next_due_unix_seconds <= now_unix_seconds
+        });
+        ScrubScheduleStatus { schedule, due }
+    }
+
+    /// Marks a due scrub as running. A concurrent caller either sees the
+    /// completed record or receives `AlreadyRunning`; only one can claim it.
+    pub fn begin_if_due_at(
+        &self,
+        now_unix_seconds: u64,
+    ) -> Result<Option<ScrubScheduleState>, ScrubScheduleError> {
+        let mut state = lock_unpoisoned(&self.state);
+        let schedule = state.as_mut().ok_or(ScrubScheduleError::NotConfigured)?;
+        if schedule.run_state == ScrubRunState::Running {
+            return Err(ScrubScheduleError::AlreadyRunning);
+        }
+        if schedule.next_due_unix_seconds > now_unix_seconds {
+            return Ok(None);
+        }
+        schedule.run_state = ScrubRunState::Running;
+        schedule.last_started_unix_seconds = Some(now_unix_seconds);
+        self.write_locked(schedule)?;
+        Ok(Some(schedule.clone()))
+    }
+
+    /// Persists a successful scrub and schedules the following run from its
+    /// completion timestamp.
+    pub fn complete_success_at(
+        &self,
+        now_unix_seconds: u64,
+    ) -> Result<ScrubScheduleState, ScrubScheduleError> {
+        self.finish_at(now_unix_seconds, true)
+    }
+
+    /// Persists an unsuccessful scrub. Failures remain visible in status but
+    /// still advance the cadence, preventing a broken store from busy-looping.
+    pub fn complete_failure_at(
+        &self,
+        now_unix_seconds: u64,
+    ) -> Result<ScrubScheduleState, ScrubScheduleError> {
+        self.finish_at(now_unix_seconds, false)
+    }
+
+    /// Recovers only an explicitly persisted in-progress run. It is
+    /// idempotent and called automatically by [`Self::open`].
+    pub fn recover_startup_at(&self, now_unix_seconds: u64) -> Result<usize, ScrubScheduleError> {
+        let mut state = lock_unpoisoned(&self.state);
+        let Some(schedule) = state.as_mut() else {
+            return Ok(0);
+        };
+        if schedule.run_state != ScrubRunState::Running {
+            return Ok(0);
+        }
+        schedule.run_state = ScrubRunState::Idle;
+        schedule.next_due_unix_seconds = schedule.next_due_unix_seconds.min(now_unix_seconds);
+        schedule.recovered_interrupted_runs = schedule
+            .recovered_interrupted_runs
+            .checked_add(1)
+            .ok_or(ScrubScheduleError::CounterOverflow)?;
+        self.write_locked(schedule)?;
+        Ok(1)
+    }
+
+    fn finish_at(
+        &self,
+        now_unix_seconds: u64,
+        succeeded: bool,
+    ) -> Result<ScrubScheduleState, ScrubScheduleError> {
+        let mut state = lock_unpoisoned(&self.state);
+        let schedule = state.as_mut().ok_or(ScrubScheduleError::NotConfigured)?;
+        if schedule.run_state != ScrubRunState::Running {
+            return Err(ScrubScheduleError::InvalidRecord(
+                "cannot complete a scrub that is not running",
+            ));
+        }
+        schedule.run_state = ScrubRunState::Idle;
+        schedule.last_completed_unix_seconds = Some(now_unix_seconds);
+        schedule.next_due_unix_seconds = now_unix_seconds
+            .checked_add(schedule.interval_seconds)
+            .ok_or(ScrubScheduleError::TimestampOverflow)?;
+        if succeeded {
+            schedule.consecutive_failures = 0;
+        } else {
+            schedule.consecutive_failures = schedule
+                .consecutive_failures
+                .checked_add(1)
+                .filter(|count| *count <= MAX_CONSECUTIVE_SCRUB_FAILURES)
+                .ok_or(ScrubScheduleError::CounterOverflow)?;
+        }
+        self.write_locked(schedule)?;
+        Ok(schedule.clone())
+    }
+
+    fn write_locked(&self, state: &ScrubScheduleState) -> Result<(), ScrubScheduleError> {
+        let bytes = encode_scrub_schedule_record(state)?;
+        for _ in 0..32 {
+            let nonce = TEMP_NONCE.fetch_add(1, Ordering::Relaxed);
+            let temporary = self.state_root.join(format!(
+                "{SCRUB_TEMP_PREFIX}{nonce:016x}{SCRUB_TEMP_SUFFIX}"
+            ));
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&temporary)
+            {
+                Ok(mut file) => {
+                    let result = (|| {
+                        file.write_all(&bytes)?;
+                        file.sync_all()?;
+                        drop(file);
+                        fs::rename(&temporary, &self.record_path)?;
+                        sync_directory(&self.state_root)?;
+                        Ok::<(), io::Error>(())
+                    })();
+                    if let Err(error) = result {
+                        let _ = fs::remove_file(&temporary);
+                        return Err(error.into());
+                    }
+                    return Ok(());
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not allocate scrub schedule temporary file",
+        )
+        .into())
+    }
+
+    fn remove_stale_temporaries(&self) -> Result<(), ScrubScheduleError> {
+        let mut removed = false;
+        for entry in fs::read_dir(&self.state_root)? {
+            let entry = entry?;
+            let path = entry.path();
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| ScrubScheduleError::UnsafeScheduleFile(path.clone()))?;
+            if !name.starts_with(SCRUB_TEMP_PREFIX) || !name.ends_with(SCRUB_TEMP_SUFFIX) {
+                continue;
+            }
+            if !entry.file_type()?.is_file() {
+                return Err(ScrubScheduleError::UnsafeScheduleFile(path));
+            }
+            fs::remove_file(path)?;
+            removed = true;
+        }
+        if removed {
+            sync_directory(&self.state_root)?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_scrub_interval(interval_seconds: u64) -> Result<(), ScrubScheduleError> {
+    if !(MIN_SCRUB_INTERVAL_SECONDS..=MAX_SCRUB_INTERVAL_SECONDS).contains(&interval_seconds) {
+        return Err(ScrubScheduleError::InvalidInterval(interval_seconds));
+    }
+    Ok(())
+}
+
+fn encode_scrub_schedule_record(
+    state: &ScrubScheduleState,
+) -> Result<[u8; SCRUB_RECORD_LEN], ScrubScheduleError> {
+    state.validate()?;
+    let mut bytes = [0_u8; SCRUB_RECORD_LEN];
+    bytes[0] = SCRUB_RECORD_VERSION;
+    bytes[1] = state.run_state as u8;
+    bytes[2] = (u8::from(state.last_started_unix_seconds.is_some()) * SCRUB_FLAG_LAST_STARTED)
+        | (u8::from(state.last_completed_unix_seconds.is_some()) * SCRUB_FLAG_LAST_COMPLETED);
+    bytes[4..12].copy_from_slice(&SCRUB_RECORD_MAGIC);
+    put_u64(&mut bytes, 12, state.interval_seconds);
+    put_u64(&mut bytes, 20, state.next_due_unix_seconds);
+    put_u64(
+        &mut bytes,
+        28,
+        state.last_started_unix_seconds.unwrap_or_default(),
+    );
+    put_u64(
+        &mut bytes,
+        36,
+        state.last_completed_unix_seconds.unwrap_or_default(),
+    );
+    put_u32(&mut bytes, 44, state.consecutive_failures);
+    put_u64(&mut bytes, 48, state.recovered_interrupted_runs);
+    let checksum = crc32c(&bytes[..60]);
+    put_u32(&mut bytes, 60, checksum);
+    Ok(bytes)
+}
+
+fn read_scrub_schedule_record(
+    path: &Path,
+) -> Result<Option<ScrubScheduleState>, ScrubScheduleError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.file_type().is_file() || metadata.len() != SCRUB_RECORD_LEN as u64 {
+        return Err(ScrubScheduleError::UnsafeScheduleFile(path.to_path_buf()));
+    }
+    let bytes = fs::read(path)?;
+    decode_scrub_schedule_record(&bytes).map(Some)
+}
+
+fn decode_scrub_schedule_record(bytes: &[u8]) -> Result<ScrubScheduleState, ScrubScheduleError> {
+    if bytes.len() != SCRUB_RECORD_LEN {
+        return Err(ScrubScheduleError::InvalidRecord(
+            "scrub schedule record length is invalid",
+        ));
+    }
+    if bytes[0] != SCRUB_RECORD_VERSION {
+        return Err(ScrubScheduleError::UnsupportedVersion(bytes[0]));
+    }
+    if bytes[3] != 0 || bytes[4..12] != SCRUB_RECORD_MAGIC {
+        return Err(ScrubScheduleError::InvalidRecord(
+            "scrub schedule header is invalid",
+        ));
+    }
+    if bytes[2] & !SCRUB_KNOWN_FLAGS != 0 {
+        return Err(ScrubScheduleError::InvalidRecord(
+            "scrub schedule flags are invalid",
+        ));
+    }
+    if read_u32(bytes, 60) != crc32c(&bytes[..60]) {
+        return Err(ScrubScheduleError::InvalidRecord(
+            "scrub schedule checksum mismatch",
+        ));
+    }
+    let flags = bytes[2];
+    let last_started = read_u64(bytes, 28);
+    let last_completed = read_u64(bytes, 36);
+    let state = ScrubScheduleState {
+        interval_seconds: read_u64(bytes, 12),
+        next_due_unix_seconds: read_u64(bytes, 20),
+        run_state: ScrubRunState::from_tag(bytes[1]).ok_or(ScrubScheduleError::InvalidRecord(
+            "scrub schedule run state is invalid",
+        ))?,
+        last_started_unix_seconds: (flags & SCRUB_FLAG_LAST_STARTED != 0).then_some(last_started),
+        last_completed_unix_seconds: (flags & SCRUB_FLAG_LAST_COMPLETED != 0)
+            .then_some(last_completed),
+        consecutive_failures: read_u32(bytes, 44),
+        recovered_interrupted_runs: read_u64(bytes, 48),
+    };
+    if state.last_started_unix_seconds.is_none() && last_started != 0
+        || state.last_completed_unix_seconds.is_none() && last_completed != 0
+    {
+        return Err(ScrubScheduleError::InvalidRecord(
+            "scrub schedule has a timestamp without its presence flag",
+        ));
+    }
+    state.validate()?;
+    Ok(state)
 }
 
 fn parse_job_filename(name: &str) -> Option<JobId> {
@@ -1081,6 +1546,13 @@ fn current_uid() -> u32 {
     unsafe { getuid() }
 }
 
+fn current_unix_seconds() -> Result<u64, ScrubScheduleError> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .map_err(|_| ScrubScheduleError::InvalidRecord("system clock predates the Unix epoch"))
+}
+
 /// A parsed local control command. Commands are deliberately limited to
 /// durable job state transitions; no Git, mount, or workspace side effect can
 /// be reached through this protocol.
@@ -1192,6 +1664,7 @@ pub struct DaemonStatus {
     pub state_root: PathBuf,
     pub socket_path: PathBuf,
     pub metrics: DaemonMetricsSnapshot,
+    pub scrub: ScrubScheduleStatus,
 }
 
 #[derive(Debug)]
@@ -1199,6 +1672,7 @@ pub enum DaemonServiceError {
     Config(DaemonConfigError),
     Daemon(DaemonError),
     Job(JobError),
+    Scrub(ScrubScheduleError),
     StoreAlreadyInUse(PathBuf),
 }
 
@@ -1208,6 +1682,7 @@ impl std::fmt::Display for DaemonServiceError {
             Self::Config(error) => write!(formatter, "daemon configuration failed: {error}"),
             Self::Daemon(error) => write!(formatter, "daemon startup failed: {error}"),
             Self::Job(error) => write!(formatter, "daemon job recovery failed: {error}"),
+            Self::Scrub(error) => write!(formatter, "daemon scrub scheduling failed: {error}"),
             Self::StoreAlreadyInUse(path) => write!(
                 formatter,
                 "daemon state root is already owned by another instance: {}",
@@ -1230,6 +1705,11 @@ impl From<DaemonError> for DaemonServiceError {
 impl From<JobError> for DaemonServiceError {
     fn from(value: JobError) -> Self {
         Self::Job(value)
+    }
+}
+impl From<ScrubScheduleError> for DaemonServiceError {
+    fn from(value: ScrubScheduleError) -> Self {
+        Self::Scrub(value)
     }
 }
 
@@ -1340,6 +1820,7 @@ pub struct DaemonService {
     config: DaemonConfig,
     daemon: Daemon,
     jobs: JobStore,
+    scrubs: ScrubScheduleStore,
     _store_lock: InstanceLock,
     recovered_on_startup: u64,
     accepted_requests: AtomicU64,
@@ -1360,11 +1841,13 @@ impl DaemonService {
             Err(error) => return Err(error.into()),
         };
         let (jobs, recovered) = JobStore::open_with_recovery(&config.state_root)?;
+        let scrubs = ScrubScheduleStore::open(&config.state_root, current_unix_seconds()?)?;
         let daemon = Daemon::bind(&config.runtime_dir)?;
         Ok(Self {
             config,
             daemon,
             jobs,
+            scrubs,
             _store_lock: store_lock,
             recovered_on_startup: recovered as u64,
             accepted_requests: AtomicU64::new(0),
@@ -1380,12 +1863,30 @@ impl DaemonService {
         &self.jobs
     }
 
+    /// Returns the daemon-owned durable scrub scheduler. Callers must claim a
+    /// due run and record completion through this store; they may not infer a
+    /// schedule from an external cron or timer service.
+    pub fn scrub_store(&self) -> &ScrubScheduleStore {
+        &self.scrubs
+    }
+
+    /// Configures a bounded scrub cadence using the daemon's current clock.
+    pub fn configure_scrub_schedule(
+        &self,
+        interval_seconds: u64,
+    ) -> Result<ScrubScheduleState, DaemonServiceError> {
+        Ok(self
+            .scrubs
+            .configure_at(interval_seconds, current_unix_seconds()?)?)
+    }
+
     pub fn status(&self) -> Result<DaemonStatus, DaemonServiceError> {
         Ok(DaemonStatus {
             runtime_dir: self.config.runtime_dir.clone(),
             state_root: self.config.state_root.clone(),
             socket_path: self.socket_path().to_path_buf(),
             metrics: self.metrics_snapshot()?,
+            scrub: self.scrubs.status_at(current_unix_seconds()?),
         })
     }
 
@@ -1439,12 +1940,30 @@ impl DaemonService {
     fn execute(&self, command: DaemonCommand) -> Result<String, JobError> {
         match command {
             DaemonCommand::Status => {
-                let snapshot = self.metrics_snapshot().map_err(|error| match error {
+                let status = self.status().map_err(|error| match error {
                     DaemonServiceError::Job(error) => error,
                     _ => JobError::InvalidRecord("daemon metrics are unavailable"),
                 })?;
+                let snapshot = status.metrics;
+                let scrub_state = status
+                    .scrub
+                    .schedule
+                    .as_ref()
+                    .map_or("disabled", |schedule| match schedule.run_state {
+                        ScrubRunState::Idle => "idle",
+                        ScrubRunState::Running => "running",
+                    });
+                let scrub_next_due = status.scrub.schedule.as_ref().map_or_else(
+                    || "none".to_owned(),
+                    |schedule| schedule.next_due_unix_seconds.to_string(),
+                );
+                let scrub_recovered = status
+                    .scrub
+                    .schedule
+                    .as_ref()
+                    .map_or(0, |schedule| schedule.recovered_interrupted_runs);
                 Ok(format!(
-                    "ok status queued={} running={} succeeded={} failed={} recovered={} accepted={} rejected={}\n",
+                    "ok status queued={} running={} succeeded={} failed={} recovered={} accepted={} rejected={} scrub_state={} scrub_due={} scrub_next_due={} scrub_recovered={}\n",
                     snapshot.jobs.queued,
                     snapshot.jobs.running,
                     snapshot.jobs.succeeded,
@@ -1452,6 +1971,10 @@ impl DaemonService {
                     snapshot.recovered_on_startup,
                     snapshot.accepted_requests,
                     snapshot.rejected_requests,
+                    scrub_state,
+                    u8::from(status.scrub.due),
+                    scrub_next_due,
+                    scrub_recovered,
                 ))
             }
             DaemonCommand::Enqueue { kind, payload } => {
@@ -1548,6 +2071,83 @@ mod tests {
 
     fn job_id(value: u8) -> JobId {
         JobId::from_bytes([value; 16])
+    }
+
+    #[test]
+    fn scrub_schedule_is_versioned_bounded_and_recovers_interrupted_work() {
+        let root = dir();
+        fs::create_dir_all(&root).unwrap();
+        let store = ScrubScheduleStore::open(&root, 100).unwrap();
+        assert_eq!(store.status_at(100), ScrubScheduleStatus::default());
+        assert!(matches!(
+            store.configure_at(MIN_SCRUB_INTERVAL_SECONDS - 1, 100),
+            Err(ScrubScheduleError::InvalidInterval(_))
+        ));
+        assert!(matches!(
+            store.configure_at(MAX_SCRUB_INTERVAL_SECONDS + 1, 100),
+            Err(ScrubScheduleError::InvalidInterval(_))
+        ));
+
+        let configured = store.configure_at(MIN_SCRUB_INTERVAL_SECONDS, 100).unwrap();
+        assert_eq!(configured.next_due_unix_seconds, 160);
+        assert!(!store.status_at(159).due);
+        assert!(store.begin_if_due_at(159).unwrap().is_none());
+        let running = store.begin_if_due_at(160).unwrap().unwrap();
+        assert_eq!(running.run_state, ScrubRunState::Running);
+        let bytes = fs::read(store.record_path()).unwrap();
+        assert_eq!(bytes.len(), SCRUB_RECORD_LEN);
+        assert_eq!(bytes[0], SCRUB_RECORD_VERSION);
+        assert_eq!(&bytes[4..12], &SCRUB_RECORD_MAGIC);
+        drop(store);
+
+        let recovered = ScrubScheduleStore::open(&root, 200).unwrap();
+        let status = recovered.status_at(200);
+        assert!(status.due);
+        let schedule = status.schedule.unwrap();
+        assert_eq!(schedule.run_state, ScrubRunState::Idle);
+        assert_eq!(schedule.next_due_unix_seconds, 160);
+        assert_eq!(schedule.recovered_interrupted_runs, 1);
+        assert_eq!(recovered.recover_startup_at(200).unwrap(), 0);
+
+        recovered.begin_if_due_at(200).unwrap().unwrap();
+        let completed = recovered.complete_failure_at(201).unwrap();
+        assert_eq!(completed.run_state, ScrubRunState::Idle);
+        assert_eq!(completed.consecutive_failures, 1);
+        assert_eq!(completed.next_due_unix_seconds, 261);
+        drop(recovered);
+
+        let reloaded = ScrubScheduleStore::open(&root, 202).unwrap();
+        assert_eq!(reloaded.state().unwrap(), completed);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scrub_schedule_rejects_corruption_and_cleans_only_its_stale_temporary_files() {
+        let root = dir();
+        fs::create_dir_all(&root).unwrap();
+        let store = ScrubScheduleStore::open(&root, 1_000).unwrap();
+        store
+            .configure_at(MIN_SCRUB_INTERVAL_SECONDS, 1_000)
+            .unwrap();
+        let temporary = root.join(format!("{SCRUB_TEMP_PREFIX}partial{SCRUB_TEMP_SUFFIX}"));
+        fs::write(&temporary, b"unpublished").unwrap();
+        drop(store);
+
+        let reloaded = ScrubScheduleStore::open(&root, 1_000).unwrap();
+        assert!(!temporary.exists());
+        drop(reloaded);
+
+        let path = root.join(SCRUB_RECORD_FILE);
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[60] ^= 0xff;
+        fs::write(&path, bytes).unwrap();
+        assert!(matches!(
+            ScrubScheduleStore::open(&root, 1_000),
+            Err(ScrubScheduleError::InvalidRecord(
+                "scrub schedule checksum mismatch"
+            ))
+        ));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1758,6 +2358,31 @@ mod tests {
             JobState::Queued
         );
         drop(restarted);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn daemon_status_reports_the_durable_scrub_schedule() {
+        let root = dir();
+        let service = DaemonService::start(service_config(&root)).unwrap();
+        let configured = service
+            .configure_scrub_schedule(MIN_SCRUB_INTERVAL_SECONDS)
+            .unwrap();
+        let status = service.status().unwrap();
+        assert_eq!(status.scrub.schedule, Some(configured));
+        assert!(!status.scrub.due);
+
+        let socket = service.socket_path().to_path_buf();
+        let server = thread::spawn(move || {
+            service.serve_one().unwrap();
+            service
+        });
+        let response = socket_request(&socket, "status\n");
+        assert!(response.starts_with("ok status"));
+        assert!(response.contains("scrub_state=idle"));
+        assert!(response.contains("scrub_due=0"));
+        assert!(response.contains("scrub_recovered=0"));
+        drop(server.join().unwrap());
         fs::remove_dir_all(root).unwrap();
     }
 

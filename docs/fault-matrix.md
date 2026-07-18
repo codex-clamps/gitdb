@@ -16,6 +16,7 @@ only in the privileged VM capability job.
 | Generation GC | reader lease held while retirement begins | new leases stop; old generation remains until the last lease drains | portable maintenance test |
 | Generation publication | pointer update fails after catalog batch | catalog generation remains authoritative and startup repairs the pointer | portable maintenance test |
 | Backup | corrupt descriptor/manifest or restore destination exists/is unsafe | restore fails before publication and target is unchanged | portable backup test |
+| Backup → checkout | original cold tree removed after checkpoint, then restored | restored chunk bytes hydrate and materialize a raw workspace without the original tree | portable workspace integration test |
 | Loop attach | reboot-style pre-existing loop association | helper verifies canonical backing image then reuses it; no duplicate loop is attached | privileged VM |
 | Btrfs init | existing or unmarked image path | no formatting or truncation occurs | privileged VM |
 | Btrfs mount | wrong UUID, label, marker, or mountpoint | helper rejects the mount without formatting | privileged VM |

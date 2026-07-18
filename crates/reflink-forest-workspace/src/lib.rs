@@ -1297,6 +1297,144 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn restored_cold_tier_materializes_a_workspace_without_the_original_tree() {
+        use reflink_forest_backup::{
+            checkpoint_cold_tier, restore_cold_tier, BackupError, CheckpointGuard,
+            ChunkClassification, ColdChunkDescriptor, ColdTierCheckpointDescriptor,
+        };
+        use reflink_forest_cache::CacheError;
+        use reflink_forest_checkout::MaterializeError;
+
+        // Keep the original cold tree outside the Btrfs checkout domain so
+        // success proves checkout reads only the restored authoritative bytes.
+        let original = temp_root();
+        fs::create_dir(&original).unwrap();
+        let chunk = original.join("1.open");
+        let original_cache = Cache::open(original.join("cache")).unwrap();
+        let repository = RepoId([0x41; 16]);
+        let commit_oid = oid(0x42);
+        let tree_oid = oid(0x43);
+        let blob_oid = oid(0x44);
+        let payload = b"restored cold object\n".to_vec();
+        let mut writer = ChunkWriter::create(
+            &chunk,
+            ChunkHeader {
+                generation: 1,
+                chunk_id: 1,
+                created_unix_secs: 0,
+                flags: 0,
+            },
+        )
+        .unwrap();
+        let mut catalog = InMemoryCatalog::default();
+        append(
+            &mut writer,
+            &mut catalog,
+            repository,
+            blob_oid,
+            ObjectKind::Blob,
+            payload.clone(),
+        );
+        let mut tree = b"100644 restored.txt\0".to_vec();
+        tree.extend_from_slice(blob_oid.as_bytes());
+        append(
+            &mut writer,
+            &mut catalog,
+            repository,
+            tree_oid,
+            ObjectKind::Tree,
+            tree,
+        );
+        append(
+            &mut writer,
+            &mut catalog,
+            repository,
+            commit_oid,
+            ObjectKind::Commit,
+            format!("tree {}\n\nrestored\n", oid_hex(&tree_oid)).into_bytes(),
+        );
+        writer.sync_data().unwrap();
+        drop(writer);
+        drop(original_cache);
+
+        let backup_parent = temp_root();
+        fs::create_dir(&backup_parent).unwrap();
+        let backup = backup_parent.join("checkpoint");
+        struct Guard;
+        impl CheckpointGuard for Guard {
+            fn quiesce_and_sync(&self) -> Result<(), BackupError> {
+                Ok(())
+            }
+        }
+        let manifest = checkpoint_cold_tier(
+            &Guard,
+            &original,
+            &backup,
+            &ColdTierCheckpointDescriptor {
+                catalog_schema_version: 1,
+                active_generation: 1,
+                chunks: vec![ColdChunkDescriptor {
+                    generation: 1,
+                    chunk_id: 1,
+                    classification: ChunkClassification::Open,
+                    valid_prefix: fs::metadata(&chunk).unwrap().len(),
+                }],
+                catalog_digest: [0x45; 32],
+                config_digest: [0x46; 32],
+                pins_manifest_digest: [0x47; 32],
+            },
+        )
+        .unwrap();
+        fs::remove_dir_all(&original).unwrap();
+        assert!(!original.exists());
+
+        // The workspace root is inside this checkout's Btrfs filesystem on
+        // supported hosts, so the final regular file exercises restored
+        // cold-record hydration and FICLONE in one path.
+        let restored = std::env::current_dir().unwrap().join(format!(
+            ".reflink-forest-restored-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        restore_cold_tier(&backup, &manifest, &restored).unwrap();
+        let cache = Cache::open(restored.join("cache")).unwrap();
+        let source =
+            ColdWorkspaceSource::new(repository, &catalog, &cache, |_, _| restored.join("1.open"));
+        assert_eq!(source.blob_bytes(&blob_oid).unwrap(), payload);
+        let staging = restored.join("staging/workspace");
+        let workspaces = restored.join("workspaces");
+        let trash = restored.join("trash");
+        fs::create_dir_all(&staging).unwrap();
+        fs::create_dir_all(&workspaces).unwrap();
+        let result = source.checkout_commit(WorkspaceCheckoutRequest {
+            commit: commit_oid,
+            limits: reflink_forest_checkout::DEFAULT_CHECKOUT_LIMITS,
+            staging: &staging,
+            workspaces: &workspaces,
+            trash: &trash,
+            name: &WorkspaceName::new("restored").unwrap(),
+            gitlink_policy: GitlinkPolicy::Reject,
+            replace: ReplacePolicy::Reject,
+        });
+        match result {
+            Ok(workspace) => {
+                assert_eq!(fs::read(workspace.join("restored.txt")).unwrap(), payload);
+            }
+            Err(WorkspaceCheckoutError::Materialize(error))
+                if matches!(
+                    *error,
+                    MaterializeError::Cache(CacheError::Io(ref io_error))
+                        if matches!(io_error.raw_os_error(), Some(18) | Some(95))
+                ) => {}
+            Err(error) => panic!("restored checkout failed unexpectedly: {error}"),
+        }
+        fs::remove_dir_all(backup_parent).unwrap();
+        fs::remove_dir_all(restored).unwrap();
+    }
+
     fn oid_hex(oid: &GitOid) -> String {
         let mut output = String::new();
         for byte in oid.as_bytes() {

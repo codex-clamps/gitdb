@@ -5,10 +5,13 @@
 //! checked plans only after independently validating the configured instance.
 
 use std::{
-    ffi::{CString, OsStr},
+    ffi::{CString, OsStr, OsString},
     fs,
     io::{self, Write},
-    os::{fd::AsRawFd, unix::ffi::OsStrExt},
+    os::{
+        fd::AsRawFd,
+        unix::ffi::{OsStrExt, OsStringExt},
+    },
     path::{Path, PathBuf},
     process::Command,
     time::{SystemTime, UNIX_EPOCH},
@@ -44,6 +47,15 @@ pub enum BtrfsError {
     DuplicateLoopAssociation(String),
     InvalidLoopDevice(String),
     InvalidSize,
+    LoopBackingMismatch {
+        device: String,
+        backing: PathBuf,
+    },
+    InvalidCommandOutput(&'static str),
+    ShrinkNotSupported {
+        current: u64,
+        requested: u64,
+    },
 }
 impl std::fmt::Display for BtrfsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -79,6 +91,18 @@ impl std::fmt::Display for BtrfsError {
             }
             Self::InvalidLoopDevice(device) => write!(f, "invalid loop device: {device}"),
             Self::InvalidSize => write!(f, "image size must be non-zero"),
+            Self::LoopBackingMismatch { device, backing } => write!(
+                f,
+                "loop device {device} is associated with unexpected backing image: {}",
+                backing.display()
+            ),
+            Self::InvalidCommandOutput(what) => {
+                write!(f, "invalid fixed-purpose command output: {what}")
+            }
+            Self::ShrinkNotSupported { current, requested } => write!(
+                f,
+                "refusing to shrink Btrfs image from {current} to {requested} bytes"
+            ),
         }
     }
 }
@@ -382,9 +406,32 @@ pub fn validate_backing_image(
 /// program name or arbitrary argument vector.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PrivilegedPlan {
-    AttachLoop { image: PathBuf },
-    Mount { device: String, mount_root: PathBuf },
-    GrowImage { image: PathBuf, size: u64 },
+    /// Enumerates loop device names. Each resulting backing path is inspected
+    /// separately and canonicalized before it may be reused.
+    ListLoops,
+    AttachLoop {
+        image: PathBuf,
+    },
+    InspectLoopBacking {
+        device: String,
+    },
+    InspectFilesystem {
+        device: String,
+    },
+    Mount {
+        device: String,
+        mount_root: PathBuf,
+    },
+    GrowImage {
+        image: PathBuf,
+        size: u64,
+    },
+    RefreshLoopCapacity {
+        device: String,
+    },
+    ResizeFilesystem {
+        mount_root: PathBuf,
+    },
 }
 impl PrivilegedPlan {
     pub fn attach(
@@ -426,9 +473,28 @@ impl PrivilegedPlan {
     }
     pub fn command(&self) -> Command {
         match self {
+            Self::ListLoops => {
+                let mut command = Command::new("losetup");
+                command.arg("--all");
+                command
+            }
             Self::AttachLoop { image } => {
                 let mut command = Command::new("losetup");
                 command.args(["--find", "--show", "--nooverlap"]).arg(image);
+                command
+            }
+            Self::InspectLoopBacking { device } => {
+                let mut command = Command::new("losetup");
+                command
+                    .args(["--list", "--noheadings", "--raw", "--output", "BACK-FILE"])
+                    .arg(device);
+                command
+            }
+            Self::InspectFilesystem { device } => {
+                let mut command = Command::new("blkid");
+                command
+                    .args(["--output", "export", "--match-token", "TYPE=btrfs"])
+                    .arg(device);
                 command
             }
             Self::Mount { device, mount_root } => {
@@ -444,6 +510,31 @@ impl PrivilegedPlan {
                 command.arg("--size").arg(size.to_string()).arg(image);
                 command
             }
+            Self::RefreshLoopCapacity { device } => {
+                let mut command = Command::new("losetup");
+                command.args(["--set-capacity", device]);
+                command
+            }
+            Self::ResizeFilesystem { mount_root } => {
+                let mut command = Command::new("btrfs");
+                command
+                    .args(["filesystem", "resize", "max"])
+                    .arg(mount_root);
+                command
+            }
+        }
+    }
+
+    fn program_name(&self) -> &'static str {
+        match self {
+            Self::ListLoops
+            | Self::AttachLoop { .. }
+            | Self::InspectLoopBacking { .. }
+            | Self::RefreshLoopCapacity { .. } => "losetup",
+            Self::InspectFilesystem { .. } => "blkid",
+            Self::Mount { .. } => "mount",
+            Self::GrowImage { .. } => "truncate",
+            Self::ResizeFilesystem { .. } => "btrfs filesystem resize",
         }
     }
 }
@@ -458,6 +549,337 @@ pub fn parse_loop_association(output: &str) -> Option<String> {
     output.lines().find_map(|line| {
         let (device, _) = line.split_once(':')?;
         is_loop_device(device).then(|| device.to_owned())
+    })
+}
+
+/// The only immutable inputs accepted by the privileged loop/mount helper.
+/// The helper never receives a client-selected device, backing image,
+/// mountpoint, or mount options. `new` canonicalizes and validates both paths
+/// before any command can be executed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PrivilegedExecutorConfig {
+    image: PathBuf,
+    mount_root: PathBuf,
+    marker: InstanceMarker,
+}
+
+impl PrivilegedExecutorConfig {
+    pub fn new(
+        image: impl AsRef<Path>,
+        configured_parent: impl AsRef<Path>,
+        mount_root: impl AsRef<Path>,
+        marker: InstanceMarker,
+    ) -> Result<Self, BtrfsError> {
+        if marker.label.is_empty()
+            || marker.label.len() > usize::from(u16::MAX)
+            || marker.label.contains(['\n', '\r'])
+        {
+            return Err(BtrfsError::InvalidMarker);
+        }
+        let image = validate_backing_image(image, configured_parent)?;
+        // The command output protocol is line-delimited. Newlines in a
+        // configured path would make it impossible to identify the exact
+        // backing file without a lossy parser.
+        if image.as_os_str().as_bytes().contains(&b'\n')
+            || image.as_os_str().as_bytes().contains(&b'\r')
+        {
+            return Err(BtrfsError::UnsafeImagePath(image));
+        }
+        let mount_root = checked_mount_root(mount_root.as_ref())?;
+        Ok(Self {
+            image,
+            mount_root,
+            marker,
+        })
+    }
+
+    pub fn image(&self) -> &Path {
+        &self.image
+    }
+
+    pub fn mount_root(&self) -> &Path {
+        &self.mount_root
+    }
+
+    pub fn marker(&self) -> &InstanceMarker {
+        &self.marker
+    }
+}
+
+/// Byte-preserving output of one command from the closed privileged command
+/// vocabulary. The runner reports command failures as `BtrfsError`; successful
+/// output is parsed by the executor with command-specific rules.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommandOutput {
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+impl CommandOutput {
+    pub fn success(stdout: impl Into<Vec<u8>>) -> Self {
+        Self {
+            stdout: stdout.into(),
+            stderr: Vec::new(),
+        }
+    }
+}
+
+/// Injection boundary for the privileged helper. Implementations can only run
+/// the fixed `PrivilegedPlan` variants, never a caller-provided program or
+/// argument vector. Tests use this interface without loop or mount privileges.
+pub trait CommandRunner {
+    fn run(&mut self, plan: &PrivilegedPlan) -> Result<CommandOutput, BtrfsError>;
+}
+
+/// The production runner for the closed privileged command vocabulary.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SystemCommandRunner;
+
+impl CommandRunner for SystemCommandRunner {
+    fn run(&mut self, plan: &PrivilegedPlan) -> Result<CommandOutput, BtrfsError> {
+        let output = plan.command().output()?;
+        if output.status.success() {
+            Ok(CommandOutput {
+                stdout: output.stdout,
+                stderr: output.stderr,
+            })
+        } else {
+            Err(BtrfsError::CommandFailed {
+                program: plan.program_name(),
+                status: output.status.code(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            })
+        }
+    }
+}
+
+/// A parsed Btrfs identity reported by the inspected loop device, before a
+/// mount is considered. It deliberately excludes mountpoint-derived data.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InspectedFilesystem {
+    pub filesystem_uuid: [u8; 16],
+    pub label: String,
+}
+
+/// Fixed-purpose privileged loop/Btrfs executor. All device selection is
+/// derived from the configured canonical image. In particular, a loop device
+/// is never persisted or supplied by the caller: after a reboot we inspect all
+/// current associations and reuse only a canonical backing-path match.
+pub struct PrivilegedExecutor<R> {
+    config: PrivilegedExecutorConfig,
+    runner: R,
+}
+
+impl<R: CommandRunner> PrivilegedExecutor<R> {
+    pub fn new(config: PrivilegedExecutorConfig, runner: R) -> Self {
+        Self { config, runner }
+    }
+
+    pub fn config(&self) -> &PrivilegedExecutorConfig {
+        &self.config
+    }
+
+    pub fn into_runner(self) -> R {
+        self.runner
+    }
+
+    /// Finds a pre-existing canonical association, or attaches the configured
+    /// image with `--nooverlap` and verifies the returned association before it
+    /// can be used. Multiple matching loop devices are rejected rather than
+    /// selecting an arbitrary transient loop number.
+    pub fn attach_or_reuse(&mut self) -> Result<String, BtrfsError> {
+        let output = self.run(&PrivilegedPlan::ListLoops)?;
+        let mut matches = Vec::new();
+        for device in parse_loop_device_listing(&output.stdout)? {
+            let backing = self.inspect_loop_backing(&device)?;
+            if backing == self.config.image {
+                matches.push(device);
+            }
+        }
+        match matches.as_slice() {
+            [device] => Ok(device.clone()),
+            [] => {
+                let output = self.run(&PrivilegedPlan::AttachLoop {
+                    image: self.config.image.clone(),
+                })?;
+                let device = parse_attached_loop_device(&output.stdout)?;
+                let backing = self.inspect_loop_backing(&device)?;
+                if backing != self.config.image {
+                    return Err(BtrfsError::LoopBackingMismatch { device, backing });
+                }
+                Ok(device)
+            }
+            // Keep the historical error type so older callers retain their
+            // duplicate-association handling, while refusing to guess.
+            [_, duplicate, ..] => Err(BtrfsError::DuplicateLoopAssociation(duplicate.clone())),
+        }
+    }
+
+    /// Inspects the Btrfs UUID and label on the derived loop device, compares
+    /// both to the instance marker, and only then executes the fixed mount
+    /// plan. Failed identity checks execute no mount command.
+    pub fn mount(&mut self) -> Result<String, BtrfsError> {
+        let device = self.attach_or_reuse()?;
+        self.verify_loop_identity(&device)?;
+        self.run(&PrivilegedPlan::Mount {
+            device: device.clone(),
+            mount_root: self.config.mount_root.clone(),
+        })?;
+        Ok(device)
+    }
+
+    /// Grows only (never shrinks) the configured image. The ordering is
+    /// deliberate and observable: file length first, loop capacity refresh
+    /// second, then the Btrfs filesystem resize at the configured mount root.
+    pub fn grow(&mut self, size: u64) -> Result<(), BtrfsError> {
+        if size == 0 {
+            return Err(BtrfsError::InvalidSize);
+        }
+        let current = fs::metadata(&self.config.image)?.len();
+        if size <= current {
+            return Err(BtrfsError::ShrinkNotSupported {
+                current,
+                requested: size,
+            });
+        }
+        let device = self.attach_or_reuse()?;
+        self.verify_loop_identity(&device)?;
+        self.run(&PrivilegedPlan::GrowImage {
+            image: self.config.image.clone(),
+            size,
+        })?;
+        self.run(&PrivilegedPlan::RefreshLoopCapacity { device })?;
+        self.run(&PrivilegedPlan::ResizeFilesystem {
+            mount_root: self.config.mount_root.clone(),
+        })?;
+        Ok(())
+    }
+
+    fn run(&mut self, plan: &PrivilegedPlan) -> Result<CommandOutput, BtrfsError> {
+        self.runner.run(plan)
+    }
+
+    fn inspect_loop_backing(&mut self, device: &str) -> Result<PathBuf, BtrfsError> {
+        let output = self.run(&PrivilegedPlan::InspectLoopBacking {
+            device: device.to_owned(),
+        })?;
+        let backing = parse_single_backing_path(&output.stdout)?;
+        backing.canonicalize().map_err(BtrfsError::Io)
+    }
+
+    fn verify_loop_identity(&mut self, device: &str) -> Result<InspectedFilesystem, BtrfsError> {
+        let output = self.run(&PrivilegedPlan::InspectFilesystem {
+            device: device.to_owned(),
+        })?;
+        let inspected = parse_blkid_export_identity(&output.stdout)?;
+        verify_instance_identity(
+            &self.config.marker,
+            inspected.filesystem_uuid,
+            &inspected.label,
+        )?;
+        Ok(inspected)
+    }
+}
+
+fn checked_mount_root(path: &Path) -> Result<PathBuf, BtrfsError> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(BtrfsError::InvalidMountRoot);
+    }
+    Ok(path.canonicalize()?)
+}
+
+fn parse_loop_device_listing(output: &[u8]) -> Result<Vec<String>, BtrfsError> {
+    let output = std::str::from_utf8(output)
+        .map_err(|_| BtrfsError::InvalidCommandOutput("losetup --all is not UTF-8"))?;
+    let mut devices = Vec::new();
+    for line in output.lines() {
+        let (device, _) = line
+            .split_once(':')
+            .ok_or(BtrfsError::InvalidCommandOutput(
+                "malformed losetup --all line",
+            ))?;
+        if !is_loop_device(device) || devices.iter().any(|known| known == device) {
+            return Err(BtrfsError::InvalidCommandOutput(
+                "invalid or duplicate loop device",
+            ));
+        }
+        devices.push(device.to_owned());
+    }
+    Ok(devices)
+}
+
+fn parse_attached_loop_device(output: &[u8]) -> Result<String, BtrfsError> {
+    let output = std::str::from_utf8(output)
+        .map_err(|_| BtrfsError::InvalidCommandOutput("losetup device is not UTF-8"))?;
+    let device = output
+        .strip_suffix("\r\n")
+        .or_else(|| output.strip_suffix('\n'))
+        .unwrap_or(output);
+    if !is_loop_device(device) || device.is_empty() {
+        return Err(BtrfsError::InvalidCommandOutput(
+            "invalid losetup --show device",
+        ));
+    }
+    Ok(device.to_owned())
+}
+
+fn parse_single_backing_path(output: &[u8]) -> Result<PathBuf, BtrfsError> {
+    let output = output
+        .strip_suffix(b"\r\n")
+        .or_else(|| output.strip_suffix(b"\n"))
+        .unwrap_or(output);
+    if output.is_empty() || output.contains(&b'\n') || output.contains(&b'\r') {
+        return Err(BtrfsError::InvalidCommandOutput(
+            "invalid loop backing path",
+        ));
+    }
+    Ok(PathBuf::from(OsString::from_vec(output.to_vec())))
+}
+
+/// Parses the narrow `blkid --output export --match-token TYPE=btrfs` result.
+/// Duplicate fields, a missing `TYPE=btrfs`, or noncanonical UUIDs are all
+/// rejected before marker comparison.
+pub fn parse_blkid_export_identity(output: &[u8]) -> Result<InspectedFilesystem, BtrfsError> {
+    let output = std::str::from_utf8(output)
+        .map_err(|_| BtrfsError::InvalidCommandOutput("blkid output is not UTF-8"))?;
+    let mut uuid = None;
+    let mut label = None;
+    let mut btrfs = false;
+    for line in output.lines() {
+        let (key, value) = line
+            .split_once('=')
+            .ok_or(BtrfsError::InvalidCommandOutput(
+                "malformed blkid export line",
+            ))?;
+        match key {
+            "UUID" => {
+                if uuid
+                    .replace(
+                        parse_filesystem_uuid(value)
+                            .ok_or(BtrfsError::InvalidCommandOutput("invalid Btrfs UUID"))?,
+                    )
+                    .is_some()
+                {
+                    return Err(BtrfsError::InvalidCommandOutput("duplicate Btrfs UUID"));
+                }
+            }
+            "LABEL" => {
+                if label.replace(value.to_owned()).is_some() {
+                    return Err(BtrfsError::InvalidCommandOutput("duplicate Btrfs label"));
+                }
+            }
+            "TYPE" if value == "btrfs" => btrfs = true,
+            "TYPE" => return Err(BtrfsError::InvalidCommandOutput("non-Btrfs blkid type")),
+            _ => {}
+        }
+    }
+    if !btrfs {
+        return Err(BtrfsError::InvalidCommandOutput("missing Btrfs type"));
+    }
+    Ok(InspectedFilesystem {
+        filesystem_uuid: uuid.ok_or(BtrfsError::InvalidCommandOutput("missing Btrfs UUID"))?,
+        label: label.ok_or(BtrfsError::InvalidCommandOutput("missing Btrfs label"))?,
     })
 }
 
@@ -582,7 +1004,10 @@ fn run_btrfs_subvolume_create(path: &Path) -> Result<(), BtrfsError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::{
+        collections::VecDeque,
+        time::{SystemTime, UNIX_EPOCH},
+    };
     #[test]
     fn layout_keeps_clone_paths_under_one_root() {
         let root = std::env::temp_dir().join(format!(
@@ -718,6 +1143,265 @@ mod tests {
         ));
         let plan = PrivilegedPlan::attach(&image, &parent, "").unwrap();
         assert!(format!("{:?}", plan.command()).contains("losetup"));
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[derive(Default)]
+    struct RecordedRunner {
+        expected: VecDeque<(PrivilegedPlan, CommandOutput)>,
+        seen: Vec<PrivilegedPlan>,
+    }
+
+    impl RecordedRunner {
+        fn new(expected: impl IntoIterator<Item = (PrivilegedPlan, CommandOutput)>) -> Self {
+            Self {
+                expected: expected.into_iter().collect(),
+                seen: Vec::new(),
+            }
+        }
+    }
+
+    impl CommandRunner for RecordedRunner {
+        fn run(&mut self, plan: &PrivilegedPlan) -> Result<CommandOutput, BtrfsError> {
+            let (expected, output) = self
+                .expected
+                .pop_front()
+                .expect("unexpected fixed-purpose command");
+            assert_eq!(&expected, plan);
+            self.seen.push(plan.clone());
+            Ok(output)
+        }
+    }
+
+    fn executor_fixture(name: &str) -> (PathBuf, PathBuf, PrivilegedExecutorConfig) {
+        let parent = temp_path(name);
+        fs::create_dir(&parent).unwrap();
+        let image =
+            initialize_loopback_image(parent.join("hot.btrfs"), 4096, ImageAllocation::Sparse)
+                .unwrap();
+        let config = PrivilegedExecutorConfig::new(
+            &image,
+            &parent,
+            &parent,
+            InstanceMarker {
+                instance_uuid: [4; 16],
+                filesystem_uuid: [5; 16],
+                label: "test-instance".into(),
+            },
+        )
+        .unwrap();
+        (parent, image, config)
+    }
+
+    fn btrfs_identity(label: &str) -> CommandOutput {
+        CommandOutput::success(format!(
+            "DEVNAME=/dev/loop7\nUUID=05050505-0505-0505-0505-050505050505\nTYPE=btrfs\nLABEL={label}\n"
+        ))
+    }
+
+    fn backing_output(image: &Path) -> CommandOutput {
+        let mut output = image.as_os_str().as_bytes().to_vec();
+        output.push(b'\n');
+        CommandOutput::success(output)
+    }
+
+    #[test]
+    fn executor_reuses_reboot_style_association_after_canonical_verification() {
+        let (parent, image, config) = executor_fixture("reflink-forest-reattach");
+        let runner = RecordedRunner::new([
+            (
+                PrivilegedPlan::ListLoops,
+                CommandOutput::success("/dev/loop7: [2065]:4 (old-path)\n"),
+            ),
+            (
+                PrivilegedPlan::InspectLoopBacking {
+                    device: "/dev/loop7".into(),
+                },
+                backing_output(&image),
+            ),
+            (
+                PrivilegedPlan::InspectFilesystem {
+                    device: "/dev/loop7".into(),
+                },
+                btrfs_identity("test-instance"),
+            ),
+            (
+                PrivilegedPlan::Mount {
+                    device: "/dev/loop7".into(),
+                    mount_root: parent.clone(),
+                },
+                CommandOutput::success(Vec::new()),
+            ),
+        ]);
+        let mut executor = PrivilegedExecutor::new(config, runner);
+        assert_eq!(executor.mount().unwrap(), "/dev/loop7");
+        let runner = executor.into_runner();
+        assert!(runner
+            .seen
+            .iter()
+            .all(|plan| !matches!(plan, PrivilegedPlan::AttachLoop { .. })));
+        assert!(runner.expected.is_empty());
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn executor_rejects_duplicate_canonical_loop_associations() {
+        let (parent, image, config) = executor_fixture("reflink-forest-duplicate-loop");
+        let runner = RecordedRunner::new([
+            (
+                PrivilegedPlan::ListLoops,
+                CommandOutput::success("/dev/loop7: first\n/dev/loop8: second\n"),
+            ),
+            (
+                PrivilegedPlan::InspectLoopBacking {
+                    device: "/dev/loop7".into(),
+                },
+                backing_output(&image),
+            ),
+            (
+                PrivilegedPlan::InspectLoopBacking {
+                    device: "/dev/loop8".into(),
+                },
+                backing_output(&image),
+            ),
+        ]);
+        let mut executor = PrivilegedExecutor::new(config, runner);
+        assert!(matches!(
+            executor.attach_or_reuse(),
+            Err(BtrfsError::DuplicateLoopAssociation(device)) if device == "/dev/loop8"
+        ));
+        let runner = executor.into_runner();
+        assert!(runner.expected.is_empty());
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn executor_rejects_wrong_inspected_identity_before_mount() {
+        let (parent, image, config) = executor_fixture("reflink-forest-wrong-identity");
+        let runner = RecordedRunner::new([
+            (
+                PrivilegedPlan::ListLoops,
+                CommandOutput::success("/dev/loop7: existing\n"),
+            ),
+            (
+                PrivilegedPlan::InspectLoopBacking {
+                    device: "/dev/loop7".into(),
+                },
+                backing_output(&image),
+            ),
+            (
+                PrivilegedPlan::InspectFilesystem {
+                    device: "/dev/loop7".into(),
+                },
+                btrfs_identity("wrong-instance"),
+            ),
+        ]);
+        let mut executor = PrivilegedExecutor::new(config, runner);
+        assert!(matches!(
+            executor.mount(),
+            Err(BtrfsError::IdentityMismatch)
+        ));
+        let runner = executor.into_runner();
+        assert!(runner.expected.is_empty());
+        assert!(runner
+            .seen
+            .iter()
+            .all(|plan| !matches!(plan, PrivilegedPlan::Mount { .. })));
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn executor_attaches_with_nooverlap_and_grows_in_required_order() {
+        let (parent, image, config) = executor_fixture("reflink-forest-grow-sequence");
+        let runner = RecordedRunner::new([
+            (
+                PrivilegedPlan::ListLoops,
+                CommandOutput::success(Vec::new()),
+            ),
+            (
+                PrivilegedPlan::AttachLoop {
+                    image: image.clone(),
+                },
+                CommandOutput::success("/dev/loop7\n"),
+            ),
+            (
+                PrivilegedPlan::InspectLoopBacking {
+                    device: "/dev/loop7".into(),
+                },
+                backing_output(&image),
+            ),
+            (
+                PrivilegedPlan::InspectFilesystem {
+                    device: "/dev/loop7".into(),
+                },
+                btrfs_identity("test-instance"),
+            ),
+            (
+                PrivilegedPlan::GrowImage {
+                    image: image.clone(),
+                    size: 8192,
+                },
+                CommandOutput::success(Vec::new()),
+            ),
+            (
+                PrivilegedPlan::RefreshLoopCapacity {
+                    device: "/dev/loop7".into(),
+                },
+                CommandOutput::success(Vec::new()),
+            ),
+            (
+                PrivilegedPlan::ResizeFilesystem {
+                    mount_root: parent.clone(),
+                },
+                CommandOutput::success(Vec::new()),
+            ),
+        ]);
+        let mut executor = PrivilegedExecutor::new(config, runner);
+        executor.grow(8192).unwrap();
+        let runner = executor.into_runner();
+        assert!(runner.expected.is_empty());
+        let attach = runner
+            .seen
+            .iter()
+            .find(|plan| matches!(plan, PrivilegedPlan::AttachLoop { .. }))
+            .unwrap()
+            .command();
+        assert_eq!(
+            attach
+                .get_args()
+                .map(|arg| arg.as_bytes().to_vec())
+                .collect::<Vec<_>>(),
+            vec![
+                b"--find".to_vec(),
+                b"--show".to_vec(),
+                b"--nooverlap".to_vec(),
+                image.as_os_str().as_bytes().to_vec(),
+            ]
+        );
+        let operation_order = runner
+            .seen
+            .iter()
+            .filter(|plan| {
+                matches!(
+                    plan,
+                    PrivilegedPlan::GrowImage { .. }
+                        | PrivilegedPlan::RefreshLoopCapacity { .. }
+                        | PrivilegedPlan::ResizeFilesystem { .. }
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            operation_order[0],
+            PrivilegedPlan::GrowImage { .. }
+        ));
+        assert!(matches!(
+            operation_order[1],
+            PrivilegedPlan::RefreshLoopCapacity { .. }
+        ));
+        assert!(matches!(
+            operation_order[2],
+            PrivilegedPlan::ResizeFilesystem { .. }
+        ));
         fs::remove_dir_all(parent).unwrap();
     }
 

@@ -11,21 +11,98 @@ use reflink_forest_format::Codec;
 
 pub const CATALOG_VERSION: u8 = 1;
 pub const REPO_ID_LEN: usize = 16;
+pub const SNAPSHOT_ID_LEN: usize = 16;
 pub const WORKSPACE_ID_LEN: usize = 16;
+pub const GC_PIN_ID_LEN: usize = 16;
 
 /// The fixed metadata key that identifies the generation new readers should
 /// use. Its value is an encoded unsigned 32-bit generation number.
 pub const CURRENT_GENERATION_META_KEY: &[u8] = b"current_generation";
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Hash)]
 pub struct RepoId(pub [u8; REPO_ID_LEN]);
+
+/// Stable identity of one imported repository snapshot.
+///
+/// The import manifest owns the snapshot's descriptive fields. The catalog
+/// records only whether that manifest is visible as a GC root, so a failed or
+/// incomplete import cannot retain cold data accidentally.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Hash)]
+pub struct SnapshotId(pub [u8; SNAPSHOT_ID_LEN]);
 
 /// Stable identifier for a published workspace.
 ///
 /// As with repository IDs, the catalog stores this value as raw bytes rather
 /// than a textual UUID so it is independent of any presentation format.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Hash)]
 pub struct WorkspaceId(pub [u8; WORKSPACE_ID_LEN]);
+
+/// Stable identity for an explicit cold-generation retention pin.
+///
+/// These pins are for durable operations such as a checkpoint or an
+/// in-progress compaction. Workspace pins intentionally use their workspace
+/// identity instead, so deleting a workspace never risks deleting an
+/// unrelated operational pin.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Hash)]
+pub struct GcPinId(pub [u8; GC_PIN_ID_LEN]);
+
+/// Visibility of a repository snapshot in the catalog.
+///
+/// Only `Ready` snapshots are roots during the GC mark phase. `Incomplete`
+/// is persisted so recovery can distinguish an unfinished import from a
+/// snapshot that was intentionally deleted.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[repr(u8)]
+pub enum SnapshotVisibility {
+    Incomplete = 1,
+    Ready = 2,
+}
+impl SnapshotVisibility {
+    const fn from_tag(tag: u8) -> Option<Self> {
+        match tag {
+            1 => Some(Self::Incomplete),
+            2 => Some(Self::Ready),
+            _ => None,
+        }
+    }
+}
+
+/// A repository snapshot record discovered during durable catalog scans.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct RepositorySnapshot {
+    pub repository: RepoId,
+    pub snapshot: SnapshotId,
+    pub visibility: SnapshotVisibility,
+}
+
+/// A cold-generation retention pin discovered during durable catalog scans.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct GcPin {
+    pub id: GcPinId,
+    pub generation: u32,
+}
+
+/// One durable starting point for the GC mark phase or an old-generation
+/// retention decision.
+///
+/// A compactor resolves ready snapshot IDs to their durable manifests and
+/// walks the referenced Git object graph. Generation pins are independent:
+/// they keep an old generation available until a workspace or operation no
+/// longer needs it.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum GcRoot {
+    RepositorySnapshot {
+        repository: RepoId,
+        snapshot: SnapshotId,
+    },
+    WorkspacePin {
+        workspace: WorkspaceId,
+        generation: u32,
+    },
+    ExplicitPin {
+        pin: GcPin,
+    },
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ObjectLocation {
@@ -161,6 +238,60 @@ pub fn encode_content_id_value(id: ContentId) -> [u8; 33] {
 }
 pub fn decode_content_id_value(input: &[u8]) -> Result<ContentId, CatalogError> {
     decode_object_location_key(input)
+}
+
+/// Versioned `repositories` key: version then RepoId.
+pub fn encode_repository_key(id: RepoId) -> [u8; 17] {
+    let mut out = [0_u8; 17];
+    out[0] = CATALOG_VERSION;
+    out[1..].copy_from_slice(&id.0);
+    out
+}
+
+/// Decodes a versioned `repositories` key.
+pub fn decode_repository_key(input: &[u8]) -> Result<RepoId, CatalogError> {
+    if input.len() != 17 {
+        return Err(CatalogError::InvalidEncoding);
+    }
+    check_version(input[0])?;
+    Ok(RepoId(
+        input[1..].try_into().expect("fixed repository ID length"),
+    ))
+}
+
+/// Versioned `repo_snapshots` key: version, RepoId, then SnapshotId.
+pub fn encode_repository_snapshot_key(repository: RepoId, snapshot: SnapshotId) -> [u8; 33] {
+    let mut out = [0_u8; 33];
+    out[0] = CATALOG_VERSION;
+    out[1..17].copy_from_slice(&repository.0);
+    out[17..].copy_from_slice(&snapshot.0);
+    out
+}
+
+/// Decodes a versioned `repo_snapshots` key.
+pub fn decode_repository_snapshot_key(input: &[u8]) -> Result<(RepoId, SnapshotId), CatalogError> {
+    if input.len() != 33 {
+        return Err(CatalogError::InvalidEncoding);
+    }
+    check_version(input[0])?;
+    Ok((
+        RepoId(input[1..17].try_into().expect("fixed repository ID length")),
+        SnapshotId(input[17..].try_into().expect("fixed snapshot ID length")),
+    ))
+}
+
+/// Versioned `repo_snapshots` visibility value.
+pub fn encode_snapshot_visibility_value(value: SnapshotVisibility) -> [u8; 2] {
+    [CATALOG_VERSION, value as u8]
+}
+
+/// Decodes a versioned `repo_snapshots` visibility value.
+pub fn decode_snapshot_visibility_value(input: &[u8]) -> Result<SnapshotVisibility, CatalogError> {
+    if input.len() != 2 {
+        return Err(CatalogError::InvalidEncoding);
+    }
+    check_version(input[0])?;
+    SnapshotVisibility::from_tag(input[1]).ok_or(CatalogError::InvalidEncoding)
 }
 
 /// Versioned `chunks` key: version, generation, chunk ID.
@@ -313,6 +444,44 @@ pub fn decode_workspace_pin_value(input: &[u8]) -> Result<u32, CatalogError> {
     decode_current_generation_value(input)
 }
 
+// `pins` already contains the legacy-compatible workspace key shape
+// `[version, workspace-id]`. Explicit operational pins use a different fixed
+// length and a domain byte, so every decoded key remains unambiguous.
+const EXPLICIT_GC_PIN_KEY_TAG: u8 = 1;
+
+/// Versioned `pins` key for an explicit operational generation pin.
+pub fn encode_gc_pin_key(id: GcPinId) -> [u8; 18] {
+    let mut out = [0_u8; 18];
+    out[0] = CATALOG_VERSION;
+    out[1] = EXPLICIT_GC_PIN_KEY_TAG;
+    out[2..].copy_from_slice(&id.0);
+    out
+}
+
+/// Decodes a versioned explicit operational pin key.
+pub fn decode_gc_pin_key(input: &[u8]) -> Result<GcPinId, CatalogError> {
+    if input.len() != 18 {
+        return Err(CatalogError::InvalidEncoding);
+    }
+    check_version(input[0])?;
+    if input[1] != EXPLICIT_GC_PIN_KEY_TAG {
+        return Err(CatalogError::InvalidEncoding);
+    }
+    Ok(GcPinId(
+        input[2..].try_into().expect("fixed GC pin ID length"),
+    ))
+}
+
+/// Versioned generation value used by explicit operational pins.
+pub fn encode_gc_pin_value(generation: u32) -> [u8; 5] {
+    encode_workspace_pin_value(generation)
+}
+
+/// Decodes the generation value used by explicit operational pins.
+pub fn decode_gc_pin_value(input: &[u8]) -> Result<u32, CatalogError> {
+    decode_workspace_pin_value(input)
+}
+
 /// Versioned `jobs` key. Job IDs are deliberately opaque to the catalog.
 pub fn encode_job_key(job_id: &[u8]) -> Vec<u8> {
     encode_opaque_key(job_id)
@@ -331,11 +500,18 @@ pub struct CatalogBatch {
 enum Operation {
     ObjectLocation(ContentId, ObjectLocation),
     OidAlias(RepoId, GitOid, ContentId),
+    Repository(RepoId, Vec<u8>),
+    DeleteRepository(RepoId),
+    RepositorySnapshot(RepoId, SnapshotId, SnapshotVisibility),
+    DeleteRepositorySnapshot(RepoId, SnapshotId),
     ChunkMetadata(u32, u64, ChunkMetadata),
     Meta(Vec<u8>, Vec<u8>),
     Workspace(WorkspaceId, Vec<u8>),
     WorkspaceName(Vec<u8>, WorkspaceId),
     WorkspacePin(WorkspaceId, u32),
+    DeleteWorkspacePin(WorkspaceId),
+    GcPin(GcPinId, u32),
+    DeleteGcPin(GcPinId),
     Job(Vec<u8>, Vec<u8>),
 }
 impl CatalogBatch {
@@ -348,6 +524,37 @@ impl CatalogBatch {
     }
     pub fn put_oid_alias(&mut self, repo: RepoId, oid: GitOid, id: ContentId) {
         self.operations.push(Operation::OidAlias(repo, oid, id));
+    }
+    /// Stores opaque, versioned repository metadata. The import layer owns
+    /// the record format; this entry is removed atomically with a repository's
+    /// snapshot visibility records by [`Catalog::delete_repository`].
+    pub fn put_repository(&mut self, id: RepoId, record: impl AsRef<[u8]>) {
+        self.operations
+            .push(Operation::Repository(id, record.as_ref().to_vec()));
+    }
+    /// Removes an opaque repository metadata record. Prefer
+    /// [`Catalog::delete_repository`] for normal deletion so no visible
+    /// snapshots are accidentally left behind.
+    pub fn delete_repository(&mut self, id: RepoId) {
+        self.operations.push(Operation::DeleteRepository(id));
+    }
+    /// Sets the durable visibility of one repository snapshot. The import
+    /// manifest must be synchronized before callers publish `Ready`.
+    pub fn put_repository_snapshot(
+        &mut self,
+        repository: RepoId,
+        snapshot: SnapshotId,
+        visibility: SnapshotVisibility,
+    ) {
+        self.operations.push(Operation::RepositorySnapshot(
+            repository, snapshot, visibility,
+        ));
+    }
+    /// Removes one snapshot from catalog visibility. It ceases to be a GC
+    /// root in the same synchronous write that removes this record.
+    pub fn delete_repository_snapshot(&mut self, repository: RepoId, snapshot: SnapshotId) {
+        self.operations
+            .push(Operation::DeleteRepositorySnapshot(repository, snapshot));
     }
     pub fn put_chunk(&mut self, generation: u32, chunk_id: u64, metadata: ChunkMetadata) {
         self.operations
@@ -385,6 +592,18 @@ impl CatalogBatch {
         self.operations
             .push(Operation::WorkspacePin(id, generation));
     }
+    /// Removes a workspace's old-generation retention pin.
+    pub fn delete_workspace_pin(&mut self, id: WorkspaceId) {
+        self.operations.push(Operation::DeleteWorkspacePin(id));
+    }
+    /// Adds or replaces an explicit operational generation pin.
+    pub fn put_gc_pin(&mut self, id: GcPinId, generation: u32) {
+        self.operations.push(Operation::GcPin(id, generation));
+    }
+    /// Removes an explicit operational generation pin.
+    pub fn delete_gc_pin(&mut self, id: GcPinId) {
+        self.operations.push(Operation::DeleteGcPin(id));
+    }
     /// Stores an opaque durable job record. Job-ID allocation and record
     /// contents are owned by the daemon layer.
     pub fn put_job(&mut self, job_id: impl AsRef<[u8]>, record: impl AsRef<[u8]>) {
@@ -399,6 +618,42 @@ pub trait Catalog {
     fn apply(&mut self, batch: CatalogBatch) -> Result<(), CatalogError>;
     fn object_location(&self, id: ContentId) -> Option<ObjectLocation>;
     fn oid_alias(&self, repo: RepoId, oid: &GitOid) -> Option<ContentId>;
+    /// Returns opaque repository metadata after checking the catalog version.
+    fn repository(&self, _id: RepoId) -> Option<Vec<u8>> {
+        None
+    }
+    /// Reads one repository snapshot visibility record.
+    fn repository_snapshot(
+        &self,
+        _repository: RepoId,
+        _snapshot: SnapshotId,
+    ) -> Option<SnapshotVisibility> {
+        None
+    }
+    /// Enumerates snapshot visibility records in deterministic order.
+    ///
+    /// Implementations must return an error instead of silently skipping an
+    /// invalid stored record: a compactor needs fail-closed root discovery.
+    fn repository_snapshots(&self) -> Result<Vec<RepositorySnapshot>, CatalogError> {
+        Ok(Vec::new())
+    }
+    /// Deletes repository metadata and every visible or incomplete snapshot
+    /// record in a single synchronous catalog batch.
+    ///
+    /// Snapshot manifests are intentionally not deleted here. Once the
+    /// catalog batch commits they are no longer visible roots and can be
+    /// reclaimed asynchronously, just like retired chunk generations.
+    fn delete_repository(&mut self, repository: RepoId) -> Result<(), CatalogError> {
+        let snapshots = self.repository_snapshots()?;
+        let mut batch = CatalogBatch::new();
+        batch.delete_repository(repository);
+        for snapshot in snapshots {
+            if snapshot.repository == repository {
+                batch.delete_repository_snapshot(repository, snapshot.snapshot);
+            }
+        }
+        self.apply(batch)
+    }
     fn chunk(&self, generation: u32, chunk_id: u64) -> Option<ChunkMetadata>;
     /// Returns an opaque metadata value after checking the catalog version.
     ///
@@ -425,6 +680,44 @@ pub trait Catalog {
     fn workspace_pin(&self, _id: WorkspaceId) -> Option<u32> {
         None
     }
+    /// Enumerates workspace generation pins in deterministic order.
+    fn workspace_pins(&self) -> Result<Vec<(WorkspaceId, u32)>, CatalogError> {
+        Ok(Vec::new())
+    }
+    /// Enumerates explicit operational generation pins in deterministic order.
+    fn gc_pins(&self) -> Result<Vec<GcPin>, CatalogError> {
+        Ok(Vec::new())
+    }
+    /// Enumerates every durable root used by cold GC.
+    ///
+    /// Repository snapshots identify object-graph mark roots; workspace and
+    /// operational pins retain old generations until they are released.
+    fn gc_roots(&self) -> Result<Vec<GcRoot>, CatalogError> {
+        let mut roots = Vec::new();
+        for snapshot in self.repository_snapshots()? {
+            if snapshot.visibility == SnapshotVisibility::Ready {
+                roots.push(GcRoot::RepositorySnapshot {
+                    repository: snapshot.repository,
+                    snapshot: snapshot.snapshot,
+                });
+            }
+        }
+        roots.extend(
+            self.workspace_pins()?
+                .into_iter()
+                .map(|(workspace, generation)| GcRoot::WorkspacePin {
+                    workspace,
+                    generation,
+                }),
+        );
+        roots.extend(
+            self.gc_pins()?
+                .into_iter()
+                .map(|pin| GcRoot::ExplicitPin { pin }),
+        );
+        roots.sort_unstable();
+        Ok(roots)
+    }
     /// Returns an opaque durable job record after checking the catalog version.
     fn job(&self, _job_id: &[u8]) -> Option<Vec<u8>> {
         None
@@ -435,11 +728,14 @@ pub trait Catalog {
 pub struct InMemoryCatalog {
     objects: HashMap<ContentId, ObjectLocation>,
     aliases: HashMap<(RepoId, GitOid), ContentId>,
+    repositories: HashMap<RepoId, Vec<u8>>,
+    repository_snapshots: HashMap<(RepoId, SnapshotId), SnapshotVisibility>,
     chunks: HashMap<(u32, u64), ChunkMetadata>,
     meta: HashMap<Vec<u8>, Vec<u8>>,
     workspaces: HashMap<WorkspaceId, Vec<u8>>,
     workspace_names: HashMap<Vec<u8>, WorkspaceId>,
     workspace_pins: HashMap<WorkspaceId, u32>,
+    gc_pins: HashMap<GcPinId, u32>,
     jobs: HashMap<Vec<u8>, Vec<u8>>,
 }
 impl Catalog for InMemoryCatalog {
@@ -454,6 +750,20 @@ impl Catalog for InMemoryCatalog {
                 Operation::ChunkMetadata(generation, chunk_id, metadata) => {
                     staged.chunks.insert((generation, chunk_id), metadata);
                 }
+                Operation::Repository(id, record) => {
+                    staged.repositories.insert(id, record);
+                }
+                Operation::DeleteRepository(id) => {
+                    staged.repositories.remove(&id);
+                }
+                Operation::RepositorySnapshot(repository, snapshot, visibility) => {
+                    staged
+                        .repository_snapshots
+                        .insert((repository, snapshot), visibility);
+                }
+                Operation::DeleteRepositorySnapshot(repository, snapshot) => {
+                    staged.repository_snapshots.remove(&(repository, snapshot));
+                }
                 Operation::Meta(key, value) => {
                     staged.meta.insert(key, value);
                 }
@@ -465,6 +775,15 @@ impl Catalog for InMemoryCatalog {
                 }
                 Operation::WorkspacePin(id, generation) => {
                     staged.workspace_pins.insert(id, generation);
+                }
+                Operation::DeleteWorkspacePin(id) => {
+                    staged.workspace_pins.remove(&id);
+                }
+                Operation::GcPin(id, generation) => {
+                    staged.gc_pins.insert(id, generation);
+                }
+                Operation::DeleteGcPin(id) => {
+                    staged.gc_pins.remove(&id);
                 }
                 Operation::Job(job_id, record) => {
                     staged.jobs.insert(job_id, record);
@@ -493,6 +812,33 @@ impl Catalog for InMemoryCatalog {
     fn oid_alias(&self, repo: RepoId, oid: &GitOid) -> Option<ContentId> {
         self.aliases.get(&(repo, *oid)).copied()
     }
+    fn repository(&self, id: RepoId) -> Option<Vec<u8>> {
+        self.repositories.get(&id).cloned()
+    }
+    fn repository_snapshot(
+        &self,
+        repository: RepoId,
+        snapshot: SnapshotId,
+    ) -> Option<SnapshotVisibility> {
+        self.repository_snapshots
+            .get(&(repository, snapshot))
+            .copied()
+    }
+    fn repository_snapshots(&self) -> Result<Vec<RepositorySnapshot>, CatalogError> {
+        let mut snapshots: Vec<_> = self
+            .repository_snapshots
+            .iter()
+            .map(
+                |(&(repository, snapshot), &visibility)| RepositorySnapshot {
+                    repository,
+                    snapshot,
+                    visibility,
+                },
+            )
+            .collect();
+        snapshots.sort_unstable();
+        Ok(snapshots)
+    }
     fn chunk(&self, generation: u32, chunk_id: u64) -> Option<ChunkMetadata> {
         self.chunks.get(&(generation, chunk_id)).copied()
     }
@@ -507,6 +853,24 @@ impl Catalog for InMemoryCatalog {
     }
     fn workspace_pin(&self, id: WorkspaceId) -> Option<u32> {
         self.workspace_pins.get(&id).copied()
+    }
+    fn workspace_pins(&self) -> Result<Vec<(WorkspaceId, u32)>, CatalogError> {
+        let mut pins: Vec<_> = self
+            .workspace_pins
+            .iter()
+            .map(|(&workspace, &generation)| (workspace, generation))
+            .collect();
+        pins.sort_unstable();
+        Ok(pins)
+    }
+    fn gc_pins(&self) -> Result<Vec<GcPin>, CatalogError> {
+        let mut pins: Vec<_> = self
+            .gc_pins
+            .iter()
+            .map(|(&id, &generation)| GcPin { id, generation })
+            .collect();
+        pins.sort_unstable();
+        Ok(pins)
     }
     fn job(&self, job_id: &[u8]) -> Option<Vec<u8>> {
         self.jobs.get(job_id).cloned()
@@ -592,6 +956,8 @@ impl Catalog for RocksDbCatalog {
     fn apply(&mut self, batch: CatalogBatch) -> Result<(), CatalogError> {
         let object_cf = self.cf(CF_OBJECT_LOCATIONS)?;
         let alias_cf = self.cf(CF_OID_ALIASES)?;
+        let repository_cf = self.cf(CF_REPOSITORIES)?;
+        let snapshot_cf = self.cf(CF_REPO_SNAPSHOTS)?;
         let chunk_cf = self.cf(CF_CHUNKS)?;
         let meta_cf = self.cf(CF_META)?;
         let workspace_cf = self.cf(CF_WORKSPACES)?;
@@ -641,6 +1007,23 @@ impl Catalog for RocksDbCatalog {
                     encode_oid_alias_key(repo, &oid),
                     encode_content_id_value(id),
                 ),
+                Operation::Repository(id, record) => writes.put_cf(
+                    repository_cf,
+                    encode_repository_key(id),
+                    encode_opaque_value(&record),
+                ),
+                Operation::DeleteRepository(id) => {
+                    writes.delete_cf(repository_cf, encode_repository_key(id))
+                }
+                Operation::RepositorySnapshot(repository, snapshot, visibility) => writes.put_cf(
+                    snapshot_cf,
+                    encode_repository_snapshot_key(repository, snapshot),
+                    encode_snapshot_visibility_value(visibility),
+                ),
+                Operation::DeleteRepositorySnapshot(repository, snapshot) => writes.delete_cf(
+                    snapshot_cf,
+                    encode_repository_snapshot_key(repository, snapshot),
+                ),
                 Operation::ChunkMetadata(generation, chunk_id, metadata) => writes.put_cf(
                     chunk_cf,
                     encode_chunk_key(generation, chunk_id),
@@ -664,6 +1047,15 @@ impl Catalog for RocksDbCatalog {
                     encode_workspace_pin_key(id),
                     encode_workspace_pin_value(generation),
                 ),
+                Operation::DeleteWorkspacePin(id) => {
+                    writes.delete_cf(pin_cf, encode_workspace_pin_key(id))
+                }
+                Operation::GcPin(id, generation) => writes.put_cf(
+                    pin_cf,
+                    encode_gc_pin_key(id),
+                    encode_gc_pin_value(generation),
+                ),
+                Operation::DeleteGcPin(id) => writes.delete_cf(pin_cf, encode_gc_pin_key(id)),
                 Operation::Job(job_id, record) => writes.put_cf(
                     job_cf,
                     encode_job_key(&job_id),
@@ -697,6 +1089,46 @@ impl Catalog for RocksDbCatalog {
             )
             .ok()??;
         decode_content_id_value(&value).ok()
+    }
+    fn repository(&self, id: RepoId) -> Option<Vec<u8>> {
+        let value = self
+            .db
+            .get_cf(self.cf(CF_REPOSITORIES).ok()?, encode_repository_key(id))
+            .ok()??;
+        decode_opaque_value(&value).ok()
+    }
+    fn repository_snapshot(
+        &self,
+        repository: RepoId,
+        snapshot: SnapshotId,
+    ) -> Option<SnapshotVisibility> {
+        let value = self
+            .db
+            .get_cf(
+                self.cf(CF_REPO_SNAPSHOTS).ok()?,
+                encode_repository_snapshot_key(repository, snapshot),
+            )
+            .ok()??;
+        decode_snapshot_visibility_value(&value).ok()
+    }
+    fn repository_snapshots(&self) -> Result<Vec<RepositorySnapshot>, CatalogError> {
+        let snapshot_cf = self.cf(CF_REPO_SNAPSHOTS)?;
+        let mut snapshots = Vec::new();
+        for entry in self
+            .db
+            .iterator_cf(snapshot_cf, rocksdb::IteratorMode::Start)
+        {
+            let (key, value) = entry.map_err(|error| CatalogError::Backend(error.to_string()))?;
+            let (repository, snapshot) = decode_repository_snapshot_key(&key)?;
+            let visibility = decode_snapshot_visibility_value(&value)?;
+            snapshots.push(RepositorySnapshot {
+                repository,
+                snapshot,
+                visibility,
+            });
+        }
+        snapshots.sort_unstable();
+        Ok(snapshots)
     }
     fn chunk(&self, generation: u32, chunk_id: u64) -> Option<ChunkMetadata> {
         let value = self
@@ -738,6 +1170,40 @@ impl Catalog for RocksDbCatalog {
             .get_cf(self.cf(CF_PINS).ok()?, encode_workspace_pin_key(id))
             .ok()??;
         decode_workspace_pin_value(&value).ok()
+    }
+    fn workspace_pins(&self) -> Result<Vec<(WorkspaceId, u32)>, CatalogError> {
+        let pin_cf = self.cf(CF_PINS)?;
+        let mut pins = Vec::new();
+        for entry in self.db.iterator_cf(pin_cf, rocksdb::IteratorMode::Start) {
+            let (key, value) = entry.map_err(|error| CatalogError::Backend(error.to_string()))?;
+            if key.len() == 17 {
+                pins.push((
+                    decode_workspace_pin_key(&key)?,
+                    decode_workspace_pin_value(&value)?,
+                ));
+            } else if key.len() != 18 {
+                return Err(CatalogError::InvalidEncoding);
+            }
+        }
+        pins.sort_unstable();
+        Ok(pins)
+    }
+    fn gc_pins(&self) -> Result<Vec<GcPin>, CatalogError> {
+        let pin_cf = self.cf(CF_PINS)?;
+        let mut pins = Vec::new();
+        for entry in self.db.iterator_cf(pin_cf, rocksdb::IteratorMode::Start) {
+            let (key, value) = entry.map_err(|error| CatalogError::Backend(error.to_string()))?;
+            if key.len() == 18 {
+                pins.push(GcPin {
+                    id: decode_gc_pin_key(&key)?,
+                    generation: decode_gc_pin_value(&value)?,
+                });
+            } else if key.len() != 17 {
+                return Err(CatalogError::InvalidEncoding);
+            }
+        }
+        pins.sort_unstable();
+        Ok(pins)
     }
     fn job(&self, job_id: &[u8]) -> Option<Vec<u8>> {
         let value = self
@@ -805,6 +1271,12 @@ mod tests {
     fn workspace_id(byte: u8) -> WorkspaceId {
         WorkspaceId([byte; WORKSPACE_ID_LEN])
     }
+    fn snapshot_id(byte: u8) -> SnapshotId {
+        SnapshotId([byte; SNAPSHOT_ID_LEN])
+    }
+    fn gc_pin_id(byte: u8) -> GcPinId {
+        GcPinId([byte; GC_PIN_ID_LEN])
+    }
     fn location() -> ObjectLocation {
         ObjectLocation {
             generation: 1,
@@ -822,6 +1294,7 @@ mod tests {
     #[test]
     fn keys_and_values_are_versioned_and_round_trip() {
         let repo = RepoId([9; 16]);
+        let snapshot = snapshot_id(4);
         let object = location();
         assert_eq!(
             decode_object_location_key(&encode_object_location_key(id(1))).unwrap(),
@@ -833,6 +1306,22 @@ mod tests {
         );
         let alias = encode_oid_alias_key(repo, &oid());
         assert_eq!(decode_oid_alias_key(&alias).unwrap(), (repo, oid()));
+        assert_eq!(
+            decode_repository_key(&encode_repository_key(repo)).unwrap(),
+            repo
+        );
+        assert_eq!(
+            decode_repository_snapshot_key(&encode_repository_snapshot_key(repo, snapshot))
+                .unwrap(),
+            (repo, snapshot)
+        );
+        assert_eq!(
+            decode_snapshot_visibility_value(&encode_snapshot_visibility_value(
+                SnapshotVisibility::Ready
+            ))
+            .unwrap(),
+            SnapshotVisibility::Ready
+        );
         let chunk = ChunkMetadata {
             state: ChunkState::Sealed,
             size: 33,
@@ -861,6 +1350,7 @@ mod tests {
     #[test]
     fn catalog_v1_opaque_and_workspace_encodings_round_trip() {
         let workspace = workspace_id(6);
+        let pin = gc_pin_id(7);
         assert_eq!(
             decode_opaque_key(&encode_opaque_key(b"meta\0key")).unwrap(),
             b"meta\0key"
@@ -897,6 +1387,8 @@ mod tests {
             decode_workspace_pin_value(&encode_workspace_pin_value(46)).unwrap(),
             46
         );
+        assert_eq!(decode_gc_pin_key(&encode_gc_pin_key(pin)).unwrap(), pin);
+        assert_eq!(decode_gc_pin_value(&encode_gc_pin_value(47)).unwrap(), 47);
         assert_eq!(
             decode_job_key(&encode_job_key(&[9, 0, 8])).unwrap(),
             vec![9, 0, 8]
@@ -929,6 +1421,88 @@ mod tests {
         assert_eq!(
             catalog.job(&[0, 1, 2, 3]),
             Some(b"job-record\0payload".to_vec())
+        );
+    }
+    #[test]
+    fn gc_root_enumeration_is_complete_deterministic_and_excludes_incomplete_snapshots() {
+        let repository = RepoId([0x31; REPO_ID_LEN]);
+        let ready = snapshot_id(0x32);
+        let incomplete = snapshot_id(0x33);
+        let workspace = workspace_id(0x34);
+        let pin = gc_pin_id(0x35);
+        let mut catalog = InMemoryCatalog::default();
+        let mut batch = CatalogBatch::new();
+        batch.put_repository(repository, b"repository metadata");
+        batch.put_repository_snapshot(repository, incomplete, SnapshotVisibility::Incomplete);
+        batch.put_repository_snapshot(repository, ready, SnapshotVisibility::Ready);
+        batch.put_workspace_pin(workspace, 17);
+        batch.put_gc_pin(pin, 18);
+        catalog.apply(batch).unwrap();
+
+        assert_eq!(
+            catalog.repository_snapshots().unwrap(),
+            vec![
+                RepositorySnapshot {
+                    repository,
+                    snapshot: ready,
+                    visibility: SnapshotVisibility::Ready,
+                },
+                RepositorySnapshot {
+                    repository,
+                    snapshot: incomplete,
+                    visibility: SnapshotVisibility::Incomplete,
+                },
+            ]
+        );
+        assert_eq!(
+            catalog.gc_roots().unwrap(),
+            vec![
+                GcRoot::RepositorySnapshot {
+                    repository,
+                    snapshot: ready,
+                },
+                GcRoot::WorkspacePin {
+                    workspace,
+                    generation: 17,
+                },
+                GcRoot::ExplicitPin {
+                    pin: GcPin {
+                        id: pin,
+                        generation: 18,
+                    },
+                },
+            ]
+        );
+    }
+    #[test]
+    fn repository_deletion_removes_every_snapshot_visibility_in_one_batch() {
+        let repository = RepoId([0x41; REPO_ID_LEN]);
+        let other_repository = RepoId([0x42; REPO_ID_LEN]);
+        let first = snapshot_id(0x43);
+        let second = snapshot_id(0x44);
+        let retained = snapshot_id(0x45);
+        let mut catalog = InMemoryCatalog::default();
+        let mut batch = CatalogBatch::new();
+        batch.put_repository(repository, b"source metadata");
+        batch.put_repository_snapshot(repository, first, SnapshotVisibility::Ready);
+        batch.put_repository_snapshot(repository, second, SnapshotVisibility::Incomplete);
+        batch.put_repository_snapshot(other_repository, retained, SnapshotVisibility::Ready);
+        catalog.apply(batch).unwrap();
+
+        catalog.delete_repository(repository).unwrap();
+        assert_eq!(catalog.repository(repository), None);
+        assert_eq!(catalog.repository_snapshot(repository, first), None);
+        assert_eq!(catalog.repository_snapshot(repository, second), None);
+        assert_eq!(
+            catalog.repository_snapshot(other_repository, retained),
+            Some(SnapshotVisibility::Ready)
+        );
+        assert_eq!(
+            catalog.gc_roots().unwrap(),
+            vec![GcRoot::RepositorySnapshot {
+                repository: other_repository,
+                snapshot: retained,
+            }]
         );
     }
     #[test]
@@ -993,22 +1567,35 @@ mod tests {
         let repo = RepoId([8; 16]);
         let object_id = id(4);
         let workspace = workspace_id(7);
+        let snapshot = snapshot_id(9);
+        let pin = gc_pin_id(10);
         {
             let mut catalog = RocksDbCatalog::open(&path).unwrap();
             let mut batch = CatalogBatch::new();
             batch.put_object_location(object_id, location());
             batch.put_oid_alias(repo, oid(), object_id);
+            batch.put_repository(repo, b"repository metadata");
+            batch.put_repository_snapshot(repo, snapshot, SnapshotVisibility::Ready);
             batch.put_meta(b"migration", b"complete");
             batch.put_current_generation(12);
             batch.put_workspace(workspace, b"workspace manifest bytes");
             batch.put_workspace_name(b"demo\xff", workspace);
             batch.put_workspace_pin(workspace, 12);
-            batch.put_job(&[4, 5, 6], b"opaque job record");
+            batch.put_gc_pin(pin, 13);
+            batch.put_job([4, 5, 6], b"opaque job record");
             catalog.apply(batch).unwrap();
         }
         let catalog = RocksDbCatalog::open(&path).unwrap();
         assert_eq!(catalog.object_location(object_id), Some(location()));
         assert_eq!(catalog.oid_alias(repo, &oid()), Some(object_id));
+        assert_eq!(
+            catalog.repository(repo),
+            Some(b"repository metadata".to_vec())
+        );
+        assert_eq!(
+            catalog.repository_snapshot(repo, snapshot),
+            Some(SnapshotVisibility::Ready)
+        );
         assert_eq!(catalog.meta(b"migration"), Some(b"complete".to_vec()));
         assert_eq!(catalog.current_generation(), Some(12));
         assert_eq!(
@@ -1017,6 +1604,25 @@ mod tests {
         );
         assert_eq!(catalog.workspace_name(b"demo\xff"), Some(workspace));
         assert_eq!(catalog.workspace_pin(workspace), Some(12));
+        assert_eq!(
+            catalog.gc_roots().unwrap(),
+            vec![
+                GcRoot::RepositorySnapshot {
+                    repository: repo,
+                    snapshot,
+                },
+                GcRoot::WorkspacePin {
+                    workspace,
+                    generation: 12,
+                },
+                GcRoot::ExplicitPin {
+                    pin: GcPin {
+                        id: pin,
+                        generation: 13,
+                    },
+                },
+            ]
+        );
         assert_eq!(catalog.job(&[4, 5, 6]), Some(b"opaque job record".to_vec()));
         drop(catalog);
         std::fs::remove_dir_all(path).unwrap();
