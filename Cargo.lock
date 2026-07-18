@@ -370,6 +370,7 @@ dependencies = [
  "reflink-forest-index",
  "reflink-forest-maintenance",
  "reflink-forest-store",
+ "reflink-forest-workspace",
 ]
 
 [[package]]

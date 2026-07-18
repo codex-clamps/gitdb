@@ -9,7 +9,10 @@ use reflink_forest_cache::{
     CapacityAdmission, CapacityAdmissionError, CapacityMeter, ReservePolicy,
 };
 use reflink_forest_format::crc32c;
-use reflink_forest_index::{Catalog, CatalogBatch, CatalogError};
+use reflink_forest_import::{
+    reconcile_snapshot_publication, SnapshotPublicationError, SnapshotPublicationStatus,
+};
+use reflink_forest_index::{Catalog, CatalogBatch, CatalogError, WorkspaceId};
 use reflink_forest_maintenance::{
     compact_completed_mark_set, completed_mark_set, reconcile_active_generation,
     retire_compacted_generation, CompactionOutcome, CompactionReader, CompactionWriter,
@@ -17,6 +20,7 @@ use reflink_forest_maintenance::{
     SnapshotManifestSource,
 };
 use reflink_forest_store::{verify_chunk, StoreError};
+use reflink_forest_workspace::{load_ready_workspace, WorkspaceManifestError};
 use std::{
     collections::{BTreeMap, VecDeque},
     fs::{self, File, OpenOptions},
@@ -759,7 +763,7 @@ impl<'a> MaintenanceJobHandler<'a> {
     /// Claims and executes at most one queued maintenance job. Job terminal
     /// state is persisted by [`JobStore`] before this method returns.
     pub fn execute_next(&mut self, jobs: &JobStore) -> Result<JobExecutionOutcome, JobError> {
-        jobs.execute_next(self)
+        jobs.execute_next_matching(is_legacy_maintenance_job, self)
     }
 
     /// Equivalent to [`Self::execute_next`], with a bounded structured event
@@ -770,10 +774,17 @@ impl<'a> MaintenanceJobHandler<'a> {
         jobs: &JobStore,
         sink: &mut S,
     ) -> Result<JobExecutionOutcome, JobError> {
-        let result = jobs.execute_next(self);
+        let result = jobs.execute_next_matching(is_legacy_maintenance_job, self);
         emit_operation_event(sink, maintenance_operation_event(&result));
         result
     }
+}
+
+fn is_legacy_maintenance_job(job: &JobRecord) -> bool {
+    matches!(
+        job.kind.as_slice(),
+        CACHE_RECONCILE_JOB_KIND | CACHE_EVICT_JOB_KIND | VERIFY_COLD_CHUNK_JOB_KIND
+    )
 }
 
 impl JobHandler for MaintenanceJobHandler<'_> {
@@ -835,6 +846,495 @@ fn decode_cold_chunk_payload(payload: &[u8]) -> Result<(u32, u64), MaintenanceJo
     let generation = u32::from_be_bytes(bytes[..4].try_into().expect("fixed-width slice"));
     let chunk_id = u64::from_be_bytes(bytes[4..].try_into().expect("fixed-width slice"));
     Ok((generation, chunk_id))
+}
+
+/// Fixed durable job kind for a daemon-registered import operation.
+///
+/// The corresponding job payload is always empty. The opaque [`JobId`] is
+/// the only value given to the injected implementation, which must resolve
+/// it against daemon-owned operation state rather than a client request.
+pub const TRUSTED_IMPORT_JOB_KIND: &[u8] = b"trusted-import-v1";
+/// Fixed durable job kind for a daemon-registered raw checkout operation.
+/// Like [`TRUSTED_IMPORT_JOB_KIND`], this accepts no client-controlled
+/// payload.
+pub const TRUSTED_CHECKOUT_JOB_KIND: &[u8] = b"trusted-checkout-v1";
+/// Hard upper bound for trusted publication and workspace targets examined
+/// during one daemon startup. This prevents deployment configuration from
+/// turning recovery into unbounded work before the daemon serves requests.
+pub const MAX_IMPORT_CHECKOUT_STARTUP_TARGETS: usize = 4096;
+
+/// Opaque durable operation identity passed to trusted import and checkout
+/// implementations. It deliberately exposes no [`JobRecord::kind`], payload,
+/// path, or persisted diagnostic.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TrustedOperationId(JobId);
+
+impl TrustedOperationId {
+    pub const fn job_id(self) -> JobId {
+        self.0
+    }
+}
+
+/// Trusted bootstrap configuration for import and checkout recovery.
+///
+/// These paths and IDs are supplied by daemon deployment code after it has
+/// obtained the instance lock. They are never parsed from a socket command or
+/// durable job payload. Snapshot paths identify only durable manifest files;
+/// workspace IDs are resolved through the catalog and the fixed manifests
+/// root.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImportCheckoutConfig {
+    cache_root: PathBuf,
+    workspace_manifests_root: PathBuf,
+    snapshot_manifests: Vec<PathBuf>,
+    workspace_ids: Vec<WorkspaceId>,
+}
+
+impl ImportCheckoutConfig {
+    pub fn new(cache_root: impl AsRef<Path>, workspace_manifests_root: impl AsRef<Path>) -> Self {
+        Self {
+            cache_root: cache_root.as_ref().to_path_buf(),
+            workspace_manifests_root: workspace_manifests_root.as_ref().to_path_buf(),
+            snapshot_manifests: Vec::new(),
+            workspace_ids: Vec::new(),
+        }
+    }
+
+    pub fn cache_root(&self) -> &Path {
+        &self.cache_root
+    }
+
+    pub fn workspace_manifests_root(&self) -> &Path {
+        &self.workspace_manifests_root
+    }
+
+    /// Registers one daemon-known manifest that may have been written before
+    /// an interrupted `Incomplete -> Ready` catalog transition.
+    pub fn add_snapshot_manifest(
+        &mut self,
+        path: impl AsRef<Path>,
+    ) -> Result<(), ImportCheckoutConfigurationError> {
+        let path = path.as_ref().to_path_buf();
+        if self
+            .snapshot_manifests
+            .iter()
+            .any(|existing| existing == &path)
+        {
+            return Err(ImportCheckoutConfigurationError::DuplicateStartupTarget);
+        }
+        self.reserve_startup_target()?;
+        self.snapshot_manifests.push(path);
+        Ok(())
+    }
+
+    /// Registers a catalog-visible workspace whose separately persisted
+    /// manifest must validate before startup completes. The workspace crate
+    /// intentionally exposes no global scan of private staging directories;
+    /// those are reconciled by [`TrustedImportCheckoutOperations`] below.
+    pub fn add_workspace(
+        &mut self,
+        id: WorkspaceId,
+    ) -> Result<(), ImportCheckoutConfigurationError> {
+        if self.workspace_ids.contains(&id) {
+            return Err(ImportCheckoutConfigurationError::DuplicateStartupTarget);
+        }
+        self.reserve_startup_target()?;
+        self.workspace_ids.push(id);
+        Ok(())
+    }
+
+    fn reserve_startup_target(&self) -> Result<(), ImportCheckoutConfigurationError> {
+        if self
+            .snapshot_manifests
+            .len()
+            .saturating_add(self.workspace_ids.len())
+            >= MAX_IMPORT_CHECKOUT_STARTUP_TARGETS
+        {
+            return Err(ImportCheckoutConfigurationError::TooManyStartupTargets {
+                maximum: MAX_IMPORT_CHECKOUT_STARTUP_TARGETS,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Failure while constructing trusted startup recovery configuration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ImportCheckoutConfigurationError {
+    DuplicateStartupTarget,
+    TooManyStartupTargets { maximum: usize },
+}
+
+impl std::fmt::Display for ImportCheckoutConfigurationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DuplicateStartupTarget => {
+                write!(formatter, "duplicate import/checkout startup target")
+            }
+            Self::TooManyStartupTargets { maximum } => write!(
+                formatter,
+                "import/checkout startup targets exceed bounded maximum {maximum}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ImportCheckoutConfigurationError {}
+
+/// Recovery summary produced before import or checkout jobs may run.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ImportCheckoutStartup {
+    /// Incomplete snapshot markers promoted only after their exact manifest
+    /// successfully decoded and matched the catalog identity.
+    pub snapshots_published: u64,
+    /// Targeted manifests whose snapshots were already visible as `Ready`.
+    pub snapshots_already_ready: u64,
+    /// Catalog-visible workspaces whose independent manifests were verified.
+    pub ready_workspaces: u64,
+    /// Targeted workspace IDs that have no catalog-visible Ready record.
+    pub absent_workspaces: u64,
+    /// Private incomplete workspace states recovered by the trusted injected
+    /// backend. This count is informational; no path is retained here.
+    pub incomplete_workspaces_recovered: u64,
+}
+
+/// Failure from public snapshot/workspace reconciliation before the injected
+/// backend is allowed to execute an operation.
+#[derive(Debug)]
+pub enum ImportCheckoutStartupError {
+    Snapshot(SnapshotPublicationError),
+    Workspace(WorkspaceManifestError),
+}
+
+impl std::fmt::Display for ImportCheckoutStartupError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Snapshot(_) => write!(formatter, "snapshot publication reconciliation failed"),
+            Self::Workspace(_) => write!(formatter, "workspace manifest reconciliation failed"),
+        }
+    }
+}
+
+impl std::error::Error for ImportCheckoutStartupError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Snapshot(error) => Some(error),
+            Self::Workspace(error) => Some(error),
+        }
+    }
+}
+
+impl From<SnapshotPublicationError> for ImportCheckoutStartupError {
+    fn from(value: SnapshotPublicationError) -> Self {
+        Self::Snapshot(value)
+    }
+}
+
+impl From<WorkspaceManifestError> for ImportCheckoutStartupError {
+    fn from(value: WorkspaceManifestError) -> Self {
+        Self::Workspace(value)
+    }
+}
+
+/// Reconciles the public, durable import and workspace state supplied by
+/// [`ImportCheckoutConfig`]. This is exposed separately so bootstrap code can
+/// test or audit the exact public recovery phase without constructing an
+/// operation handler.
+pub fn reconcile_import_checkout_startup<C: Catalog>(
+    catalog: &mut C,
+    config: &ImportCheckoutConfig,
+) -> Result<ImportCheckoutStartup, ImportCheckoutStartupError> {
+    let mut startup = ImportCheckoutStartup::default();
+    for manifest_path in &config.snapshot_manifests {
+        match reconcile_snapshot_publication(catalog, manifest_path)? {
+            SnapshotPublicationStatus::Published => startup.snapshots_published += 1,
+            SnapshotPublicationStatus::AlreadyReady => startup.snapshots_already_ready += 1,
+        }
+    }
+    for workspace_id in &config.workspace_ids {
+        match load_ready_workspace(catalog, &config.workspace_manifests_root, *workspace_id)? {
+            Some(_) => startup.ready_workspaces += 1,
+            None => startup.absent_workspaces += 1,
+        }
+    }
+    Ok(startup)
+}
+
+/// Daemon-trusted implementation of the concrete import and raw-checkout
+/// work. Each method receives only an opaque [`TrustedOperationId`]. The
+/// implementation must resolve it through daemon-owned durable configuration
+/// and must never interpret `JobRecord::payload` as a source path, checkout
+/// destination, Git revision, or policy.
+///
+/// `materialize_checkout` may affect the derived cache only through the
+/// supplied cache handle. Its `checkout_cache_bytes` estimate must
+/// conservatively include every cache payload it might create. The daemon
+/// keeps capacity admission locked over the immediate materialization call.
+pub trait TrustedImportCheckoutOperations {
+    type Error: std::fmt::Display;
+
+    /// Recovers private staging or operation-registry state unavailable to
+    /// the workspace crate's intentionally narrow public API. Implementations
+    /// may resume or discard only state addressed by their trusted deployment
+    /// configuration.
+    fn reconcile_incomplete_workspaces(&mut self) -> Result<u64, Self::Error>;
+
+    fn import(&mut self, operation: TrustedOperationId) -> Result<(), Self::Error>;
+
+    fn checkout_cache_bytes(&mut self, operation: TrustedOperationId) -> Result<u64, Self::Error>;
+
+    fn materialize_checkout(
+        &mut self,
+        operation: TrustedOperationId,
+        cache: &Cache,
+    ) -> Result<(), Self::Error>;
+}
+
+/// Successful execution of one trusted import or checkout job.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ImportCheckoutOperationOutcome {
+    Imported,
+    CheckedOut { admission: CapacityAdmission },
+}
+
+/// Failure while executing a strict import/checkout durable job.
+#[derive(Debug)]
+pub enum ImportCheckoutJobError<E> {
+    InvalidJobState(JobState),
+    ClientPayloadRejected,
+    UnsupportedJobKind,
+    Capacity(CapacityAdmissionError),
+    Operation(E),
+}
+
+impl<E: std::fmt::Display> std::fmt::Display for ImportCheckoutJobError<E> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidJobState(state) => write!(
+                formatter,
+                "trusted import/checkout job must be running before execution, found {state:?}"
+            ),
+            // Do not render payload bytes or lengths: a raw client request is
+            // not an operation authority and should not be echoed into the
+            // durable diagnostic through JobStore.
+            Self::ClientPayloadRejected => {
+                write!(formatter, "trusted import/checkout job payload is rejected")
+            }
+            Self::UnsupportedJobKind => {
+                write!(formatter, "unsupported trusted import/checkout job kind")
+            }
+            Self::Capacity(error) => write!(formatter, "checkout cache admission failed: {error}"),
+            Self::Operation(error) => write!(formatter, "trusted operation failed: {error}"),
+        }
+    }
+}
+
+impl<E> std::error::Error for ImportCheckoutJobError<E>
+where
+    E: std::error::Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Capacity(error) => Some(error),
+            Self::Operation(error) => Some(error),
+            Self::InvalidJobState(_) | Self::ClientPayloadRejected | Self::UnsupportedJobKind => {
+                None
+            }
+        }
+    }
+}
+
+/// Failure while opening the daemon-owned import/checkout orchestrator.
+#[derive(Debug)]
+pub enum ImportCheckoutOrchestratorError<E> {
+    Cache(CacheError),
+    Startup(ImportCheckoutStartupError),
+    Operations(E),
+}
+
+impl<E: std::fmt::Display> std::fmt::Display for ImportCheckoutOrchestratorError<E> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cache(error) => write!(formatter, "import/checkout cache open failed: {error}"),
+            Self::Startup(error) => write!(formatter, "import/checkout startup failed: {error}"),
+            Self::Operations(error) => {
+                write!(
+                    formatter,
+                    "trusted import/checkout workspace recovery failed: {error}"
+                )
+            }
+        }
+    }
+}
+
+impl<E> std::error::Error for ImportCheckoutOrchestratorError<E>
+where
+    E: std::error::Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Cache(error) => Some(error),
+            Self::Startup(error) => Some(error),
+            Self::Operations(error) => Some(error),
+        }
+    }
+}
+
+/// Bounded daemon worker that joins durable job transitions to injected,
+/// daemon-trusted import and checkout operations.
+///
+/// Construction requires the live [`DaemonService`] so this worker cannot
+/// outlive the service's state-root lock. It owns a cache capacity coordinator
+/// and handles at most one durable job per [`Self::execute_next`] call.
+pub struct DaemonImportCheckoutOrchestrator<'daemon, O, M> {
+    _daemon: PhantomData<&'daemon DaemonService>,
+    jobs: &'daemon JobStore,
+    operations: O,
+    cache: CacheCapacityCoordinator<M>,
+    startup: ImportCheckoutStartup,
+}
+
+impl<'daemon, O, M> DaemonImportCheckoutOrchestrator<'daemon, O, M>
+where
+    O: TrustedImportCheckoutOperations,
+    M: CapacityMeter,
+{
+    /// Reconciles every configured public manifest before the injected backend
+    /// repairs its private workspace state, then opens the cache coordinator.
+    /// A failure leaves no worker available to process durable jobs.
+    pub fn open<C: Catalog>(
+        daemon: &'daemon DaemonService,
+        catalog: &mut C,
+        config: &ImportCheckoutConfig,
+        mut operations: O,
+        meter: M,
+        reserve_policy: ReservePolicy,
+    ) -> Result<(Self, ImportCheckoutStartup), ImportCheckoutOrchestratorError<O::Error>> {
+        let mut startup = reconcile_import_checkout_startup(catalog, config)
+            .map_err(ImportCheckoutOrchestratorError::Startup)?;
+        startup.incomplete_workspaces_recovered = operations
+            .reconcile_incomplete_workspaces()
+            .map_err(ImportCheckoutOrchestratorError::Operations)?;
+        let cache =
+            Cache::open(config.cache_root()).map_err(ImportCheckoutOrchestratorError::Cache)?;
+        let orchestrator = Self {
+            _daemon: PhantomData,
+            jobs: daemon.job_store(),
+            operations,
+            cache: CacheCapacityCoordinator::new(cache, meter, reserve_policy),
+            startup,
+        };
+        Ok((orchestrator, startup))
+    }
+
+    pub fn startup(&self) -> ImportCheckoutStartup {
+        self.startup
+    }
+
+    pub fn operations(&self) -> &O {
+        &self.operations
+    }
+
+    pub fn operations_mut(&mut self) -> &mut O {
+        &mut self.operations
+    }
+
+    /// Runs at most one queued trusted import or checkout job. Every accepted
+    /// job has an exact fixed kind and empty payload; all concrete operation
+    /// inputs come from the trusted injected backend's opaque-ID registry.
+    pub fn execute_next(&mut self) -> Result<JobExecutionOutcome, JobError> {
+        let jobs = self.jobs;
+        jobs.execute_next_matching(is_trusted_import_checkout_job, self)
+    }
+
+    /// Equivalent to [`Self::execute_next`] with the generic bounded daemon
+    /// event hook. The emitted event carries only job ID/state/attempts, not
+    /// import or checkout configuration.
+    pub fn execute_next_with_events<S: OperationEventSink>(
+        &mut self,
+        sink: &mut S,
+    ) -> Result<JobExecutionOutcome, JobError> {
+        let jobs = self.jobs;
+        let result = jobs.execute_next_matching(is_trusted_import_checkout_job, self);
+        emit_operation_event(sink, job_operation_event(&result));
+        result
+    }
+
+    pub fn execute(
+        &mut self,
+        job: &JobRecord,
+    ) -> Result<ImportCheckoutOperationOutcome, ImportCheckoutJobError<O::Error>> {
+        if job.state != JobState::Running {
+            return Err(ImportCheckoutJobError::InvalidJobState(job.state));
+        }
+        if !job.payload.is_empty() {
+            return Err(ImportCheckoutJobError::ClientPayloadRejected);
+        }
+        let operation = TrustedOperationId(job.id);
+        match job.kind.as_slice() {
+            TRUSTED_IMPORT_JOB_KIND => self
+                .operations
+                .import(operation)
+                .map(|()| ImportCheckoutOperationOutcome::Imported)
+                .map_err(ImportCheckoutJobError::Operation),
+            TRUSTED_CHECKOUT_JOB_KIND => {
+                let projected_allocation_bytes = self
+                    .operations
+                    .checkout_cache_bytes(operation)
+                    .map_err(ImportCheckoutJobError::Operation)?;
+                // `with_admission` intentionally keeps the cache lock until
+                // the injected materializer returns. The inner result keeps a
+                // trusted-operation error distinct from a cache error without
+                // widening the cache crate's public error surface.
+                let materialized = {
+                    let (operations, cache) = (&mut self.operations, &self.cache);
+                    cache
+                        .with_admission(projected_allocation_bytes, |cache| {
+                            Ok::<_, CacheError>(operations.materialize_checkout(operation, cache))
+                        })
+                        .map_err(ImportCheckoutJobError::Capacity)?
+                };
+                materialized
+                    .1
+                    .map(|()| ImportCheckoutOperationOutcome::CheckedOut {
+                        admission: materialized.0,
+                    })
+                    .map_err(ImportCheckoutJobError::Operation)
+            }
+            _ => Err(ImportCheckoutJobError::UnsupportedJobKind),
+        }
+    }
+}
+
+fn is_trusted_import_checkout_job(job: &JobRecord) -> bool {
+    matches!(
+        job.kind.as_slice(),
+        TRUSTED_IMPORT_JOB_KIND | TRUSTED_CHECKOUT_JOB_KIND
+    )
+}
+
+impl<O, M> JobHandler for DaemonImportCheckoutOrchestrator<'_, O, M>
+where
+    O: TrustedImportCheckoutOperations,
+    M: CapacityMeter,
+{
+    type Error = ImportCheckoutJobError<O::Error>;
+
+    fn handle(&mut self, job: &JobRecord) -> Result<(), Self::Error> {
+        self.execute(job).map(|_| ())
+    }
+}
+
+/// Enqueues an empty-payload import job. The trusted backend must register the
+/// returned opaque ID in daemon-owned state before execution.
+pub fn enqueue_trusted_import(jobs: &JobStore) -> Result<JobRecord, JobError> {
+    jobs.enqueue(TRUSTED_IMPORT_JOB_KIND, [])
+}
+
+/// Enqueues an empty-payload checkout job. The trusted backend must register
+/// the returned opaque ID in daemon-owned state before execution.
+pub fn enqueue_trusted_checkout(jobs: &JobStore) -> Result<JobRecord, JobError> {
+    jobs.enqueue(TRUSTED_CHECKOUT_JOB_KIND, [])
 }
 
 /// Trusted daemon configuration for operational maintenance.
@@ -1066,6 +1566,19 @@ where
             .with_admission(projected_allocation_bytes, allocate)?)
     }
 
+    /// Applies the daemon cache reserve policy and, when necessary, performs
+    /// deterministic derived-cache eviction before a later cache-affecting
+    /// worker turn. The payload is an expected allocation size, not a path or
+    /// client-selected cache entry; a refused admission leaves the queue job
+    /// retryable without writing authoritative state.
+    pub fn relieve_cache_pressure(
+        &self,
+        projected_allocation_bytes: u64,
+    ) -> Result<CapacityAdmission, OperationalMaintenanceError> {
+        let (admission, ()) = self.with_cache_admission(projected_allocation_bytes, |_| Ok(()))?;
+        Ok(admission)
+    }
+
     /// Publishes a verified blob only after reserving space for its complete
     /// payload. This is the standard daemon cache-publication path.
     pub fn publish_cache_blob(
@@ -1166,6 +1679,281 @@ where
             Err(error) => Err(error.into()),
         }
     }
+}
+
+/// Stable, empty-payload job that runs one bounded cold-generation GC cycle.
+/// The manifests, retained roots, reader, and writer are injected by trusted
+/// daemon startup; they are not serialized into the job or accepted over the
+/// local control socket.
+pub const OPERATIONAL_GC_JOB_KIND: &[u8] = b"operational-gc-v1";
+
+/// Stable job that applies cache reserve admission and, when necessary,
+/// deterministic derived-cache eviction before a known allocation.
+/// Its payload is exactly one big-endian `u64` projected allocation size.
+pub const CACHE_PRESSURE_JOB_KIND: &[u8] = b"cache-pressure-v1";
+
+const CACHE_PRESSURE_PAYLOAD_LEN: usize = 8;
+
+/// Trusted source of extra object references that must survive the next GC
+/// generation. Typical implementations read the daemon's private job or boot
+/// metadata; callers must not derive these from a socket request.
+pub trait RetainedObjectSource {
+    type Error: std::fmt::Display;
+
+    fn retained_objects(&self) -> Result<Vec<RetainedObjectRef>, Self::Error>;
+}
+
+impl<F, E> RetainedObjectSource for F
+where
+    F: Fn() -> Result<Vec<RetainedObjectRef>, E>,
+    E: std::fmt::Display,
+{
+    type Error = E;
+
+    fn retained_objects(&self) -> Result<Vec<RetainedObjectRef>, Self::Error> {
+        self()
+    }
+}
+
+/// Failure while decoding or executing a fixed-purpose operational job.
+#[derive(Debug)]
+pub enum OperationalMaintenanceJobError {
+    InvalidJobState(JobState),
+    InvalidPayload(&'static str),
+    UnsupportedKind(Vec<u8>),
+    RetainedObjects(String),
+    Operational(OperationalMaintenanceError),
+}
+
+impl std::fmt::Display for OperationalMaintenanceJobError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidJobState(state) => write!(
+                formatter,
+                "operational maintenance job must be running before execution, found {state:?}"
+            ),
+            Self::InvalidPayload(reason) => {
+                write!(
+                    formatter,
+                    "invalid operational maintenance job payload: {reason}"
+                )
+            }
+            Self::UnsupportedKind(kind) => write!(
+                formatter,
+                "unsupported operational maintenance job kind: {} bytes",
+                kind.len()
+            ),
+            Self::RetainedObjects(error) => {
+                write!(formatter, "trusted retained-object source failed: {error}")
+            }
+            Self::Operational(error) => {
+                write!(formatter, "operational maintenance failed: {error}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for OperationalMaintenanceJobError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Operational(error) => Some(error),
+            Self::InvalidJobState(_)
+            | Self::InvalidPayload(_)
+            | Self::UnsupportedKind(_)
+            | Self::RetainedObjects(_) => None,
+        }
+    }
+}
+
+impl From<OperationalMaintenanceError> for OperationalMaintenanceJobError {
+    fn from(value: OperationalMaintenanceError) -> Self {
+        Self::Operational(value)
+    }
+}
+
+/// Executes one fixed `cache-pressure-v1` job through a daemon-owned
+/// [`OperationalMaintenanceCoordinator`]. It cannot read an arbitrary cache
+/// target: the only durable input is the fixed-width projected byte count.
+pub struct CachePressureJobHandler<'daemon, 'coordinator, C, M> {
+    coordinator: &'coordinator OperationalMaintenanceCoordinator<'daemon, C, M>,
+}
+
+impl<'daemon, 'coordinator, C, M> CachePressureJobHandler<'daemon, 'coordinator, C, M>
+where
+    C: Catalog,
+    M: CapacityMeter,
+{
+    pub fn new(
+        coordinator: &'coordinator OperationalMaintenanceCoordinator<'daemon, C, M>,
+    ) -> Self {
+        Self { coordinator }
+    }
+
+    /// Executes one already-claimed cache-pressure job.
+    pub fn execute(
+        &self,
+        job: &JobRecord,
+    ) -> Result<CapacityAdmission, OperationalMaintenanceJobError> {
+        if job.state != JobState::Running {
+            return Err(OperationalMaintenanceJobError::InvalidJobState(job.state));
+        }
+        if job.kind.as_slice() != CACHE_PRESSURE_JOB_KIND {
+            return Err(OperationalMaintenanceJobError::UnsupportedKind(
+                job.kind.clone(),
+            ));
+        }
+        let projected_allocation_bytes = decode_cache_pressure_payload(&job.payload)?;
+        Ok(self
+            .coordinator
+            .relieve_cache_pressure(projected_allocation_bytes)?)
+    }
+
+    /// Claims and executes at most one cache-pressure job, leaving unrelated
+    /// durable jobs queued for their own fixed-purpose workers.
+    pub fn execute_next(&mut self, jobs: &JobStore) -> Result<JobExecutionOutcome, JobError> {
+        jobs.execute_next_matching(is_cache_pressure_job, self)
+    }
+}
+
+impl<C, M> JobHandler for CachePressureJobHandler<'_, '_, C, M>
+where
+    C: Catalog,
+    M: CapacityMeter,
+{
+    type Error = OperationalMaintenanceJobError;
+
+    fn handle(&mut self, job: &JobRecord) -> Result<(), Self::Error> {
+        self.execute(job).map(|_| ())
+    }
+}
+
+/// Executes one fixed `operational-gc-v1` job. Every collaborator that can
+/// read or write cold data is injected by trusted daemon bootstrap; the
+/// durable job payload is deliberately empty.
+pub struct OperationalGcJobHandler<'daemon, 'coordinator, 'input, C, M, S, R, W, T> {
+    coordinator: &'coordinator OperationalMaintenanceCoordinator<'daemon, C, M>,
+    manifests: &'input S,
+    reader: &'input mut R,
+    writer: &'input mut W,
+    retained: &'input T,
+    limits: MarkLimits,
+}
+
+impl<'daemon, 'coordinator, 'input, C, M, S, R, W, T>
+    OperationalGcJobHandler<'daemon, 'coordinator, 'input, C, M, S, R, W, T>
+where
+    C: Catalog,
+    M: CapacityMeter,
+    S: SnapshotManifestSource,
+    R: CompactionReader,
+    W: CompactionWriter,
+    T: RetainedObjectSource,
+{
+    pub fn new(
+        coordinator: &'coordinator OperationalMaintenanceCoordinator<'daemon, C, M>,
+        manifests: &'input S,
+        reader: &'input mut R,
+        writer: &'input mut W,
+        retained: &'input T,
+        limits: MarkLimits,
+    ) -> Self {
+        Self {
+            coordinator,
+            manifests,
+            reader,
+            writer,
+            retained,
+            limits,
+        }
+    }
+
+    /// Executes one already-claimed bounded GC job.
+    pub fn execute(
+        &mut self,
+        job: &JobRecord,
+    ) -> Result<OperationalGcOutcome, OperationalMaintenanceJobError> {
+        if job.state != JobState::Running {
+            return Err(OperationalMaintenanceJobError::InvalidJobState(job.state));
+        }
+        if job.kind.as_slice() != OPERATIONAL_GC_JOB_KIND {
+            return Err(OperationalMaintenanceJobError::UnsupportedKind(
+                job.kind.clone(),
+            ));
+        }
+        if !job.payload.is_empty() {
+            return Err(OperationalMaintenanceJobError::InvalidPayload(
+                "operational GC payload must be empty",
+            ));
+        }
+        let retained = self
+            .retained
+            .retained_objects()
+            .map_err(|error| OperationalMaintenanceJobError::RetainedObjects(error.to_string()))?;
+        Ok(self.coordinator.run_gc_once(
+            self.manifests,
+            &mut *self.reader,
+            &mut *self.writer,
+            retained,
+            self.limits,
+        )?)
+    }
+
+    /// Claims and executes at most one operational GC job, leaving unrelated
+    /// durable jobs queued for their own fixed-purpose workers.
+    pub fn execute_next(&mut self, jobs: &JobStore) -> Result<JobExecutionOutcome, JobError> {
+        jobs.execute_next_matching(is_operational_gc_job, self)
+    }
+}
+
+impl<C, M, S, R, W, T> JobHandler for OperationalGcJobHandler<'_, '_, '_, C, M, S, R, W, T>
+where
+    C: Catalog,
+    M: CapacityMeter,
+    S: SnapshotManifestSource,
+    R: CompactionReader,
+    W: CompactionWriter,
+    T: RetainedObjectSource,
+{
+    type Error = OperationalMaintenanceJobError;
+
+    fn handle(&mut self, job: &JobRecord) -> Result<(), Self::Error> {
+        self.execute(job).map(|_| ())
+    }
+}
+
+/// Enqueues one bounded operational GC job. The empty payload is intentional:
+/// all cold-store sources and paths remain daemon-owned handler state.
+pub fn enqueue_operational_gc(jobs: &JobStore) -> Result<JobRecord, JobError> {
+    jobs.enqueue(OPERATIONAL_GC_JOB_KIND, [])
+}
+
+/// Enqueues one cache-pressure admission job with its fixed-width projected
+/// allocation payload.
+pub fn enqueue_cache_pressure(
+    jobs: &JobStore,
+    projected_allocation_bytes: u64,
+) -> Result<JobRecord, JobError> {
+    jobs.enqueue(
+        CACHE_PRESSURE_JOB_KIND,
+        projected_allocation_bytes.to_be_bytes(),
+    )
+}
+
+fn is_operational_gc_job(job: &JobRecord) -> bool {
+    job.kind.as_slice() == OPERATIONAL_GC_JOB_KIND
+}
+
+fn is_cache_pressure_job(job: &JobRecord) -> bool {
+    job.kind.as_slice() == CACHE_PRESSURE_JOB_KIND
+}
+
+fn decode_cache_pressure_payload(payload: &[u8]) -> Result<u64, OperationalMaintenanceJobError> {
+    let bytes: [u8; CACHE_PRESSURE_PAYLOAD_LEN] = payload.try_into().map_err(|_| {
+        OperationalMaintenanceJobError::InvalidPayload(
+            "cache-pressure payload must be exactly 8 bytes",
+        )
+    })?;
+    Ok(u64::from_be_bytes(bytes))
 }
 
 impl JobRecord {
@@ -1374,11 +2162,26 @@ impl JobStore {
     /// `start`, so competing in-process workers cannot both select the same
     /// job.
     pub fn claim_next(&self) -> Result<Option<JobRecord>, JobError> {
+        self.claim_next_matching(|_| true)
+    }
+
+    /// Claims the oldest queued job accepted by `matches` in stable
+    /// [`JobId`] order.
+    ///
+    /// Worker families use this to share the daemon's durable queue without
+    /// incorrectly failing an unrelated job just because it belongs to a
+    /// different fixed-purpose handler. The predicate runs while the queue
+    /// mutation lock is held and receives only a decoded durable record; it
+    /// never chooses a filesystem path.
+    pub fn claim_next_matching<F>(&self, matches: F) -> Result<Option<JobRecord>, JobError>
+    where
+        F: Fn(&JobRecord) -> bool,
+    {
         let _guard = lock_unpoisoned(&self.mutation_lock);
         let Some(mut record) = self
             .list_records_locked()?
             .into_iter()
-            .find(|record| record.state == JobState::Queued)
+            .find(|record| record.state == JobState::Queued && matches(record))
         else {
             return Ok(None);
         };
@@ -1409,7 +2212,23 @@ impl JobStore {
         &self,
         handler: &mut H,
     ) -> Result<JobExecutionOutcome, JobError> {
-        let Some(claimed) = self.claim_next()? else {
+        self.execute_next_matching(|_| true, handler)
+    }
+
+    /// Durably claims and executes at most one queued job accepted by
+    /// `matches`. It has the same crash-recovery guarantees as
+    /// [`Self::execute_next`], but leaves other fixed-purpose job families
+    /// queued for their own trusted handlers.
+    pub fn execute_next_matching<H, F>(
+        &self,
+        matches: F,
+        handler: &mut H,
+    ) -> Result<JobExecutionOutcome, JobError>
+    where
+        H: JobHandler,
+        F: Fn(&JobRecord) -> bool,
+    {
+        let Some(claimed) = self.claim_next_matching(matches)? else {
             return Ok(JobExecutionOutcome::Idle);
         };
 
@@ -3562,6 +4381,8 @@ fn current_unix_seconds() -> Result<u64, ScrubScheduleError> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DaemonCommand {
     Status,
+    EnqueueOperationalGc,
+    EnqueueCachePressure { projected_allocation_bytes: u64 },
     Enqueue { kind: Vec<u8>, payload: Vec<u8> },
     Get { id: JobId },
     Start { id: JobId },
@@ -3603,6 +4424,12 @@ pub fn parse_daemon_command(request: &str) -> Result<DaemonCommand, DaemonComman
     }
     match fields.as_slice() {
         ["status"] => Ok(DaemonCommand::Status),
+        ["maintenance", "gc"] => Ok(DaemonCommand::EnqueueOperationalGc),
+        ["maintenance", "cache-pressure", projected_allocation_bytes] => {
+            Ok(DaemonCommand::EnqueueCachePressure {
+                projected_allocation_bytes: parse_decimal_u64(projected_allocation_bytes)?,
+            })
+        }
         ["job", "enqueue", kind, payload] => Ok(DaemonCommand::Enqueue {
             kind: parse_hex_bytes(kind, false)?,
             payload: parse_hex_bytes(payload, true)?,
@@ -3630,6 +4457,13 @@ pub fn parse_daemon_command(request: &str) -> Result<DaemonCommand, DaemonComman
 
 fn parse_command_job_id(value: &str) -> Result<JobId, DaemonCommandParseError> {
     JobId::parse_hex(value).ok_or(DaemonCommandParseError::Invalid)
+}
+
+fn parse_decimal_u64(value: &str) -> Result<u64, DaemonCommandParseError> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(DaemonCommandParseError::Invalid);
+    }
+    value.parse().map_err(|_| DaemonCommandParseError::Invalid)
 }
 
 fn parse_hex_bytes(value: &str, allow_empty: bool) -> Result<Vec<u8>, DaemonCommandParseError> {
@@ -3880,6 +4714,23 @@ impl DaemonService {
         &self.jobs
     }
 
+    /// Schedules one fixed operational GC job. The job has no path or source
+    /// payload; trusted collaborators are supplied only when a daemon worker
+    /// later executes it.
+    pub fn enqueue_operational_gc(&self) -> Result<JobRecord, JobError> {
+        enqueue_operational_gc(&self.jobs)
+    }
+
+    /// Schedules one fixed cache-pressure job for a known projected derived
+    /// allocation. The durable payload is a fixed-width integer, never a
+    /// client-supplied cache path or content identifier.
+    pub fn enqueue_cache_pressure(
+        &self,
+        projected_allocation_bytes: u64,
+    ) -> Result<JobRecord, JobError> {
+        enqueue_cache_pressure(&self.jobs, projected_allocation_bytes)
+    }
+
     /// Returns the daemon-owned durable scrub scheduler. Callers must claim a
     /// due run and record completion through this store; they may not infer a
     /// schedule from an external cron or timer service.
@@ -3947,6 +4798,38 @@ impl DaemonService {
         M: CapacityMeter,
     {
         OperationalMaintenanceCoordinator::open(catalog, config, meter, reserve_policy)
+    }
+
+    /// Executes at most one fixed cache-pressure job through its trusted
+    /// coordinator-bound handler. Unrelated durable jobs remain queued.
+    pub fn execute_next_cache_pressure<'daemon, C, M>(
+        &'daemon self,
+        handler: &mut CachePressureJobHandler<'daemon, '_, C, M>,
+    ) -> Result<JobExecutionOutcome, JobError>
+    where
+        C: Catalog,
+        M: CapacityMeter,
+    {
+        handler.execute_next(&self.jobs)
+    }
+
+    /// Executes at most one bounded operational GC job through a handler
+    /// whose manifests, retained roots, reader, and writer were injected by
+    /// trusted daemon startup. No such collaborator can be selected by a
+    /// socket request.
+    pub fn execute_next_operational_gc<'daemon, 'input, C, M, S, R, W, T>(
+        &'daemon self,
+        handler: &mut OperationalGcJobHandler<'daemon, '_, 'input, C, M, S, R, W, T>,
+    ) -> Result<JobExecutionOutcome, JobError>
+    where
+        C: Catalog,
+        M: CapacityMeter,
+        S: SnapshotManifestSource,
+        R: CompactionReader,
+        W: CompactionWriter,
+        T: RetainedObjectSource,
+    {
+        handler.execute_next(&self.jobs)
     }
 
     pub fn status(&self) -> Result<DaemonStatus, DaemonServiceError> {
@@ -4056,6 +4939,14 @@ impl DaemonService {
                     u8::from(status.migration.resumable),
                 ))
             }
+            DaemonCommand::EnqueueOperationalGc => {
+                self.enqueue_operational_gc().map(render_job_response)
+            }
+            DaemonCommand::EnqueueCachePressure {
+                projected_allocation_bytes,
+            } => self
+                .enqueue_cache_pressure(projected_allocation_bytes)
+                .map(render_job_response),
             DaemonCommand::Enqueue { kind, payload } => {
                 self.jobs.enqueue(kind, payload).map(render_job_response)
             }

@@ -10,9 +10,8 @@ description = "Per-user local daemon primitives for Reflink Forest"
 reflink-forest-cache = { path = "../reflink-forest-cache" }
 reflink-forest-core = { path = "../reflink-forest-core" }
 reflink-forest-format = { path = "../reflink-forest-format" }
+reflink-forest-import = { path = "../reflink-forest-import" }
 reflink-forest-index = { path = "../reflink-forest-index" }
 reflink-forest-maintenance = { path = "../reflink-forest-maintenance" }
 reflink-forest-store = { path = "../reflink-forest-store" }
-
-[dev-dependencies]
-reflink-forest-import = { path = "../reflink-forest-import" }
+reflink-forest-workspace = { path = "../reflink-forest-workspace" }
