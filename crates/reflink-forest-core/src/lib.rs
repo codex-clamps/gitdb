@@ -132,6 +132,11 @@ impl GitOid {
         self.len
     }
 
+    /// Git object IDs always have a native algorithm-defined, non-zero width.
+    pub const fn is_empty(self) -> bool {
+        false
+    }
+
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes[..usize::from(self.len)]
     }

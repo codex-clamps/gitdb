@@ -80,6 +80,7 @@ pub fn acquire_lock(path: impl AsRef<Path>) -> Result<InstanceLock, DaemonError>
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .mode(0o600)
         .open(path)?;
     if unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) } != 0 {

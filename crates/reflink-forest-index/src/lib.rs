@@ -192,23 +192,24 @@ pub struct CatalogBatch {
 }
 #[derive(Clone, Debug)]
 enum Operation {
-    PutObject(ContentId, ObjectLocation),
-    PutAlias(RepoId, GitOid, ContentId),
-    PutChunk(u32, u64, ChunkMetadata),
+    ObjectLocation(ContentId, ObjectLocation),
+    OidAlias(RepoId, GitOid, ContentId),
+    ChunkMetadata(u32, u64, ChunkMetadata),
 }
 impl CatalogBatch {
     pub fn new() -> Self {
         Self::default()
     }
     pub fn put_object_location(&mut self, id: ContentId, location: ObjectLocation) {
-        self.operations.push(Operation::PutObject(id, location));
+        self.operations
+            .push(Operation::ObjectLocation(id, location));
     }
     pub fn put_oid_alias(&mut self, repo: RepoId, oid: GitOid, id: ContentId) {
-        self.operations.push(Operation::PutAlias(repo, oid, id));
+        self.operations.push(Operation::OidAlias(repo, oid, id));
     }
     pub fn put_chunk(&mut self, generation: u32, chunk_id: u64, metadata: ChunkMetadata) {
         self.operations
-            .push(Operation::PutChunk(generation, chunk_id, metadata));
+            .push(Operation::ChunkMetadata(generation, chunk_id, metadata));
     }
 }
 
@@ -231,13 +232,13 @@ impl Catalog for InMemoryCatalog {
         let mut staged = self.clone();
         for operation in batch.operations {
             match operation {
-                Operation::PutObject(id, location) => {
+                Operation::ObjectLocation(id, location) => {
                     staged.objects.insert(id, location);
                 }
-                Operation::PutChunk(generation, chunk_id, metadata) => {
+                Operation::ChunkMetadata(generation, chunk_id, metadata) => {
                     staged.chunks.insert((generation, chunk_id), metadata);
                 }
-                Operation::PutAlias(repo, oid, id) => match staged.aliases.get(&(repo, oid)) {
+                Operation::OidAlias(repo, oid, id) => match staged.aliases.get(&(repo, oid)) {
                     Some(&existing) if existing != id => {
                         return Err(CatalogError::AliasConflict {
                             repo,
@@ -312,7 +313,7 @@ impl Catalog for RocksDbCatalog {
         // Validate all conflicts before the atomic write. A rejected batch has
         // no preceding writes committed.
         for operation in &batch.operations {
-            if let Operation::PutAlias(repo, oid, requested) = operation {
+            if let Operation::OidAlias(repo, oid, requested) = operation {
                 let key = encode_oid_alias_key(*repo, oid);
                 let existing = match pending_aliases.get(&(*repo, *oid)) {
                     Some(id) => Some(*id),
@@ -340,17 +341,17 @@ impl Catalog for RocksDbCatalog {
         let mut writes = rocksdb::WriteBatch::default();
         for operation in batch.operations {
             match operation {
-                Operation::PutObject(id, location) => writes.put_cf(
+                Operation::ObjectLocation(id, location) => writes.put_cf(
                     object_cf,
                     encode_object_location_key(id),
                     encode_object_location_value(location),
                 ),
-                Operation::PutAlias(repo, oid, id) => writes.put_cf(
+                Operation::OidAlias(repo, oid, id) => writes.put_cf(
                     alias_cf,
                     encode_oid_alias_key(repo, &oid),
                     encode_content_id_value(id),
                 ),
-                Operation::PutChunk(generation, chunk_id, metadata) => writes.put_cf(
+                Operation::ChunkMetadata(generation, chunk_id, metadata) => writes.put_cf(
                     chunk_cf,
                     encode_chunk_key(generation, chunk_id),
                     encode_chunk_value(metadata),

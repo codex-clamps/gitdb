@@ -294,6 +294,7 @@ dependencies = [
 name = "reflink-forest-btrfs"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "reflink-forest-core",
 ]
 

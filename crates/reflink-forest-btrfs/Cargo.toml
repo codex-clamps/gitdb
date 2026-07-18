@@ -8,3 +8,4 @@ description = "Verified Btrfs materialization-domain setup for Reflink Forest"
 
 [dependencies]
 reflink-forest-core = { path = "../reflink-forest-core" }
+libc = "0.2"

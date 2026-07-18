@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Format
+        run: cargo fmt --check
+      - name: Lint
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test workspace
+        run: cargo test --workspace
+      - name: Test durable RocksDB catalog
+        run: cargo test -p reflink-forest-index --features rocksdb-backend
+
+  privileged-btrfs:
+    # This is a capability check: the runner must have an unshared Btrfs
+    # scratch device, loop support, and mount privilege. The ordinary CI image
+    # intentionally does not receive those powers.
+    if: ${{ false }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo 'Run the Btrfs/loop fault-injection suite in a dedicated VM.'

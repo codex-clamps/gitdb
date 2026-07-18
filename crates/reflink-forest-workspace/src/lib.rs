@@ -8,8 +8,9 @@ use std::{collections::HashSet, path::PathBuf};
 
 use reflink_forest_cache::{hydrate_raw_blob_from_chunk, Cache, HydrationError};
 use reflink_forest_checkout::{
-    CheckoutError, CheckoutLimits, CheckoutPlan, CheckoutPlanBuilder, RawCheckoutSource,
-    RelativePath, TreeEntry, TreeName,
+    materialize_raw, publish_workspace, CheckoutError, CheckoutLimits, CheckoutPlan,
+    CheckoutPlanBuilder, GitlinkPolicy, MaterializeError, RawCheckoutSource, RelativePath,
+    ReplacePolicy, TreeEntry, TreeName, WorkspaceName, WorkspacePublishError,
 };
 use reflink_forest_core::{ContentId, GitOid, ObjectKind};
 use reflink_forest_format::{Codec, ObjectRecord};
@@ -71,6 +72,35 @@ impl From<CheckoutError> for WorkspaceError {
     fn from(value: CheckoutError) -> Self {
         Self::Checkout(value)
     }
+}
+
+#[derive(Debug)]
+pub enum WorkspaceCheckoutError {
+    Planning(Box<WorkspaceError>),
+    Materialize(Box<MaterializeError<WorkspaceError>>),
+    Publish(Box<WorkspacePublishError>),
+}
+impl std::fmt::Display for WorkspaceCheckoutError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Planning(error) => write!(f, "workspace planning failed: {error}"),
+            Self::Materialize(error) => write!(f, "workspace materialization failed: {error}"),
+            Self::Publish(error) => write!(f, "workspace publication failed: {error}"),
+        }
+    }
+}
+impl std::error::Error for WorkspaceCheckoutError {}
+
+/// Paths and policies required for the publication half of one raw checkout.
+pub struct WorkspaceCheckoutRequest<'a> {
+    pub commit: GitOid,
+    pub limits: CheckoutLimits,
+    pub staging: &'a std::path::Path,
+    pub workspaces: &'a std::path::Path,
+    pub trash: &'a std::path::Path,
+    pub name: &'a WorkspaceName,
+    pub gitlink_policy: GitlinkPolicy,
+    pub replace: ReplacePolicy,
 }
 
 /// Resolves records for one repository using a repo-scoped catalog namespace.
@@ -152,6 +182,34 @@ impl<'a, C: Catalog, F: Fn(u32, u64) -> PathBuf> ColdWorkspaceSource<'a, C, F> {
         let mut builder = CheckoutPlanBuilder::new(limits);
         self.expand_tree(root_tree, None, limits, &mut builder, &mut HashSet::new())?;
         Ok(builder.finish())
+    }
+
+    /// Builds, privately materializes, and atomically publishes one raw
+    /// workspace. If materialization fails, `staging` remains private and no
+    /// workspace name becomes visible.
+    pub fn checkout_commit(
+        &self,
+        request: WorkspaceCheckoutRequest<'_>,
+    ) -> Result<PathBuf, WorkspaceCheckoutError> {
+        let plan = self
+            .plan_commit(request.commit, request.limits)
+            .map_err(|error| WorkspaceCheckoutError::Planning(Box::new(error)))?;
+        materialize_raw(
+            &plan,
+            self,
+            self.cache,
+            request.staging,
+            request.gitlink_policy,
+        )
+        .map_err(|error| WorkspaceCheckoutError::Materialize(Box::new(error)))?;
+        publish_workspace(
+            request.staging,
+            request.workspaces,
+            request.trash,
+            request.name,
+            request.replace,
+        )
+        .map_err(|error| WorkspaceCheckoutError::Publish(Box::new(error)))
     }
 
     fn expand_tree(
@@ -351,6 +409,84 @@ mod tests {
         assert_eq!(plan.entries().len(), 1);
         assert_eq!(plan.entries()[0].path.as_bytes(), b"file.txt");
         assert_eq!(source.blob_bytes(&blob_oid).unwrap(), blob);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn symlink_only_commit_is_materialized_privately_then_published() {
+        let root = temp_root();
+        fs::create_dir(&root).unwrap();
+        let chunk = root.join("1.open");
+        let cache = Cache::open(root.join("cache")).unwrap();
+        let repo = RepoId([6; 16]);
+        let commit_oid = oid(4);
+        let tree_oid = oid(5);
+        let target_oid = oid(6);
+        let mut writer = ChunkWriter::create(
+            &chunk,
+            ChunkHeader {
+                generation: 1,
+                chunk_id: 1,
+                created_unix_secs: 0,
+                flags: 0,
+            },
+        )
+        .unwrap();
+        let mut tree = b"120000 linked\0".to_vec();
+        tree.extend_from_slice(target_oid.as_bytes());
+        let commit = format!("tree {}\n\nmessage\n", oid_hex(&tree_oid)).into_bytes();
+        let mut catalog = InMemoryCatalog::default();
+        append(
+            &mut writer,
+            &mut catalog,
+            repo,
+            target_oid,
+            ObjectKind::Blob,
+            b"target/path".to_vec(),
+        );
+        append(
+            &mut writer,
+            &mut catalog,
+            repo,
+            tree_oid,
+            ObjectKind::Tree,
+            tree,
+        );
+        append(
+            &mut writer,
+            &mut catalog,
+            repo,
+            commit_oid,
+            ObjectKind::Commit,
+            commit,
+        );
+        writer.sync_data().unwrap();
+        drop(writer);
+
+        let source = ColdWorkspaceSource::new(repo, &catalog, &cache, |_, _| chunk.clone());
+        let staging = root.join("staging/workspace");
+        let workspaces = root.join("workspaces");
+        let trash = root.join("trash");
+        fs::create_dir_all(&staging).unwrap();
+        fs::create_dir_all(&workspaces).unwrap();
+        let name = WorkspaceName::new("published").unwrap();
+        let published = source
+            .checkout_commit(WorkspaceCheckoutRequest {
+                commit: commit_oid,
+                limits: reflink_forest_checkout::DEFAULT_CHECKOUT_LIMITS,
+                staging: &staging,
+                workspaces: &workspaces,
+                trash: &trash,
+                name: &name,
+                gitlink_policy: GitlinkPolicy::Reject,
+                replace: ReplacePolicy::Reject,
+            })
+            .unwrap();
+        assert_eq!(
+            fs::read_link(published.join("linked")).unwrap(),
+            PathBuf::from("target/path")
+        );
+        assert!(!staging.exists());
         fs::remove_dir_all(root).unwrap();
     }
 

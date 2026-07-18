@@ -83,7 +83,7 @@ impl GenerationManager {
             .write(true)
             .create_new(true)
             .open(&temporary)?;
-        write!(file, "{generation}\n")?;
+        writeln!(file, "{generation}")?;
         file.sync_all()?;
         fs::rename(&temporary, self.pointer_path())?;
         File::open(&self.root)?.sync_all()?;
