@@ -398,4 +398,47 @@ mod tests {
             Err(FormatError::Truncated)
         );
     }
+
+    fn corpus_bytes(seed: u64, len: usize) -> Vec<u8> {
+        let mut state = seed;
+        (0..len)
+            .map(|_| {
+                // SplitMix64 makes this corpus reproducible without bringing a
+                // fuzz-only dependency into ordinary CI.
+                state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+                let mut value = state;
+                value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+                (value ^ (value >> 31)) as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn untrusted_decoder_fuzz_corpus_is_total_and_length_bounded() {
+        let lengths = [0, 1, 2, 3, 7, 8, 63, 64, 127, 128, 129, 255, 1024];
+        for seed in 0..64 {
+            for len in lengths {
+                let bytes = corpus_bytes(seed, len);
+                assert!(std::panic::catch_unwind(|| {
+                    let _ = ChunkHeader::decode(&bytes);
+                    let _ = encoded_record_len_from_header(&bytes);
+                    let _ = decode_record(&bytes);
+                })
+                .is_ok());
+            }
+        }
+
+        // A CRC-valid header with a hostile length must be rejected before the
+        // record decoder can copy a payload or derive an unchecked allocation.
+        let mut oversized = encode_record(&record(b"")).unwrap();
+        put_u64(&mut oversized, 20, u64::MAX);
+        let crc = crc32c_with_zeroed_field(&oversized[..RECORD_HEADER_LEN], RECORD_CRC_OFFSET, 4);
+        put_u32(&mut oversized, RECORD_CRC_OFFSET, crc);
+        assert_eq!(
+            encoded_record_len_from_header(&oversized),
+            Err(FormatError::LengthOverflow)
+        );
+        assert_eq!(decode_record(&oversized), Err(FormatError::LengthOverflow));
+    }
 }

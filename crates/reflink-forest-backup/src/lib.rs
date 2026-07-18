@@ -29,6 +29,20 @@ const MIN_MANIFEST_ENTRY_LEN: usize = 4 + 1 + 8 + 32;
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_MANIFEST_ENTRIES: u64 = 1_000_000;
 const MAX_MANIFEST_PATH_BYTES: u32 = 1024 * 1024;
+const COLD_DESCRIPTOR_HEADER_LEN: usize = COLD_DESCRIPTOR_MAGIC.len() + 2 + 4 + 4 + 4;
+const COLD_DESCRIPTOR_CHUNK_LEN: usize = 24;
+const COLD_DESCRIPTOR_DIGESTS_LEN: usize = 3 * 32;
+const COLD_DESCRIPTOR_CHECKSUM_LEN: usize = 32;
+/// Maximum chunk locations retained in one cold-tier checkpoint descriptor.
+///
+/// This also bounds decoder allocation when the descriptor is supplied by an
+/// untrusted backup source.  A million locations need about 24 MiB on disk,
+/// which is already substantially larger than normal production checkpoints.
+pub const MAX_COLD_DESCRIPTOR_CHUNKS: usize = 1_000_000;
+const MAX_COLD_DESCRIPTOR_BYTES: usize = COLD_DESCRIPTOR_HEADER_LEN
+    + MAX_COLD_DESCRIPTOR_CHUNKS * COLD_DESCRIPTOR_CHUNK_LEN
+    + COLD_DESCRIPTOR_DIGESTS_LEN
+    + COLD_DESCRIPTOR_CHECKSUM_LEN;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BackupFile {
@@ -123,7 +137,11 @@ pub fn checkpoint_cold_tier<G: CheckpointGuard>(
 pub fn load_cold_tier_descriptor(
     root: impl AsRef<Path>,
 ) -> Result<ColdTierCheckpointDescriptor, BackupError> {
-    decode_cold_descriptor(&fs::read(root.as_ref().join(COLD_DESCRIPTOR_FILE_NAME))?)
+    let mut bytes = Vec::new();
+    File::open(root.as_ref().join(COLD_DESCRIPTOR_FILE_NAME))?
+        .take((MAX_COLD_DESCRIPTOR_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    decode_cold_descriptor(&bytes)
 }
 /// Requires both generic inventory verification and a valid cold-tier descriptor
 /// before delegating to the compatible generic restore path.
@@ -532,6 +550,9 @@ fn nonce() -> u128 {
 }
 
 fn validate_cold_descriptor(descriptor: &ColdTierCheckpointDescriptor) -> Result<(), BackupError> {
+    if descriptor.chunks.len() > MAX_COLD_DESCRIPTOR_CHUNKS {
+        return Err(BackupError::InvalidManifest);
+    }
     if descriptor.chunks.windows(2).any(|pair| {
         (pair[0].generation, pair[0].chunk_id) >= (pair[1].generation, pair[1].chunk_id)
     }) {
@@ -555,7 +576,18 @@ fn encode_cold_descriptor(
         .len()
         .try_into()
         .map_err(|_: TryFromIntError| BackupError::InvalidManifest)?;
-    let mut out = Vec::with_capacity(8 + 2 + 4 + 4 + 4 + descriptor.chunks.len() * 24 + 96 + 32);
+    let capacity = COLD_DESCRIPTOR_HEADER_LEN
+        .checked_add(
+            descriptor
+                .chunks
+                .len()
+                .checked_mul(COLD_DESCRIPTOR_CHUNK_LEN)
+                .ok_or(BackupError::InvalidManifest)?,
+        )
+        .and_then(|len| len.checked_add(COLD_DESCRIPTOR_DIGESTS_LEN))
+        .and_then(|len| len.checked_add(COLD_DESCRIPTOR_CHECKSUM_LEN))
+        .ok_or(BackupError::InvalidManifest)?;
+    let mut out = Vec::with_capacity(capacity);
     out.extend_from_slice(COLD_DESCRIPTOR_MAGIC);
     out.extend_from_slice(&1_u16.to_be_bytes());
     out.extend_from_slice(&descriptor.catalog_schema_version.to_be_bytes());
@@ -579,7 +611,10 @@ fn encode_cold_descriptor(
     Ok(out)
 }
 fn decode_cold_descriptor(bytes: &[u8]) -> Result<ColdTierCheckpointDescriptor, BackupError> {
-    if bytes.len() < 22 + 96 + 32 {
+    if bytes.len()
+        < COLD_DESCRIPTOR_HEADER_LEN + COLD_DESCRIPTOR_DIGESTS_LEN + COLD_DESCRIPTOR_CHECKSUM_LEN
+        || bytes.len() > MAX_COLD_DESCRIPTOR_BYTES
+    {
         return Err(BackupError::InvalidManifest);
     }
     let (payload, stored) = bytes.split_at(bytes.len() - 32);
@@ -593,9 +628,16 @@ fn decode_cold_descriptor(bytes: &[u8]) -> Result<ColdTierCheckpointDescriptor, 
     let schema = read_u32(payload, &mut offset)?;
     let active = read_u32(payload, &mut offset)?;
     let count = read_u32(payload, &mut offset)? as usize;
-    let expected = 22usize
-        .checked_add(count.checked_mul(24).ok_or(BackupError::InvalidManifest)?)
-        .and_then(|n| n.checked_add(96))
+    if count > MAX_COLD_DESCRIPTOR_CHUNKS {
+        return Err(BackupError::InvalidManifest);
+    }
+    let expected = COLD_DESCRIPTOR_HEADER_LEN
+        .checked_add(
+            count
+                .checked_mul(COLD_DESCRIPTOR_CHUNK_LEN)
+                .ok_or(BackupError::InvalidManifest)?,
+        )
+        .and_then(|n| n.checked_add(COLD_DESCRIPTOR_DIGESTS_LEN))
         .ok_or(BackupError::InvalidManifest)?;
     if payload.len() != expected {
         return Err(BackupError::InvalidManifest);
@@ -604,7 +646,7 @@ fn decode_cold_descriptor(bytes: &[u8]) -> Result<ColdTierCheckpointDescriptor, 
     for _ in 0..count {
         let generation = read_u32(payload, &mut offset)?;
         let chunk_id = read_u64(payload, &mut offset)?;
-        let classification = match *read_bytes(payload, &mut offset, 1)?.first().unwrap() {
+        let classification = match read_bytes(payload, &mut offset, 1)?[0] {
             1 => ChunkClassification::Open,
             2 => ChunkClassification::Sealed,
             _ => return Err(BackupError::InvalidManifest),
@@ -620,9 +662,15 @@ fn decode_cold_descriptor(bytes: &[u8]) -> Result<ColdTierCheckpointDescriptor, 
             valid_prefix,
         });
     }
-    let catalog_digest = read_bytes(payload, &mut offset, 32)?.try_into().unwrap();
-    let config_digest = read_bytes(payload, &mut offset, 32)?.try_into().unwrap();
-    let pins_manifest_digest = read_bytes(payload, &mut offset, 32)?.try_into().unwrap();
+    let catalog_digest = read_bytes(payload, &mut offset, 32)?
+        .try_into()
+        .map_err(|_| BackupError::InvalidManifest)?;
+    let config_digest = read_bytes(payload, &mut offset, 32)?
+        .try_into()
+        .map_err(|_| BackupError::InvalidManifest)?;
+    let pins_manifest_digest = read_bytes(payload, &mut offset, 32)?
+        .try_into()
+        .map_err(|_| BackupError::InvalidManifest)?;
     let descriptor = ColdTierCheckpointDescriptor {
         catalog_schema_version: schema,
         active_generation: active,
@@ -795,5 +843,61 @@ mod tests {
 
         fs::remove_dir_all(source).unwrap();
         fs::remove_dir_all(parent).unwrap();
+    }
+
+    fn corpus_bytes(seed: u64, len: usize) -> Vec<u8> {
+        let mut state = seed;
+        (0..len)
+            .map(|_| {
+                state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+                let mut value = state;
+                value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+                (value ^ (value >> 31)) as u8
+            })
+            .collect()
+    }
+
+    fn with_digest(mut payload: Vec<u8>) -> Vec<u8> {
+        let digest = Sha256::digest(&payload);
+        payload.extend_from_slice(&digest);
+        payload
+    }
+
+    #[test]
+    fn untrusted_backup_decoders_fuzz_corpus_is_total_and_count_bounded() {
+        let lengths = [0, 1, 7, 8, 9, 21, 22, 63, 127, 255, 1024, 4096];
+        for seed in 0..64 {
+            for len in lengths {
+                let bytes = corpus_bytes(seed, len);
+                assert!(std::panic::catch_unwind(|| {
+                    let _ = decode_manifest(&bytes);
+                    let _ = decode_cold_descriptor(&bytes);
+                })
+                .is_ok());
+            }
+        }
+
+        let mut impossible_manifest = Vec::new();
+        impossible_manifest.extend_from_slice(MANIFEST_MAGIC);
+        impossible_manifest.extend_from_slice(&u64::MAX.to_be_bytes());
+        let impossible_manifest = with_digest(impossible_manifest);
+        assert!(matches!(
+            decode_manifest(&impossible_manifest),
+            Err(BackupError::InvalidManifest)
+        ));
+
+        let mut impossible_descriptor = Vec::new();
+        impossible_descriptor.extend_from_slice(COLD_DESCRIPTOR_MAGIC);
+        impossible_descriptor.extend_from_slice(&1_u16.to_be_bytes());
+        impossible_descriptor.extend_from_slice(&0_u32.to_be_bytes()); // schema
+        impossible_descriptor.extend_from_slice(&0_u32.to_be_bytes()); // active generation
+        impossible_descriptor.extend_from_slice(&u32::MAX.to_be_bytes());
+        impossible_descriptor.extend_from_slice(&[0; COLD_DESCRIPTOR_DIGESTS_LEN]);
+        let impossible_descriptor = with_digest(impossible_descriptor);
+        assert!(matches!(
+            decode_cold_descriptor(&impossible_descriptor),
+            Err(BackupError::InvalidManifest)
+        ));
     }
 }

@@ -25,7 +25,17 @@ loop/mount fault injection remains gated to a dedicated Btrfs VM.
 cargo fmt --check
 cargo test --workspace
 cargo test -p reflink-forest-index --features rocksdb-backend
+# Deterministic malformed-input corpus; runs in ordinary CI without cargo-fuzz.
+cargo test -p reflink-forest-format untrusted_decoder_fuzz_corpus
+cargo test -p reflink-forest-import untrusted_manifest_decoder_fuzz_corpus
+cargo test -p reflink-forest-backup untrusted_backup_decoders_fuzz_corpus
 ```
+
+The decoder corpus tests exercise fixed boundary lengths, reproducible
+pseudo-random byte inputs, and authenticated hostile length/count fields. They
+are intentionally ordinary unit tests so every CI runner can execute them;
+each decoder also applies a format-specific input and allocation bound before
+constructing decoded collections.
 
 The runtime clone-domain probe must be run against the planned Btrfs cache and
 workspace directories, not merely any two paths:

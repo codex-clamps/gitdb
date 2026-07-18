@@ -124,6 +124,34 @@ impl GitOid {
         })
     }
 
+    /// Computes the native Git object ID for one raw object payload.
+    ///
+    /// Unlike [`ContentId`], a Git object ID includes the Git type name and
+    /// ASCII-decimal payload length.  Marking uses this to ensure a
+    /// repository-scoped OID alias actually names the cold record it selects.
+    pub fn for_object(algorithm: HashAlgorithm, kind: ObjectKind, raw_payload: &[u8]) -> Self {
+        let mut header = Vec::with_capacity(32);
+        header.extend_from_slice(git_object_kind_name(kind).as_bytes());
+        header.push(b' ');
+        header.extend_from_slice(raw_payload.len().to_string().as_bytes());
+        header.push(0);
+
+        match algorithm {
+            HashAlgorithm::Sha1 => {
+                let mut digest = sha1::Sha1::new();
+                digest.update(&header);
+                digest.update(raw_payload);
+                Self::new(algorithm, &digest.finalize()).expect("SHA-1 digest has a fixed length")
+            }
+            HashAlgorithm::Sha256 => {
+                let mut digest = Sha256::new();
+                digest.update(&header);
+                digest.update(raw_payload);
+                Self::new(algorithm, &digest.finalize()).expect("SHA-256 digest has a fixed length")
+            }
+        }
+    }
+
     pub const fn algorithm(self) -> HashAlgorithm {
         self.algorithm
     }
@@ -148,6 +176,15 @@ impl GitOid {
         output.push(self.len);
         output.extend_from_slice(self.as_bytes());
         output
+    }
+}
+
+fn git_object_kind_name(kind: ObjectKind) -> &'static str {
+    match kind {
+        ObjectKind::Commit => "commit",
+        ObjectKind::Tree => "tree",
+        ObjectKind::Blob => "blob",
+        ObjectKind::Tag => "tag",
     }
 }
 

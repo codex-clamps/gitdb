@@ -533,7 +533,12 @@ fn object_kind_name(kind: ObjectKind) -> &'static str {
     }
 }
 
-fn referenced_oids(object: &GitObject) -> Result<Vec<GitOid>, GitBackendError> {
+/// Parses every direct object reference from a validated raw Git object.
+///
+/// This is shared by import-time traversal and cold-store GC marking.  The
+/// parser deliberately rejects malformed commit, tag, and tree encodings
+/// rather than treating a damaged object as a leaf.
+pub fn referenced_oids(object: &GitObject) -> Result<Vec<GitOid>, GitBackendError> {
     match object.kind {
         ObjectKind::Blob => Ok(Vec::new()),
         ObjectKind::Commit => parse_commit_references(object),

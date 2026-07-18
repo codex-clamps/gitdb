@@ -4,10 +4,13 @@
 //! location in it. Leases make that dependency explicit and survive a process
 //! crash as files that startup reconciliation can inspect.
 
-use reflink_forest_core::ContentId;
-use reflink_forest_format::ObjectRecord;
-use reflink_forest_index::{Catalog, CatalogBatch, ObjectLocation};
+use reflink_forest_core::{ContentId, GitOid};
+use reflink_forest_format::{Codec, ObjectRecord};
+use reflink_forest_git::{referenced_oids, GitObject};
+use reflink_forest_import::SnapshotManifest;
+use reflink_forest_index::{Catalog, CatalogBatch, GcRoot, ObjectLocation, RepoId, SnapshotId};
 use std::{
+    collections::{HashMap, HashSet, VecDeque},
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     os::unix::{fs::OpenOptionsExt, io::AsRawFd},
@@ -48,6 +51,7 @@ pub enum MaintenanceError {
         target: u32,
         current: Option<u32>,
     },
+    PinnedGeneration(u32),
     ActiveReaders(u32),
     RetiringGeneration(u32),
     CannotRetireActiveGeneration(u32),
@@ -94,6 +98,10 @@ impl std::fmt::Display for MaintenanceError {
             } => write!(
                 f,
                 "cannot retire compacted generation {source}; catalog current generation is {current:?}, not published target {target}"
+            ),
+            Self::PinnedGeneration(generation) => write!(
+                f,
+                "cannot retire generation {generation}; a durable workspace or operational pin still retains it"
             ),
             Self::ActiveReaders(generation) => {
                 write!(f, "generation {generation} still has active readers")
@@ -206,6 +214,436 @@ pub struct CompactionOutcome {
     pub source_generation: u32,
     pub target_generation: u32,
     pub copied_records: usize,
+}
+
+/// One repository-scoped native object reference retained outside a ready
+/// repository snapshot, for example by an active job or boot-target manifest.
+///
+/// Generation pins are intentionally not represented here: they retain a
+/// complete *old generation* until retirement and are enforced by the
+/// retirement path. This type is for durable metadata that needs a particular
+/// object copied into the next active generation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct RetainedObjectRef {
+    pub repository: RepoId,
+    pub oid: GitOid,
+}
+
+/// Bounded-work limits for [`completed_mark_set`].
+///
+/// Limits cover the durable root manifests, queued Git references, and unique
+/// cold records. A limit failure returns no partial mark set, so callers can
+/// leave the current generation authoritative and investigate or resume.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MarkLimits {
+    pub max_snapshot_roots: usize,
+    pub max_object_references: usize,
+    pub max_objects: usize,
+}
+
+impl Default for MarkLimits {
+    fn default() -> Self {
+        Self {
+            max_snapshot_roots: 4_096,
+            max_object_references: 16 * 1024 * 1024,
+            max_objects: 8 * 1024 * 1024,
+        }
+    }
+}
+
+/// Reads one completed snapshot manifest selected by a durable catalog root.
+///
+/// Implementations normally call
+/// [`reflink_forest_import::read_snapshot_manifest`] against the instance's
+/// private manifest directory. The mark phase validates the returned manifest
+/// again, because [`SnapshotManifest`] has intentionally public fields for
+/// format migration and inspection tooling.
+pub trait SnapshotManifestSource {
+    type Error: std::fmt::Display;
+
+    fn load_snapshot_manifest(
+        &self,
+        repository: RepoId,
+        snapshot: SnapshotId,
+    ) -> Result<SnapshotManifest, Self::Error>;
+}
+
+impl<F, E> SnapshotManifestSource for F
+where
+    F: Fn(RepoId, SnapshotId) -> Result<SnapshotManifest, E>,
+    E: std::fmt::Display,
+{
+    type Error = E;
+
+    fn load_snapshot_manifest(
+        &self,
+        repository: RepoId,
+        snapshot: SnapshotId,
+    ) -> Result<SnapshotManifest, Self::Error> {
+        self(repository, snapshot)
+    }
+}
+
+/// Failure while deriving a complete mark set from durable roots.
+#[derive(Debug)]
+pub enum MarkError {
+    Catalog(String),
+    NoCurrentGeneration,
+    TooManySnapshotRoots {
+        limit: usize,
+    },
+    TooManyObjectReferences {
+        limit: usize,
+    },
+    TooManyObjects {
+        limit: usize,
+    },
+    Manifest(String),
+    ManifestIdentity {
+        expected_repository: RepoId,
+        expected_snapshot: SnapshotId,
+        actual_repository: RepoId,
+        actual_snapshot: SnapshotId,
+    },
+    MissingAlias {
+        repository: RepoId,
+        oid: GitOid,
+    },
+    MissingLocation(ContentId),
+    LocationOutsideCurrentGeneration {
+        content_id: ContentId,
+        expected_generation: u32,
+        actual_generation: u32,
+    },
+    Read(String),
+    UnsupportedCodec {
+        content_id: ContentId,
+        codec: Codec,
+    },
+    RawLengthMismatch {
+        content_id: ContentId,
+        expected: u64,
+        actual: u64,
+    },
+    RecordContentIdMismatch {
+        expected: ContentId,
+        actual: ContentId,
+    },
+    PayloadContentIdMismatch(ContentId),
+    NativeOidMismatch {
+        expected: GitOid,
+        actual: GitOid,
+    },
+    InvalidGitObject(String),
+}
+
+impl std::fmt::Display for MarkError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Catalog(error) => write!(f, "GC mark catalog error: {error}"),
+            Self::NoCurrentGeneration => write!(f, "GC mark requires a current cold generation"),
+            Self::TooManySnapshotRoots { limit } => {
+                write!(f, "GC mark exceeds its {limit} snapshot-root limit")
+            }
+            Self::TooManyObjectReferences { limit } => {
+                write!(f, "GC mark exceeds its {limit} object-reference limit")
+            }
+            Self::TooManyObjects { limit } => {
+                write!(f, "GC mark exceeds its {limit} object limit")
+            }
+            Self::Manifest(error) => write!(f, "GC mark manifest error: {error}"),
+            Self::ManifestIdentity {
+                expected_repository,
+                expected_snapshot,
+                actual_repository,
+                actual_snapshot,
+            } => write!(
+                f,
+                "GC mark manifest identity mismatch: expected {expected_repository:?}/{expected_snapshot:?}, got {actual_repository:?}/{actual_snapshot:?}"
+            ),
+            Self::MissingAlias { repository, oid } => {
+                write!(f, "GC mark is missing an OID alias for {repository:?}/{oid:?}")
+            }
+            Self::MissingLocation(content_id) => {
+                write!(f, "GC mark is missing the location for {content_id:?}")
+            }
+            Self::LocationOutsideCurrentGeneration {
+                content_id,
+                expected_generation,
+                actual_generation,
+            } => write!(
+                f,
+                "GC mark found {content_id:?} in generation {actual_generation}, not current generation {expected_generation}"
+            ),
+            Self::Read(error) => write!(f, "GC mark could not read a cold record: {error}"),
+            Self::UnsupportedCodec { content_id, codec } => write!(
+                f,
+                "GC mark cannot inspect {content_id:?}: unsupported cold codec {codec:?}"
+            ),
+            Self::RawLengthMismatch {
+                content_id,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "GC mark found raw-length mismatch for {content_id:?}: expected {expected}, got {actual}"
+            ),
+            Self::RecordContentIdMismatch { expected, actual } => write!(
+                f,
+                "GC mark found record ContentId {actual:?}, expected {expected:?}"
+            ),
+            Self::PayloadContentIdMismatch(content_id) => write!(
+                f,
+                "GC mark found payload bytes that do not hash to {content_id:?}"
+            ),
+            Self::NativeOidMismatch { expected, actual } => write!(
+                f,
+                "GC mark found native OID {actual:?}, expected {expected:?}"
+            ),
+            Self::InvalidGitObject(error) => write!(f, "GC mark found invalid Git object: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for MarkError {}
+
+struct MarkWalk {
+    limits: MarkLimits,
+    references_queued: usize,
+    pending: VecDeque<RetainedObjectRef>,
+    visited_references: HashSet<RetainedObjectRef>,
+    locations: HashMap<ContentId, ObjectLocation>,
+}
+
+impl MarkWalk {
+    fn new(limits: MarkLimits) -> Self {
+        Self {
+            limits,
+            references_queued: 0,
+            pending: VecDeque::new(),
+            visited_references: HashSet::new(),
+            locations: HashMap::new(),
+        }
+    }
+
+    fn queue(&mut self, reference: RetainedObjectRef) -> Result<(), MarkError> {
+        self.references_queued =
+            self.references_queued
+                .checked_add(1)
+                .ok_or(MarkError::TooManyObjectReferences {
+                    limit: self.limits.max_object_references,
+                })?;
+        if self.references_queued > self.limits.max_object_references {
+            return Err(MarkError::TooManyObjectReferences {
+                limit: self.limits.max_object_references,
+            });
+        }
+        self.pending.push_back(reference);
+        Ok(())
+    }
+
+    fn insert_location(
+        &mut self,
+        content_id: ContentId,
+        location: ObjectLocation,
+    ) -> Result<bool, MarkError> {
+        if self.locations.contains_key(&content_id) {
+            return Ok(false);
+        }
+        if self.locations.len() >= self.limits.max_objects {
+            return Err(MarkError::TooManyObjects {
+                limit: self.limits.max_objects,
+            });
+        }
+        self.locations.insert(content_id, location);
+        Ok(true)
+    }
+
+    fn into_sorted_locations(self) -> Vec<(ContentId, ObjectLocation)> {
+        let mut locations: Vec<_> = self.locations.into_iter().collect();
+        locations.sort_unstable_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
+        locations
+    }
+}
+
+/// Builds the complete, deterministic mark set for the current cold
+/// generation.
+///
+/// The walk begins at all `Ready` repository snapshots returned by
+/// [`Catalog::gc_roots`], plus exact retained object references supplied by
+/// durable job/boot metadata. Every manifest identity, alias, location, raw
+/// record, internal `ContentId`, native Git OID, and Git graph edge is checked
+/// before any location is returned. Missing, corrupt, cross-generation, or
+/// unsupported data therefore fails the whole mark phase rather than causing
+/// GC to silently delete reachable objects.
+///
+/// Workspace and explicit generation pins are intentionally not expanded into
+/// per-object entries: they keep their older generation from being retired.
+/// They remain part of `gc_roots()` so a caller can enforce them during the
+/// retirement decision; a pin alone cannot name a subset of current records.
+/// The returned pairs are strictly sorted by raw `ContentId` bytes with no
+/// duplicates and can be passed directly to [`compact_completed_mark_set`].
+pub fn completed_mark_set<C, M, R, I>(
+    catalog: &C,
+    manifests: &M,
+    reader: &mut R,
+    retained: I,
+    limits: MarkLimits,
+) -> Result<Vec<(ContentId, ObjectLocation)>, MarkError>
+where
+    C: Catalog,
+    M: SnapshotManifestSource,
+    R: CompactionReader,
+    I: IntoIterator<Item = RetainedObjectRef>,
+{
+    let current_generation = catalog
+        .current_generation()
+        .ok_or(MarkError::NoCurrentGeneration)?;
+    let roots = catalog
+        .gc_roots()
+        .map_err(|error| MarkError::Catalog(format!("{error:?}")))?;
+    let mut walk = MarkWalk::new(limits);
+    let mut snapshot_roots = 0_usize;
+
+    for root in roots {
+        let GcRoot::RepositorySnapshot {
+            repository,
+            snapshot,
+        } = root
+        else {
+            continue;
+        };
+        snapshot_roots = snapshot_roots
+            .checked_add(1)
+            .ok_or(MarkError::TooManySnapshotRoots {
+                limit: limits.max_snapshot_roots,
+            })?;
+        if snapshot_roots > limits.max_snapshot_roots {
+            return Err(MarkError::TooManySnapshotRoots {
+                limit: limits.max_snapshot_roots,
+            });
+        }
+        let manifest = manifests
+            .load_snapshot_manifest(repository, snapshot)
+            .map_err(|error| MarkError::Manifest(error.to_string()))?;
+        manifest
+            .validate()
+            .map_err(|error| MarkError::Manifest(error.to_string()))?;
+        if manifest.repository != repository || manifest.snapshot_id != snapshot {
+            return Err(MarkError::ManifestIdentity {
+                expected_repository: repository,
+                expected_snapshot: snapshot,
+                actual_repository: manifest.repository,
+                actual_snapshot: manifest.snapshot_id,
+            });
+        }
+        for reference in manifest.refs {
+            walk.queue(RetainedObjectRef {
+                repository,
+                oid: reference.target,
+            })?;
+        }
+    }
+
+    let mut retained_roots = Vec::new();
+    for reference in retained {
+        if retained_roots.len() >= limits.max_object_references {
+            return Err(MarkError::TooManyObjectReferences {
+                limit: limits.max_object_references,
+            });
+        }
+        retained_roots.push(reference);
+    }
+    retained_roots.sort_unstable_by(|left, right| {
+        left.repository
+            .0
+            .cmp(&right.repository.0)
+            .then_with(|| left.oid.algorithm().tag().cmp(&right.oid.algorithm().tag()))
+            .then_with(|| left.oid.as_bytes().cmp(right.oid.as_bytes()))
+    });
+    for reference in retained_roots {
+        walk.queue(reference)?;
+    }
+
+    while let Some(reference) = walk.pending.pop_front() {
+        if !walk.visited_references.insert(reference) {
+            continue;
+        }
+        let content_id = catalog
+            .oid_alias(reference.repository, &reference.oid)
+            .ok_or(MarkError::MissingAlias {
+                repository: reference.repository,
+                oid: reference.oid,
+            })?;
+        let location = catalog
+            .object_location(content_id)
+            .ok_or(MarkError::MissingLocation(content_id))?;
+        if location.generation != current_generation {
+            return Err(MarkError::LocationOutsideCurrentGeneration {
+                content_id,
+                expected_generation: current_generation,
+                actual_generation: location.generation,
+            });
+        }
+        let record = reader
+            .read_verified(content_id, location)
+            .map_err(|error| MarkError::Read(error.to_string()))?;
+        if record.content_id != content_id {
+            return Err(MarkError::RecordContentIdMismatch {
+                expected: content_id,
+                actual: record.content_id,
+            });
+        }
+        if record.codec != Codec::Raw {
+            return Err(MarkError::UnsupportedCodec {
+                content_id,
+                codec: record.codec,
+            });
+        }
+        let raw_length =
+            u64::try_from(record.payload.len()).map_err(|_| MarkError::RawLengthMismatch {
+                content_id,
+                expected: record.raw_length,
+                actual: u64::MAX,
+            })?;
+        if record.raw_length != raw_length {
+            return Err(MarkError::RawLengthMismatch {
+                content_id,
+                expected: record.raw_length,
+                actual: raw_length,
+            });
+        }
+        if ContentId::for_object(record.kind, &record.payload) != content_id {
+            return Err(MarkError::PayloadContentIdMismatch(content_id));
+        }
+        let actual_oid =
+            GitOid::for_object(reference.oid.algorithm(), record.kind, &record.payload);
+        if actual_oid != reference.oid {
+            return Err(MarkError::NativeOidMismatch {
+                expected: reference.oid,
+                actual: actual_oid,
+            });
+        }
+
+        if !walk.insert_location(content_id, location)? {
+            continue;
+        }
+        let object = GitObject {
+            oid: reference.oid,
+            kind: record.kind,
+            data: record.payload,
+        };
+        for oid in referenced_oids(&object)
+            .map_err(|error| MarkError::InvalidGitObject(error.to_string()))?
+        {
+            walk.queue(RetainedObjectRef {
+                repository: reference.repository,
+                oid,
+            })?;
+        }
+    }
+
+    Ok(walk.into_sorted_locations())
 }
 
 /// Copies a completed mark set into a new cold generation and atomically
@@ -341,6 +779,18 @@ pub fn retire_compacted_generation<C: Catalog>(
             target: target_generation,
             current,
         });
+    }
+    let has_source_pin = catalog
+        .gc_roots()
+        .map_err(|error| MaintenanceError::Catalog(format!("{error:?}")))?
+        .into_iter()
+        .any(|root| match root {
+            GcRoot::WorkspacePin { generation, .. } => generation == source_generation,
+            GcRoot::ExplicitPin { pin } => pin.generation == source_generation,
+            GcRoot::RepositorySnapshot { .. } => false,
+        });
+    if has_source_pin {
+        return Err(MaintenanceError::PinnedGeneration(source_generation));
     }
     reconcile_active_generation(catalog, manager)?;
     manager.retire_generation(source_generation, generation_path, trash_root)
@@ -601,11 +1051,16 @@ fn nonce() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use reflink_forest_core::ObjectKind;
+    use reflink_forest_core::{HashAlgorithm, ObjectKind};
     use reflink_forest_format::{crc32c, ChunkHeader, Codec, ObjectRecord};
-    use reflink_forest_index::{CatalogError, ChunkMetadata, InMemoryCatalog, RepoId};
+    use reflink_forest_git::LocalRefKind;
+    use reflink_forest_import::{ImportPolicy, ImportSummary, PersistedRef, RepoSnapshotId};
+    use reflink_forest_index::{
+        CatalogError, ChunkMetadata, GcPinId, InMemoryCatalog, RepoId, SnapshotVisibility,
+        WorkspaceId,
+    };
     use reflink_forest_store::{read_record_at, ChunkWriter, RecordLocation};
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap};
     fn root() -> PathBuf {
         std::env::temp_dir().join(format!("reflink-forest-maintenance-{}", nonce()))
     }
@@ -929,6 +1384,21 @@ mod tests {
             Err(MaintenanceError::ActiveReaders(1))
         ));
         drop(lease);
+        let workspace_pin = WorkspaceId([0x71; 16]);
+        let operation_pin = GcPinId([0x72; 16]);
+        let mut pins = CatalogBatch::new();
+        pins.put_workspace_pin(workspace_pin, 1);
+        pins.put_gc_pin(operation_pin, 1);
+        catalog.apply(pins).unwrap();
+        assert!(matches!(
+            retire_compacted_generation(&catalog, &manager, 1, 2, &source_path, root.join("trash")),
+            Err(MaintenanceError::PinnedGeneration(1))
+        ));
+        assert!(source_path.is_dir());
+        let mut release_pins = CatalogBatch::new();
+        release_pins.delete_workspace_pin(workspace_pin);
+        release_pins.delete_gc_pin(operation_pin);
+        catalog.apply(release_pins).unwrap();
         let retired =
             retire_compacted_generation(&catalog, &manager, 1, 2, &source_path, root.join("trash"))
                 .unwrap();
@@ -1008,5 +1478,226 @@ mod tests {
         drop(manager.lease(1).unwrap());
         drop(writer);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[derive(Default)]
+    struct TestManifests {
+        values: BTreeMap<(RepoId, SnapshotId), SnapshotManifest>,
+    }
+    impl SnapshotManifestSource for TestManifests {
+        type Error = String;
+
+        fn load_snapshot_manifest(
+            &self,
+            repository: RepoId,
+            snapshot: SnapshotId,
+        ) -> Result<SnapshotManifest, Self::Error> {
+            self.values
+                .get(&(repository, snapshot))
+                .cloned()
+                .ok_or_else(|| "test snapshot manifest is absent".to_owned())
+        }
+    }
+
+    #[derive(Default)]
+    struct TestMarkReader {
+        records: HashMap<ContentId, ObjectRecord>,
+    }
+    impl CompactionReader for TestMarkReader {
+        type Error = String;
+
+        fn read_verified(
+            &mut self,
+            content_id: ContentId,
+            _: ObjectLocation,
+        ) -> Result<ObjectRecord, Self::Error> {
+            self.records
+                .get(&content_id)
+                .cloned()
+                .ok_or_else(|| "test cold record is absent".to_owned())
+        }
+    }
+
+    fn native_oid(kind: ObjectKind, payload: &[u8]) -> GitOid {
+        GitOid::for_object(HashAlgorithm::Sha1, kind, payload)
+    }
+
+    fn oid_hex(oid: GitOid) -> Vec<u8> {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut text = Vec::with_capacity(usize::from(oid.len()) * 2);
+        for &byte in oid.as_bytes() {
+            text.push(HEX[usize::from(byte >> 4)]);
+            text.push(HEX[usize::from(byte & 0x0f)]);
+        }
+        text
+    }
+
+    fn marked_record(kind: ObjectKind, payload: Vec<u8>) -> ObjectRecord {
+        ObjectRecord {
+            kind,
+            codec: Codec::Raw,
+            flags: 0,
+            raw_length: payload.len() as u64,
+            content_id: ContentId::for_object(kind, &payload),
+            primary_oid: native_oid(kind, &payload),
+            payload,
+        }
+    }
+
+    fn mark_location(record: &ObjectRecord) -> ObjectLocation {
+        ObjectLocation {
+            generation: 7,
+            chunk_id: 1,
+            offset: 64,
+            record_length: 128 + record.payload.len() as u64,
+            stored_length: record.payload.len() as u64,
+            raw_length: record.raw_length,
+            kind: record.kind,
+            codec: record.codec,
+            flags: record.flags,
+            payload_crc32c: crc32c(&record.payload),
+        }
+    }
+
+    struct MarkFixture {
+        catalog: InMemoryCatalog,
+        manifests: TestManifests,
+        reader: TestMarkReader,
+        retained: RetainedObjectRef,
+        ids: Vec<ContentId>,
+    }
+
+    fn mark_fixture() -> MarkFixture {
+        let repository = RepoId([0x61; 16]);
+        let snapshot = RepoSnapshotId([0x62; 16]);
+        let tracked_blob = marked_record(ObjectKind::Blob, b"tracked\n".to_vec());
+        let retained_blob = marked_record(ObjectKind::Blob, b"retained\n".to_vec());
+        let mut tree_payload = b"100644 tracked.txt\0".to_vec();
+        tree_payload.extend_from_slice(tracked_blob.primary_oid.as_bytes());
+        let tree = marked_record(ObjectKind::Tree, tree_payload);
+        let mut commit_payload = b"tree ".to_vec();
+        commit_payload.extend_from_slice(&oid_hex(tree.primary_oid));
+        commit_payload.extend_from_slice(
+            b"\nauthor Mark <mark@example.invalid> 0 +0000\ncommitter Mark <mark@example.invalid> 0 +0000\n\nmark fixture\n",
+        );
+        let commit = marked_record(ObjectKind::Commit, commit_payload);
+
+        let manifest = SnapshotManifest {
+            repository,
+            snapshot_id: snapshot,
+            native_object_format: HashAlgorithm::Sha1,
+            import_policy: ImportPolicy::LocalBranchesAndTags,
+            refs: vec![PersistedRef {
+                name: b"refs/heads/main".to_vec(),
+                kind: LocalRefKind::Branch,
+                target: commit.primary_oid,
+            }],
+            summary: ImportSummary {
+                objects_seen: 3,
+                objects_written: 3,
+                objects_deduplicated: 0,
+                raw_bytes: (commit.payload.len() + tree.payload.len() + tracked_blob.payload.len())
+                    as u64,
+            },
+            imported_unix_secs: 0,
+            tool_version: b"mark-test".to_vec(),
+            optional_fields: Vec::new(),
+        };
+        manifest.validate().unwrap();
+
+        let incomplete_snapshot = RepoSnapshotId([0x63; 16]);
+        let mut catalog = InMemoryCatalog::default();
+        let mut batch = CatalogBatch::new();
+        batch.put_current_generation(7);
+        batch.put_repository_snapshot(repository, snapshot, SnapshotVisibility::Ready);
+        // An incomplete snapshot must not trigger a manifest read or retain
+        // its objects during this mark pass.
+        batch.put_repository_snapshot(
+            repository,
+            incomplete_snapshot,
+            SnapshotVisibility::Incomplete,
+        );
+        let mut reader = TestMarkReader::default();
+        let mut ids = Vec::new();
+        for record in [&commit, &tree, &tracked_blob, &retained_blob] {
+            batch.put_oid_alias(repository, record.primary_oid, record.content_id);
+            batch.put_object_location(record.content_id, mark_location(record));
+            reader.records.insert(record.content_id, record.clone());
+            ids.push(record.content_id);
+        }
+        catalog.apply(batch).unwrap();
+
+        let mut manifests = TestManifests::default();
+        manifests.values.insert((repository, snapshot), manifest);
+        MarkFixture {
+            catalog,
+            manifests,
+            reader,
+            retained: RetainedObjectRef {
+                repository,
+                oid: retained_blob.primary_oid,
+            },
+            ids,
+        }
+    }
+
+    #[test]
+    fn completed_mark_set_preserves_ready_snapshot_graph_and_retained_objects() {
+        let mut fixture = mark_fixture();
+        let marked = completed_mark_set(
+            &fixture.catalog,
+            &fixture.manifests,
+            &mut fixture.reader,
+            [fixture.retained],
+            MarkLimits {
+                max_snapshot_roots: 1,
+                max_object_references: 8,
+                max_objects: 4,
+            },
+        )
+        .unwrap();
+        let marked_ids: Vec<_> = marked.iter().map(|(id, _)| *id).collect();
+        let mut expected = fixture.ids;
+        expected.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+        assert_eq!(marked_ids, expected);
+        assert!(marked
+            .windows(2)
+            .all(|pair| pair[0].0.as_bytes() < pair[1].0.as_bytes()));
+        assert!(marked.iter().all(|(_, location)| location.generation == 7));
+    }
+
+    #[test]
+    fn completed_mark_set_rejects_corrupt_reachable_record_and_bounded_walks() {
+        let mut corrupt = mark_fixture();
+        let corrupt_id = corrupt.ids[0];
+        let record = corrupt.reader.records.get_mut(&corrupt_id).unwrap();
+        record.payload = b"tampered cold record".to_vec();
+        record.raw_length = record.payload.len() as u64;
+        assert!(matches!(
+            completed_mark_set(
+                &corrupt.catalog,
+                &corrupt.manifests,
+                &mut corrupt.reader,
+                [corrupt.retained],
+                MarkLimits::default(),
+            ),
+            Err(MarkError::PayloadContentIdMismatch(id)) if id == corrupt_id
+        ));
+
+        let mut bounded = mark_fixture();
+        assert!(matches!(
+            completed_mark_set(
+                &bounded.catalog,
+                &bounded.manifests,
+                &mut bounded.reader,
+                [bounded.retained],
+                MarkLimits {
+                    max_snapshot_roots: 1,
+                    max_object_references: 8,
+                    max_objects: 1,
+                },
+            ),
+            Err(MarkError::TooManyObjects { limit: 1 })
+        ));
     }
 }

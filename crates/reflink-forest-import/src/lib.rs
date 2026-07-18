@@ -15,7 +15,7 @@ use std::{
 use reflink_forest_core::{ContentId, GitOid, HashAlgorithm};
 use reflink_forest_format::{Codec, ObjectRecord};
 use reflink_forest_git::{GitBackend, GitBackendError, LocalRefKind, RefSnapshot};
-use reflink_forest_index::{Catalog, RepoId};
+use reflink_forest_index::{Catalog, CatalogBatch, CatalogError, RepoId, SnapshotVisibility};
 use reflink_forest_store::{ChunkWriter, StoreError};
 
 /// The current binary encoding version for repository snapshot manifests.
@@ -37,6 +37,11 @@ const SNAPSHOT_MANIFEST_MAGIC: &[u8; 8] = b"RFSNAP\0\0";
 const MANIFEST_REF_NAME_MAX_BYTES: usize = 64 * 1024;
 const MANIFEST_TOOL_VERSION_MAX_BYTES: usize = 64 * 1024;
 const MANIFEST_OPTIONAL_FIELD_MAX_BYTES: usize = 4 * 1024 * 1024;
+// A ref always carries its kind, name length, hash algorithm, OID length, and
+// at least a SHA-1 OID.  These lower bounds let the decoder reject impossible
+// count fields before reserving or iterating from untrusted input.
+const MIN_MANIFEST_REF_ENTRY_BYTES: usize = 1 + 2 + 1 + 1 + 20;
+const MIN_MANIFEST_OPTIONAL_FIELD_BYTES: usize = 2 + 4;
 
 /// One byte-preserving local ref retained by a completed snapshot manifest.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -144,7 +149,11 @@ impl SnapshotManifest {
         Ok(())
     }
 
-    fn validate(&self) -> Result<(), SnapshotManifestError> {
+    /// Fully validates this in-memory manifest before it can become a GC
+    /// root.  This is public because callers that receive a manifest through
+    /// an abstraction other than [`read_snapshot_manifest`] must not trust
+    /// mutable public fields without re-validating them.
+    pub fn validate(&self) -> Result<(), SnapshotManifestError> {
         if self.tool_version.is_empty() || self.tool_version.len() > MANIFEST_TOOL_VERSION_MAX_BYTES
         {
             return Err(SnapshotManifestError::Invalid(
@@ -252,6 +261,168 @@ impl std::error::Error for SnapshotManifestError {
 impl From<io::Error> for SnapshotManifestError {
     fn from(value: io::Error) -> Self {
         Self::Io(value)
+    }
+}
+
+/// Result of finishing a repository snapshot's visibility publication.
+///
+/// `AlreadyReady` is useful to recovery code: it proves that the durable
+/// manifest passed validation and that a previous process had already made
+/// this snapshot visible.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SnapshotPublicationStatus {
+    Published,
+    AlreadyReady,
+}
+
+/// Failure while moving a durable snapshot manifest through catalog
+/// visibility.
+///
+/// The only transition to `Ready` is performed after the manifest was written
+/// and re-read successfully. A catalog failure therefore leaves either no
+/// record or an `Incomplete` record, neither of which is a GC root.
+#[derive(Debug)]
+pub enum SnapshotPublicationError {
+    Manifest(SnapshotManifestError),
+    Catalog(CatalogError),
+    SnapshotAlreadyReady,
+    SnapshotNotMarkedIncomplete,
+    PersistedManifestMismatch,
+}
+impl std::fmt::Display for SnapshotPublicationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Manifest(error) => write!(f, "snapshot manifest publication failed: {error}"),
+            Self::Catalog(error) => write!(f, "snapshot catalog publication failed: {error:?}"),
+            Self::SnapshotAlreadyReady => {
+                write!(f, "repository snapshot is already visible as Ready")
+            }
+            Self::SnapshotNotMarkedIncomplete => write!(
+                f,
+                "repository snapshot has no Incomplete catalog publication marker"
+            ),
+            Self::PersistedManifestMismatch => write!(
+                f,
+                "persisted snapshot manifest does not match the manifest being published"
+            ),
+        }
+    }
+}
+impl std::error::Error for SnapshotPublicationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Manifest(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+impl From<SnapshotManifestError> for SnapshotPublicationError {
+    fn from(value: SnapshotManifestError) -> Self {
+        Self::Manifest(value)
+    }
+}
+
+/// Records a snapshot publication as incomplete before its external manifest
+/// is made visible.
+///
+/// This intentionally refuses to overwrite `Ready`: snapshot IDs are
+/// immutable publication identities, and demoting a ready snapshot after a
+/// caller accidentally reuses an ID could make live cold data collectable.
+/// Retrying an existing `Incomplete` publication is safe.
+pub fn begin_snapshot_publication<C: Catalog>(
+    catalog: &mut C,
+    manifest: &SnapshotManifest,
+) -> Result<(), SnapshotPublicationError> {
+    manifest.validate()?;
+    match catalog.repository_snapshot(manifest.repository, manifest.snapshot_id) {
+        Some(SnapshotVisibility::Ready) => Err(SnapshotPublicationError::SnapshotAlreadyReady),
+        Some(SnapshotVisibility::Incomplete) => Ok(()),
+        None => {
+            let mut batch = CatalogBatch::new();
+            batch.put_repository_snapshot(
+                manifest.repository,
+                manifest.snapshot_id,
+                SnapshotVisibility::Incomplete,
+            );
+            catalog
+                .apply(batch)
+                .map_err(SnapshotPublicationError::Catalog)
+        }
+    }
+}
+
+/// Publishes a repository snapshot only after its manifest is durable.
+///
+/// The transaction has three crash-safe stages:
+///
+/// 1. record `Incomplete` in the catalog;
+/// 2. create, synchronize, rename, and directory-synchronize the manifest;
+/// 3. atomically replace the catalog visibility with `Ready`.
+///
+/// A crash or catalog failure in stages 1–2 cannot expose a `Ready` snapshot.
+/// A crash after stage 2 leaves an `Incomplete` marker that
+/// [`reconcile_snapshot_publication`] can safely finish after validating the
+/// on-disk manifest.
+pub fn publish_snapshot_manifest<C: Catalog>(
+    catalog: &mut C,
+    path: impl AsRef<Path>,
+    manifest: &SnapshotManifest,
+) -> Result<SnapshotPublicationStatus, SnapshotPublicationError> {
+    begin_snapshot_publication(catalog, manifest)?;
+    write_snapshot_manifest(path.as_ref(), manifest)?;
+    finish_snapshot_publication(catalog, path, manifest)
+}
+
+/// Finishes an incomplete publication after proving that the exact requested
+/// manifest is already durable at `path`.
+///
+/// This is deliberately exposed for a daemon that writes the manifest before
+/// it is interrupted. It cannot promote a snapshot with a missing, malformed,
+/// or mismatched manifest.
+pub fn finish_snapshot_publication<C: Catalog>(
+    catalog: &mut C,
+    path: impl AsRef<Path>,
+    expected: &SnapshotManifest,
+) -> Result<SnapshotPublicationStatus, SnapshotPublicationError> {
+    let persisted = read_snapshot_manifest(path)?;
+    if &persisted != expected {
+        return Err(SnapshotPublicationError::PersistedManifestMismatch);
+    }
+    finish_persisted_snapshot_publication(catalog, &persisted)
+}
+
+/// Reconciles an interrupted manifest publication.
+///
+/// Only a matching `Incomplete` marker may be promoted. A manifest with no
+/// marker remains invisible: this avoids resurrecting a snapshot manifest that
+/// was left behind after repository deletion.
+pub fn reconcile_snapshot_publication<C: Catalog>(
+    catalog: &mut C,
+    path: impl AsRef<Path>,
+) -> Result<SnapshotPublicationStatus, SnapshotPublicationError> {
+    let manifest = read_snapshot_manifest(path)?;
+    finish_persisted_snapshot_publication(catalog, &manifest)
+}
+
+fn finish_persisted_snapshot_publication<C: Catalog>(
+    catalog: &mut C,
+    manifest: &SnapshotManifest,
+) -> Result<SnapshotPublicationStatus, SnapshotPublicationError> {
+    match catalog.repository_snapshot(manifest.repository, manifest.snapshot_id) {
+        Some(SnapshotVisibility::Ready) => Ok(SnapshotPublicationStatus::AlreadyReady),
+        Some(SnapshotVisibility::Incomplete) => {
+            let mut batch = CatalogBatch::new();
+            batch.put_repository_snapshot(
+                manifest.repository,
+                manifest.snapshot_id,
+                SnapshotVisibility::Ready,
+            );
+            catalog
+                .apply(batch)
+                .map_err(SnapshotPublicationError::Catalog)?;
+            Ok(SnapshotPublicationStatus::Published)
+        }
+        None => Err(SnapshotPublicationError::SnapshotNotMarkedIncomplete),
     }
 }
 
@@ -450,6 +621,11 @@ fn decode_snapshot_manifest(bytes: &[u8]) -> Result<SnapshotManifest, SnapshotMa
     let optional_field_count =
         usize::try_from(reader.u32()?).map_err(|_| SnapshotManifestError::LengthOverflow)?;
     let tool_version = reader.take(tool_version_length)?.to_vec();
+    if ref_count > reader.remaining() / MIN_MANIFEST_REF_ENTRY_BYTES {
+        return Err(SnapshotManifestError::Invalid(
+            "snapshot manifest ref count exceeds remaining input",
+        ));
+    }
     let mut refs = Vec::with_capacity(ref_count.min(4096));
     for _ in 0..ref_count {
         let kind = local_ref_kind_from_tag(reader.u8()?)?;
@@ -474,6 +650,11 @@ fn decode_snapshot_manifest(bytes: &[u8]) -> Result<SnapshotManifest, SnapshotMa
                 SnapshotManifestError::Invalid("snapshot manifest has an invalid ref OID")
             })?;
         refs.push(PersistedRef { name, kind, target });
+    }
+    if optional_field_count > reader.remaining() / MIN_MANIFEST_OPTIONAL_FIELD_BYTES {
+        return Err(SnapshotManifestError::Invalid(
+            "snapshot manifest optional field count exceeds remaining input",
+        ));
     }
     let mut optional_fields = Vec::with_capacity(optional_field_count.min(64));
     for _ in 0..optional_field_count {
@@ -620,6 +801,9 @@ impl<'a> ManifestReader<'a> {
     }
     fn is_empty(&self) -> bool {
         self.offset == self.bytes.len()
+    }
+    fn remaining(&self) -> usize {
+        self.bytes.len() - self.offset
     }
 }
 
@@ -894,8 +1078,15 @@ mod tests {
             })
             .expect("add optional manifest field");
         let manifest_path = store.join("snapshot-v1");
-        write_snapshot_manifest(&manifest_path, &manifest)
-            .expect("durably publish snapshot manifest");
+        assert_eq!(
+            publish_snapshot_manifest(&mut catalog, &manifest_path, &manifest)
+                .expect("durably publish and expose snapshot manifest"),
+            SnapshotPublicationStatus::Published
+        );
+        assert_eq!(
+            catalog.repository_snapshot(repository, manifest.snapshot_id),
+            Some(SnapshotVisibility::Ready)
+        );
         drop(writer);
 
         fs::remove_dir_all(&source).expect("delete original Git repository");
@@ -974,5 +1165,190 @@ mod tests {
         assert_eq!(nested_blob.payload, b"nested blob\n");
 
         fs::remove_dir_all(&root).expect("remove temporary test directory");
+    }
+
+    fn minimal_manifest(repository: RepoId, snapshot_id: RepoSnapshotId) -> SnapshotManifest {
+        SnapshotManifest {
+            repository,
+            snapshot_id,
+            native_object_format: HashAlgorithm::Sha1,
+            import_policy: ImportPolicy::LocalBranchesAndTags,
+            refs: Vec::new(),
+            summary: ImportSummary::default(),
+            imported_unix_secs: 1_700_000_000,
+            tool_version: b"reflink-forest-import-test".to_vec(),
+            optional_fields: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn interrupted_snapshot_publication_stays_incomplete_until_reconciled() {
+        let root = temporary_directory("interrupted-publication");
+        let repository = RepoId([0x51; 16]);
+        let manifest = minimal_manifest(repository, RepoSnapshotId([0x52; REPO_SNAPSHOT_ID_LEN]));
+        let path = root.join("snapshot-v1");
+        let mut catalog = InMemoryCatalog::default();
+
+        begin_snapshot_publication(&mut catalog, &manifest)
+            .expect("record incomplete publication marker");
+        write_snapshot_manifest(&path, &manifest).expect("durably write manifest");
+
+        // Simulate a process stop after the durable file write and before the
+        // Ready batch. Incomplete visibility is not a GC root.
+        assert_eq!(
+            catalog.repository_snapshot(repository, manifest.snapshot_id),
+            Some(SnapshotVisibility::Incomplete)
+        );
+        assert!(catalog.gc_roots().expect("discover roots").is_empty());
+
+        assert_eq!(
+            reconcile_snapshot_publication(&mut catalog, &path)
+                .expect("reconcile durable incomplete publication"),
+            SnapshotPublicationStatus::Published
+        );
+        assert_eq!(
+            catalog.repository_snapshot(repository, manifest.snapshot_id),
+            Some(SnapshotVisibility::Ready)
+        );
+
+        fs::remove_dir_all(&root).expect("remove temporary test directory");
+    }
+
+    #[derive(Default)]
+    struct FailSecondCatalogApply {
+        inner: InMemoryCatalog,
+        apply_count: usize,
+    }
+
+    impl Catalog for FailSecondCatalogApply {
+        fn apply(
+            &mut self,
+            batch: reflink_forest_index::CatalogBatch,
+        ) -> Result<(), reflink_forest_index::CatalogError> {
+            self.apply_count += 1;
+            if self.apply_count == 2 {
+                return Err(reflink_forest_index::CatalogError::Backend(
+                    "injected Ready publication failure".to_owned(),
+                ));
+            }
+            self.inner.apply(batch)
+        }
+
+        fn object_location(&self, id: ContentId) -> Option<reflink_forest_index::ObjectLocation> {
+            self.inner.object_location(id)
+        }
+
+        fn oid_alias(&self, repo: RepoId, oid: &GitOid) -> Option<ContentId> {
+            self.inner.oid_alias(repo, oid)
+        }
+
+        fn repository_snapshot(
+            &self,
+            repository: RepoId,
+            snapshot: RepoSnapshotId,
+        ) -> Option<SnapshotVisibility> {
+            self.inner.repository_snapshot(repository, snapshot)
+        }
+
+        fn chunk(
+            &self,
+            generation: u32,
+            chunk_id: u64,
+        ) -> Option<reflink_forest_index::ChunkMetadata> {
+            self.inner.chunk(generation, chunk_id)
+        }
+    }
+
+    #[test]
+    fn failed_ready_catalog_commit_leaves_the_durable_snapshot_incomplete() {
+        let root = temporary_directory("failed-ready-publication");
+        let repository = RepoId([0x61; 16]);
+        let manifest = minimal_manifest(repository, RepoSnapshotId([0x62; REPO_SNAPSHOT_ID_LEN]));
+        let path = root.join("snapshot-v1");
+        let mut catalog = FailSecondCatalogApply::default();
+
+        assert!(matches!(
+            publish_snapshot_manifest(&mut catalog, &path, &manifest),
+            Err(SnapshotPublicationError::Catalog(
+                reflink_forest_index::CatalogError::Backend(_)
+            ))
+        ));
+
+        // The file is durable before the Ready catalog write is attempted,
+        // and the failed atomic batch did not make the snapshot visible.
+        assert_eq!(
+            read_snapshot_manifest(&path).expect("read durable manifest"),
+            manifest
+        );
+        assert_eq!(
+            catalog
+                .inner
+                .repository_snapshot(repository, manifest.snapshot_id),
+            Some(SnapshotVisibility::Incomplete)
+        );
+        assert!(catalog.inner.gc_roots().expect("discover roots").is_empty());
+
+        fs::remove_dir_all(&root).expect("remove temporary test directory");
+    }
+
+    fn corpus_bytes(seed: u64, len: usize) -> Vec<u8> {
+        let mut state = seed;
+        (0..len)
+            .map(|_| {
+                state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+                let mut value = state;
+                value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+                (value ^ (value >> 31)) as u8
+            })
+            .collect()
+    }
+
+    fn fixed_manifest_prefix() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(SNAPSHOT_MANIFEST_MAGIC);
+        put_u16(&mut bytes, SNAPSHOT_MANIFEST_VERSION);
+        bytes.extend_from_slice(&[0; 16]); // repository
+        bytes.extend_from_slice(&[0; REPO_SNAPSHOT_ID_LEN]);
+        bytes.push(HashAlgorithm::Sha1.tag());
+        bytes.push(import_policy_tag(ImportPolicy::LocalBranchesAndTags));
+        put_u16(&mut bytes, 0);
+        for _ in 0..5 {
+            put_u64(&mut bytes, 0);
+        }
+        put_u16(&mut bytes, 0); // tool version
+        bytes
+    }
+
+    #[test]
+    fn untrusted_manifest_decoder_fuzz_corpus_is_total_and_count_bounded() {
+        let lengths = [0, 1, 7, 8, 9, 63, 64, 127, 128, 255, 1024, 4096];
+        for seed in 0..64 {
+            for len in lengths {
+                let bytes = corpus_bytes(seed, len);
+                assert!(std::panic::catch_unwind(|| {
+                    let _ = decode_snapshot_manifest(&bytes);
+                })
+                .is_ok());
+            }
+        }
+
+        // Ref and extension counts are checked against the bytes remaining in
+        // the bounded manifest before either collection reserves capacity.
+        let mut impossible_refs = fixed_manifest_prefix();
+        put_u32(&mut impossible_refs, u32::MAX);
+        put_u32(&mut impossible_refs, 0);
+        assert!(matches!(
+            decode_snapshot_manifest(&impossible_refs),
+            Err(SnapshotManifestError::Invalid(_))
+        ));
+
+        let mut impossible_extensions = fixed_manifest_prefix();
+        put_u32(&mut impossible_extensions, 0);
+        put_u32(&mut impossible_extensions, u32::MAX);
+        assert!(matches!(
+            decode_snapshot_manifest(&impossible_extensions),
+            Err(SnapshotManifestError::Invalid(_))
+        ));
     }
 }
