@@ -1,4 +1,4 @@
-//! Immutable local Git snapshots backed by the system `git` executable.
+//! Immutable local Git snapshots backed by system Git or local libgit2.
 //!
 //! The backend deliberately invokes `git` with [`std::process::Command`] and
 //! never via a shell.  It snapshots only `refs/heads/*` and `refs/tags/*`;
@@ -7,9 +7,12 @@
 //! the original repository has disappeared.
 //!
 //! Object traversal starts from fixed native OIDs, rather than mutable ref
-//! names.  It reads commits, trees, annotated tags, and blobs directly and
+//! names. It reads commits, trees, annotated tags, and blobs directly and
 //! parses their Git object references, so an annotated-tag object itself is
-//! retained in addition to its target.
+//! retained in addition to its target. [`LibGit2Backend`] is linked against a
+//! pinned, vendored libgit2 build and supports SHA-1 and SHA-256 repositories
+//! exposed by that library; [`SystemGitBackend`] remains available for
+//! compatibility with the installed `git` executable.
 
 use std::{
     collections::{HashSet, VecDeque},
@@ -157,9 +160,13 @@ pub fn parse_tree_entries(object: &GitObject) -> Result<Vec<GitTreeEntry>, GitBa
     Ok(entries)
 }
 
-/// Errors from invoking or parsing system Git.
+/// Errors from opening, querying, or parsing a local Git repository.
 #[derive(Debug)]
 pub enum GitBackendError {
+    LibGit2 {
+        operation: &'static str,
+        source: git2::Error,
+    },
     Io {
         command: &'static str,
         source: io::Error,
@@ -183,6 +190,9 @@ pub enum GitBackendError {
 impl fmt::Display for GitBackendError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::LibGit2 { operation, source } => {
+                write!(f, "libgit2 {operation} failed: {source}")
+            }
             Self::Io { command, source } => write!(f, "cannot run git {command}: {source}"),
             Self::CommandFailed {
                 command,
@@ -213,6 +223,7 @@ impl fmt::Display for GitBackendError {
 impl std::error::Error for GitBackendError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::LibGit2 { source, .. } => Some(source),
             Self::Io { source, .. } => Some(source),
             Self::InvalidGitOid(error) => Some(error),
             _ => None,
@@ -241,6 +252,188 @@ pub trait GitBackend {
     /// Reads every object reachable from `roots`, including root tags and all
     /// objects needed by commits and trees.
     fn reachable_objects(&self, roots: &[GitOid]) -> Result<Vec<GitObject>, GitBackendError>;
+}
+
+/// A local repository accessed through the vendored libgit2 library.
+///
+/// The crate enables git2's `unstable-sha256` feature, so native OID widths
+/// stay intact for both SHA-1 and SHA-256 repositories. It never consults a
+/// shell or the caller's Git environment.
+pub struct LibGit2Backend {
+    repository: git2::Repository,
+    algorithm: HashAlgorithm,
+}
+
+impl fmt::Debug for LibGit2Backend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LibGit2Backend")
+            .field("repository", &self.repository.path())
+            .field("algorithm", &self.algorithm)
+            .finish()
+    }
+}
+
+impl LibGit2Backend {
+    /// Opens a local repository without invoking the system `git` executable.
+    pub fn open(repository: impl AsRef<Path>) -> Result<Self, GitBackendError> {
+        let repository =
+            git2::Repository::open(repository).map_err(|source| GitBackendError::LibGit2 {
+                operation: "open repository",
+                source,
+            })?;
+        let algorithm = hash_algorithm_from_libgit2(repository.object_format());
+        Ok(Self {
+            repository,
+            algorithm,
+        })
+    }
+
+    /// Returns libgit2's repository path (the `.git` directory for a normal
+    /// repository, or the repository root for a bare one).
+    pub fn repository_path(&self) -> &Path {
+        self.repository.path()
+    }
+
+    /// Reads one object by its immutable native object ID.
+    pub fn read_object(&self, oid: GitOid) -> Result<GitObject, GitBackendError> {
+        self.ensure_algorithm(oid)?;
+        let odb = self
+            .repository
+            .odb()
+            .map_err(|source| GitBackendError::LibGit2 {
+                operation: "open object database",
+                source,
+            })?;
+        let object =
+            odb.read(self.to_libgit2_oid(oid)?)
+                .map_err(|source| GitBackendError::LibGit2 {
+                    operation: "read object",
+                    source,
+                })?;
+        let actual_oid = git_oid_from_libgit2(object.id())?;
+        if actual_oid != oid {
+            return Err(GitBackendError::InvalidGitOutput(
+                "libgit2 object ID does not match the requested ID",
+            ));
+        }
+        Ok(GitObject {
+            oid,
+            kind: object_kind_from_libgit2(object.kind())?,
+            data: object.data().to_vec(),
+        })
+    }
+
+    fn ensure_algorithm(&self, oid: GitOid) -> Result<(), GitBackendError> {
+        if oid.algorithm() != self.algorithm {
+            return Err(GitBackendError::InvalidGitOutput(
+                "object ID algorithm does not match repository format",
+            ));
+        }
+        Ok(())
+    }
+
+    fn to_libgit2_oid(&self, oid: GitOid) -> Result<git2::Oid, GitBackendError> {
+        git2::Oid::from_bytes(oid.as_bytes()).map_err(|source| GitBackendError::LibGit2 {
+            operation: "convert object ID",
+            source,
+        })
+    }
+}
+
+impl GitBackend for LibGit2Backend {
+    fn hash_algorithm(&self) -> HashAlgorithm {
+        self.algorithm
+    }
+
+    fn snapshot_local_refs(&self) -> Result<RefSnapshot, GitBackendError> {
+        let references =
+            self.repository
+                .references()
+                .map_err(|source| GitBackendError::LibGit2 {
+                    operation: "list references",
+                    source,
+                })?;
+        let mut refs = Vec::new();
+        for reference in references {
+            let reference = reference.map_err(|source| GitBackendError::LibGit2 {
+                operation: "iterate references",
+                source,
+            })?;
+            let name = reference.name_bytes();
+            let kind = if name.starts_with(HEADS_PREFIX) {
+                LocalRefKind::Branch
+            } else if name.starts_with(TAGS_PREFIX) {
+                LocalRefKind::Tag
+            } else {
+                continue;
+            };
+            let target = match reference.target() {
+                Some(target) => target,
+                None => reference
+                    .resolve()
+                    .map_err(|source| GitBackendError::LibGit2 {
+                        operation: "resolve symbolic reference",
+                        source,
+                    })?
+                    .target()
+                    .ok_or(GitBackendError::InvalidGitOutput(
+                        "resolved local reference has no direct object ID",
+                    ))?,
+            };
+            let target = git_oid_from_libgit2(target)?;
+            self.ensure_algorithm(target)?;
+            refs.push(SnapshotRef {
+                name: RefName(name.to_vec()),
+                kind,
+                target,
+            });
+        }
+        refs.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(RefSnapshot {
+            algorithm: self.algorithm,
+            refs,
+        })
+    }
+
+    fn resolve_revision(&self, revision: &str) -> Result<GitOid, GitBackendError> {
+        if revision.as_bytes().contains(&0) {
+            return Err(GitBackendError::InvalidGitOutput(
+                "revision contains a NUL byte",
+            ));
+        }
+        let object = self
+            .repository
+            .revparse_single(revision)
+            .map_err(|source| GitBackendError::LibGit2 {
+                operation: "resolve revision",
+                source,
+            })?;
+        let oid = git_oid_from_libgit2(object.id())?;
+        self.ensure_algorithm(oid)?;
+        Ok(oid)
+    }
+
+    fn reachable_objects(&self, roots: &[GitOid]) -> Result<Vec<GitObject>, GitBackendError> {
+        let mut pending = VecDeque::with_capacity(roots.len());
+        for &root in roots {
+            self.ensure_algorithm(root)?;
+            pending.push_back(root);
+        }
+
+        let mut seen = HashSet::new();
+        let mut result = Vec::new();
+        while let Some(oid) = pending.pop_front() {
+            if !seen.insert(oid) {
+                continue;
+            }
+            let object = self.read_object(oid)?;
+            for child in referenced_oids(&object)? {
+                pending.push_back(child);
+            }
+            result.push(object);
+        }
+        Ok(result)
+    }
 }
 
 /// A local repository accessed through the installed `git` executable.
@@ -524,6 +717,33 @@ fn parse_object_kind(raw: &[u8]) -> Result<ObjectKind, GitBackendError> {
     }
 }
 
+fn hash_algorithm_from_libgit2(format: git2::ObjectFormat) -> HashAlgorithm {
+    match format {
+        git2::ObjectFormat::Sha1 => HashAlgorithm::Sha1,
+        git2::ObjectFormat::Sha256 => HashAlgorithm::Sha256,
+    }
+}
+
+fn git_oid_from_libgit2(oid: git2::Oid) -> Result<GitOid, GitBackendError> {
+    GitOid::new(
+        hash_algorithm_from_libgit2(oid.object_format()),
+        oid.as_bytes(),
+    )
+    .map_err(Into::into)
+}
+
+fn object_kind_from_libgit2(kind: git2::ObjectType) -> Result<ObjectKind, GitBackendError> {
+    match kind {
+        git2::ObjectType::Commit => Ok(ObjectKind::Commit),
+        git2::ObjectType::Tree => Ok(ObjectKind::Tree),
+        git2::ObjectType::Blob => Ok(ObjectKind::Blob),
+        git2::ObjectType::Tag => Ok(ObjectKind::Tag),
+        git2::ObjectType::Any => Err(GitBackendError::InvalidGitOutput(
+            "libgit2 object database returned an object with type Any",
+        )),
+    }
+}
+
 fn object_kind_name(kind: ObjectKind) -> &'static str {
     match kind {
         ObjectKind::Commit => "commit",
@@ -641,6 +861,22 @@ mod tests {
 
     impl TempRepository {
         fn new() -> Self {
+            let repository = Self::new_uninitialized();
+            run_git(&repository.path, ["init", "-b", "main"]);
+            repository
+        }
+
+        fn try_new_sha256() -> Option<Self> {
+            let repository = Self::new_uninitialized();
+            let output = Command::new("git")
+                .current_dir(&repository.path)
+                .args(["init", "--object-format=sha256", "-b", "main"])
+                .output()
+                .expect("run test git init command");
+            output.status.success().then_some(repository)
+        }
+
+        fn new_uninitialized() -> Self {
             let unique = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
             let nanos = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -651,7 +887,6 @@ mod tests {
                 std::process::id()
             ));
             fs::create_dir(&path).expect("create temporary repository directory");
-            run_git(&path, ["init", "-b", "main"]);
             Self { path }
         }
 
@@ -717,6 +952,23 @@ mod tests {
         // A remote-tracking ref must never become a snapshot root.
         repository.git(["update-ref", "refs/remotes/origin/main", "HEAD"]);
         repository
+    }
+
+    fn make_sha256_repository() -> Option<TempRepository> {
+        let repository = TempRepository::try_new_sha256()?;
+        fs::write(repository.path.join("sha256.txt"), b"sha256 blob\n")
+            .expect("write SHA-256 fixture blob");
+        repository.git(["add", "."]);
+        repository.git([
+            "-c",
+            "user.name=Test User",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-m",
+            "sha256 fixture",
+        ]);
+        Some(repository)
     }
 
     #[test]
@@ -818,5 +1070,76 @@ mod tests {
         assert_eq!(entries[0].mode, 0o100755);
         assert_eq!(entries[0].name, b"script");
         assert_eq!(entries[0].oid.as_bytes(), &[0x5a; 20]);
+    }
+
+    #[test]
+    fn libgit2_backend_snapshots_local_refs_and_preserves_annotated_tags() {
+        let repository = make_repository();
+        let backend = LibGit2Backend::open(&repository.path).expect("open libgit2 backend");
+        assert_eq!(backend.hash_algorithm(), HashAlgorithm::Sha1);
+
+        let snapshot = backend.snapshot_local_refs().expect("snapshot refs");
+        assert_eq!(snapshot.algorithm, HashAlgorithm::Sha1);
+        assert_eq!(snapshot.refs.len(), 2);
+        assert!(snapshot.refs.iter().any(|reference| {
+            reference.kind == LocalRefKind::Branch
+                && reference.name.as_bytes() == b"refs/heads/main"
+        }));
+        assert!(snapshot.refs.iter().any(|reference| {
+            reference.kind == LocalRefKind::Tag && reference.name.as_bytes() == b"refs/tags/v1"
+        }));
+        assert!(snapshot
+            .refs
+            .iter()
+            .all(|reference| !reference.name.as_bytes().starts_with(b"refs/remotes/")));
+
+        let tag = backend.resolve_revision("v1").expect("resolve tag");
+        assert_eq!(
+            backend.read_object(tag).expect("read tag").kind,
+            ObjectKind::Tag
+        );
+    }
+
+    #[test]
+    fn libgit2_backend_reaches_immutable_objects_from_an_annotated_tag() {
+        let repository = make_repository();
+        let backend = LibGit2Backend::open(&repository.path).expect("open libgit2 backend");
+        let root = backend.resolve_revision("v1").expect("resolve tag");
+        let objects = backend.reachable_objects(&[root]).expect("walk objects");
+
+        let kinds: HashSet<ObjectKind> = objects.iter().map(|object| object.kind).collect();
+        assert!(kinds.contains(&ObjectKind::Tag));
+        assert!(kinds.contains(&ObjectKind::Commit));
+        assert!(kinds.contains(&ObjectKind::Tree));
+        assert!(kinds.contains(&ObjectKind::Blob));
+        assert!(objects
+            .iter()
+            .any(|object| object.data == b"top-level blob\n"));
+        assert!(objects.iter().any(|object| object.data == b"nested blob\n"));
+        assert_eq!(
+            objects.iter().filter(|object| object.oid == root).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn libgit2_backend_preserves_sha256_oids_when_fixture_git_supports_them() {
+        let Some(repository) = make_sha256_repository() else {
+            // Older Git installations cannot create SHA-256 repositories.
+            // The backend itself is built with libgit2's SHA-256 support.
+            return;
+        };
+        let backend = LibGit2Backend::open(&repository.path).expect("open SHA-256 backend");
+        assert_eq!(backend.hash_algorithm(), HashAlgorithm::Sha256);
+
+        let root = backend.resolve_revision("main").expect("resolve main");
+        assert_eq!(root.algorithm(), HashAlgorithm::Sha256);
+        let objects = backend
+            .reachable_objects(&[root])
+            .expect("walk SHA-256 objects");
+        assert!(objects
+            .iter()
+            .all(|object| object.oid.algorithm() == HashAlgorithm::Sha256));
+        assert!(objects.iter().any(|object| object.data == b"sha256 blob\n"));
     }
 }

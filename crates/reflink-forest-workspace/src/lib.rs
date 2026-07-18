@@ -1301,7 +1301,8 @@ mod tests {
     fn restored_cold_tier_materializes_a_workspace_without_the_original_tree() {
         use reflink_forest_backup::{
             checkpoint_cold_tier, restore_cold_tier, BackupError, CheckpointGuard,
-            ChunkClassification, ColdChunkDescriptor, ColdTierCheckpointDescriptor,
+            ChunkClassification, ColdChunkDescriptor, ColdTierAuthoritativePaths,
+            ColdTierCheckpointDescriptor,
         };
         use reflink_forest_cache::CacheError;
         use reflink_forest_checkout::MaterializeError;
@@ -1357,6 +1358,21 @@ mod tests {
         writer.sync_data().unwrap();
         drop(writer);
         drop(original_cache);
+        let authoritative_paths = ColdTierAuthoritativePaths::new(
+            "metadata/catalog.bin",
+            "metadata/config.bin",
+            "metadata/pins.bin",
+        )
+        .unwrap();
+        fs::create_dir_all(original.join("metadata")).unwrap();
+        fs::write(original.join(authoritative_paths.catalog()), b"catalog").unwrap();
+        fs::write(original.join(authoritative_paths.config()), b"config").unwrap();
+        fs::write(
+            original.join(authoritative_paths.pins_manifest()),
+            b"workspace pins",
+        )
+        .unwrap();
+        let authoritative_digests = authoritative_paths.digests(&original).unwrap();
 
         let backup_parent = temp_root();
         fs::create_dir(&backup_parent).unwrap();
@@ -1380,10 +1396,11 @@ mod tests {
                     classification: ChunkClassification::Open,
                     valid_prefix: fs::metadata(&chunk).unwrap().len(),
                 }],
-                catalog_digest: [0x45; 32],
-                config_digest: [0x46; 32],
-                pins_manifest_digest: [0x47; 32],
+                catalog_digest: authoritative_digests.catalog_digest,
+                config_digest: authoritative_digests.config_digest,
+                pins_manifest_digest: authoritative_digests.pins_manifest_digest,
             },
+            &authoritative_paths,
         )
         .unwrap();
         fs::remove_dir_all(&original).unwrap();
@@ -1399,7 +1416,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        restore_cold_tier(&backup, &manifest, &restored).unwrap();
+        restore_cold_tier(&backup, &manifest, &restored, &authoritative_paths).unwrap();
         let cache = Cache::open(restored.join("cache")).unwrap();
         let source =
             ColdWorkspaceSource::new(repository, &catalog, &cache, |_, _| restored.join("1.open"));

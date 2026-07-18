@@ -76,6 +76,97 @@ pub struct ColdTierCheckpointDescriptor {
     pub config_digest: [u8; 32],
     pub pins_manifest_digest: [u8; 32],
 }
+
+/// The three authoritative metadata files whose content digests are carried
+/// by a [`ColdTierCheckpointDescriptor`].
+///
+/// Reflink Forest deliberately does not prescribe names for these files.  The
+/// owning catalog/daemon supplies paths relative to its cold-tier root, and
+/// the backup layer validates them before it uses them.  This keeps the backup
+/// format independent of a particular on-disk catalog implementation while
+/// making the descriptor's metadata binding explicit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ColdTierAuthoritativePaths {
+    catalog: PathBuf,
+    config: PathBuf,
+    pins_manifest: PathBuf,
+}
+
+/// Content digests for a [`ColdTierAuthoritativePaths`] layout.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ColdTierAuthoritativeDigests {
+    pub catalog_digest: [u8; 32],
+    pub config_digest: [u8; 32],
+    pub pins_manifest_digest: [u8; 32],
+}
+
+impl ColdTierAuthoritativePaths {
+    /// Creates an explicit authoritative metadata layout.
+    ///
+    /// Every path must be a distinct, normalized path relative to the cold
+    /// tier root; absolute paths, traversal, and empty components are
+    /// rejected.  The paths are intentionally supplied by the caller instead
+    /// of being inferred from production-specific filenames.
+    pub fn new(
+        catalog: impl Into<PathBuf>,
+        config: impl Into<PathBuf>,
+        pins_manifest: impl Into<PathBuf>,
+    ) -> Result<Self, BackupError> {
+        let paths = Self {
+            catalog: catalog.into(),
+            config: config.into(),
+            pins_manifest: pins_manifest.into(),
+        };
+        paths.validate()?;
+        Ok(paths)
+    }
+
+    /// The catalog metadata path, relative to the cold-tier root.
+    pub fn catalog(&self) -> &Path {
+        &self.catalog
+    }
+
+    /// The cold-tier configuration path, relative to the cold-tier root.
+    pub fn config(&self) -> &Path {
+        &self.config
+    }
+
+    /// The pin-manifest path, relative to the cold-tier root.
+    pub fn pins_manifest(&self) -> &Path {
+        &self.pins_manifest
+    }
+
+    /// Hashes the three authoritative regular files below `root`.
+    ///
+    /// This is useful when the catalog layer constructs a descriptor after it
+    /// has durably synchronized its own authoritative metadata.
+    pub fn digests(
+        &self,
+        root: impl AsRef<Path>,
+    ) -> Result<ColdTierAuthoritativeDigests, BackupError> {
+        self.validate()?;
+        let root = root.as_ref();
+        Ok(ColdTierAuthoritativeDigests {
+            catalog_digest: hash_authoritative_file(root, &self.catalog)?,
+            config_digest: hash_authoritative_file(root, &self.config)?,
+            pins_manifest_digest: hash_authoritative_file(root, &self.pins_manifest)?,
+        })
+    }
+
+    fn validate(&self) -> Result<(), BackupError> {
+        for path in [&self.catalog, &self.config, &self.pins_manifest] {
+            path_to_bytes(path).map_err(|_| BackupError::InvalidColdTierLayout)?;
+        }
+        if self.catalog == self.config
+            || self.catalog == self.pins_manifest
+            || self.config == self.pins_manifest
+        {
+            return Err(BackupError::InvalidColdTierLayout);
+        }
+        Ok(())
+    }
+}
+
 /// The daemon supplies this guard to pause writers and force the catalog/chunk
 /// durability boundary before authoritative cold-tier paths are copied.
 pub trait CheckpointGuard {
@@ -86,6 +177,7 @@ pub enum BackupError {
     Io(io::Error),
     UnsafeSource(PathBuf),
     InvalidManifest,
+    InvalidColdTierLayout,
     VerificationFailed(PathBuf),
     DestinationExists,
     UnsafeDestination(PathBuf),
@@ -100,6 +192,9 @@ impl std::fmt::Display for BackupError {
                 path.display()
             ),
             Self::InvalidManifest => write!(f, "invalid backup manifest"),
+            Self::InvalidColdTierLayout => {
+                write!(f, "invalid cold-tier authoritative metadata layout")
+            }
             Self::VerificationFailed(path) => {
                 write!(f, "backup verification failed: {}", path.display())
             }
@@ -114,18 +209,26 @@ impl std::fmt::Display for BackupError {
 }
 
 /// Writes an authenticated v1 cold-tier descriptor next to a generic checkpoint.
-/// The generic file inventory remains backward compatible; consumers requiring
-/// cold-tier recovery must load and validate this descriptor before restore.
+///
+/// The descriptor's catalog, configuration, and pin-manifest digests are
+/// compared with the caller-supplied authoritative files before copying and
+/// again in the checkpoint tree before publishing the descriptor.  The generic
+/// file inventory remains backward compatible; consumers requiring cold-tier
+/// recovery must also supply this same explicit layout to [`restore_cold_tier`].
 pub fn checkpoint_cold_tier<G: CheckpointGuard>(
     guard: &G,
     source: impl AsRef<Path>,
     destination: impl AsRef<Path>,
     descriptor: &ColdTierCheckpointDescriptor,
+    authoritative_paths: &ColdTierAuthoritativePaths,
 ) -> Result<BackupManifest, BackupError> {
     guard.quiesce_and_sync()?;
     validate_cold_descriptor(descriptor)?;
+    let source = source.as_ref();
+    verify_cold_descriptor_authority(source, descriptor, authoritative_paths)?;
     let manifest = checkpoint(source, &destination)?;
     let root = destination.as_ref();
+    verify_cold_descriptor_authority(root, descriptor, authoritative_paths)?;
     let path = root.join(COLD_DESCRIPTOR_FILE_NAME);
     let bytes = encode_cold_descriptor(descriptor)?;
     let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
@@ -143,16 +246,22 @@ pub fn load_cold_tier_descriptor(
         .read_to_end(&mut bytes)?;
     decode_cold_descriptor(&bytes)
 }
-/// Requires both generic inventory verification and a valid cold-tier descriptor
-/// before delegating to the compatible generic restore path.
+/// Requires generic inventory verification, a valid cold-tier descriptor, and
+/// descriptor-digest matches for the supplied authoritative files before
+/// accepting a restore.  The restored files are checked again after the generic
+/// restore publishes its destination.
 pub fn restore_cold_tier(
     backup_root: impl AsRef<Path>,
     manifest: &BackupManifest,
     destination: impl AsRef<Path>,
+    authoritative_paths: &ColdTierAuthoritativePaths,
 ) -> Result<(), BackupError> {
     let backup_root = backup_root.as_ref();
-    let _ = load_cold_tier_descriptor(backup_root)?;
-    restore(backup_root, manifest, destination)
+    let descriptor = load_cold_tier_descriptor(backup_root)?;
+    verify_cold_descriptor_authority(backup_root, &descriptor, authoritative_paths)?;
+    let destination = destination.as_ref();
+    restore(backup_root, manifest, destination)?;
+    verify_cold_descriptor_authority(destination, &descriptor, authoritative_paths)
 }
 impl std::error::Error for BackupError {}
 impl From<io::Error> for BackupError {
@@ -355,6 +464,50 @@ fn hash_file(path: &Path) -> Result<(u64, [u8; 32]), BackupError> {
     }
     Ok((bytes, hasher.finalize().into()))
 }
+
+fn hash_authoritative_file(root: &Path, relative: &Path) -> Result<[u8; 32], BackupError> {
+    let path = root.join(relative);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        Ok(_) => return Err(BackupError::VerificationFailed(relative.to_path_buf())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(BackupError::VerificationFailed(relative.to_path_buf()))
+        }
+        Err(error) => return Err(BackupError::Io(error)),
+    }
+    match hash_file(&path) {
+        Ok((_, digest)) => Ok(digest),
+        Err(BackupError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+            Err(BackupError::VerificationFailed(relative.to_path_buf()))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn verify_cold_descriptor_authority(
+    root: &Path,
+    descriptor: &ColdTierCheckpointDescriptor,
+    authoritative_paths: &ColdTierAuthoritativePaths,
+) -> Result<(), BackupError> {
+    let actual = authoritative_paths.digests(root)?;
+    if actual.catalog_digest != descriptor.catalog_digest {
+        return Err(BackupError::VerificationFailed(
+            authoritative_paths.catalog.clone(),
+        ));
+    }
+    if actual.config_digest != descriptor.config_digest {
+        return Err(BackupError::VerificationFailed(
+            authoritative_paths.config.clone(),
+        ));
+    }
+    if actual.pins_manifest_digest != descriptor.pins_manifest_digest {
+        return Err(BackupError::VerificationFailed(
+            authoritative_paths.pins_manifest.clone(),
+        ));
+    }
+    Ok(())
+}
+
 fn write_manifest(root: &Path, manifest: &BackupManifest) -> Result<(), BackupError> {
     let path = root.join(MANIFEST_FILE_NAME);
     let mut file = OpenOptions::new()
@@ -711,6 +864,42 @@ mod tests {
         }
     }
 
+    fn authoritative_paths() -> ColdTierAuthoritativePaths {
+        ColdTierAuthoritativePaths::new(
+            "metadata/catalog.bin",
+            "metadata/config.bin",
+            "metadata/pins.bin",
+        )
+        .unwrap()
+    }
+
+    fn write_authoritative_files(root: &Path, paths: &ColdTierAuthoritativePaths) {
+        fs::create_dir_all(root.join("metadata")).unwrap();
+        fs::write(root.join(paths.catalog()), b"catalog bytes").unwrap();
+        fs::write(root.join(paths.config()), b"config bytes").unwrap();
+        fs::write(root.join(paths.pins_manifest()), b"pin bytes").unwrap();
+    }
+
+    fn descriptor_for(
+        root: &Path,
+        paths: &ColdTierAuthoritativePaths,
+    ) -> ColdTierCheckpointDescriptor {
+        let digests = paths.digests(root).unwrap();
+        ColdTierCheckpointDescriptor {
+            catalog_schema_version: 1,
+            active_generation: 7,
+            chunks: vec![ColdChunkDescriptor {
+                generation: 7,
+                chunk_id: 1,
+                classification: ChunkClassification::Open,
+                valid_prefix: 4096,
+            }],
+            catalog_digest: digests.catalog_digest,
+            config_digest: digests.config_digest,
+            pins_manifest_digest: digests.pins_manifest_digest,
+        }
+    }
+
     #[test]
     fn cold_descriptor_round_trips_and_rejects_corruption() {
         let encoded = encode_cold_descriptor(&descriptor()).unwrap();
@@ -724,20 +913,81 @@ mod tests {
     }
 
     #[test]
-    fn guarded_cold_checkpoint_requires_descriptor_for_restore() {
+    fn guarded_cold_checkpoint_verifies_authoritative_files_and_restores_fresh_root() {
         let source = dir("cold-source");
         let parent = dir("cold-parent");
         fs::create_dir_all(source.join("chunks")).unwrap();
         fs::create_dir(&parent).unwrap();
         fs::write(source.join("chunks/a"), b"cold").unwrap();
+        let paths = authoritative_paths();
+        write_authoritative_files(&source, &paths);
+        let descriptor = descriptor_for(&source, &paths);
         let checkpoint_root = parent.join("checkpoint");
         let manifest =
-            checkpoint_cold_tier(&Guard, &source, &checkpoint_root, &descriptor()).unwrap();
+            checkpoint_cold_tier(&Guard, &source, &checkpoint_root, &descriptor, &paths).unwrap();
         assert_eq!(
             load_cold_tier_descriptor(&checkpoint_root).unwrap(),
-            descriptor()
+            descriptor
         );
-        restore_cold_tier(&checkpoint_root, &manifest, parent.join("restore")).unwrap();
+        fs::remove_dir_all(source).unwrap();
+        let restore = parent.join("restore");
+        restore_cold_tier(&checkpoint_root, &manifest, &restore, &paths).unwrap();
+        assert_eq!(
+            fs::read(restore.join(paths.catalog())).unwrap(),
+            b"catalog bytes"
+        );
+        assert_eq!(
+            fs::read(restore.join(paths.config())).unwrap(),
+            b"config bytes"
+        );
+        assert_eq!(
+            fs::read(restore.join(paths.pins_manifest())).unwrap(),
+            b"pin bytes"
+        );
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn cold_checkpoint_rejects_descriptor_that_does_not_match_authoritative_files() {
+        let source = dir("cold-mismatch-source");
+        let parent = dir("cold-mismatch-parent");
+        fs::create_dir_all(source.join("chunks")).unwrap();
+        fs::create_dir(&parent).unwrap();
+        fs::write(source.join("chunks/a"), b"cold").unwrap();
+        let paths = authoritative_paths();
+        write_authoritative_files(&source, &paths);
+        let checkpoint = parent.join("checkpoint");
+
+        assert!(matches!(
+            checkpoint_cold_tier(&Guard, &source, &checkpoint, &descriptor(), &paths),
+            Err(BackupError::VerificationFailed(path)) if path == paths.catalog()
+        ));
+        assert!(!checkpoint.exists());
+        fs::remove_dir_all(source).unwrap();
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn cold_restore_rejects_tampered_authoritative_file_before_publication() {
+        let source = dir("cold-tamper-source");
+        let parent = dir("cold-tamper-parent");
+        fs::create_dir_all(source.join("chunks")).unwrap();
+        fs::create_dir(&parent).unwrap();
+        fs::write(source.join("chunks/a"), b"cold").unwrap();
+        let paths = authoritative_paths();
+        write_authoritative_files(&source, &paths);
+        let descriptor = descriptor_for(&source, &paths);
+        let checkpoint = parent.join("checkpoint");
+        let manifest =
+            checkpoint_cold_tier(&Guard, &source, &checkpoint, &descriptor, &paths).unwrap();
+        fs::write(checkpoint.join(paths.config()), b"tampered config").unwrap();
+
+        let restore = parent.join("restore");
+        assert!(matches!(
+            restore_cold_tier(&checkpoint, &manifest, &restore, &paths),
+            Err(BackupError::VerificationFailed(path)) if path == paths.config()
+        ));
+        assert!(!restore.exists());
         fs::remove_dir_all(source).unwrap();
         fs::remove_dir_all(parent).unwrap();
     }

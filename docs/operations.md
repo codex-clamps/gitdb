@@ -106,6 +106,17 @@ It reports ENOSPC, EDQUOT, I/O, and reflink-domain failures distinctly. Cache
 eviction can reclaim cache inodes but cannot promise immediate host-image block
 reclamation; trim capability is measured and reported by `doctor`.
 
+Derived-cache publication uses a capacity admission coordinator configured with
+the filesystem containing the image (host) and the mounted Btrfs clone domain
+(guest). It measures both domains, applies the reserve policy to the projected
+allocation, evicts cache leaves in stable content-ID order only when needed,
+then measures both domains again. Publication is refused if either reserve is
+still short; logical bytes deleted from the cache are never treated as proof of
+physical block reclamation. The coordinator keeps its admission lock through
+the immediate cache publication, but callers still handle allocation-time
+`ENOSPC` or quota failures because unrelated filesystem activity can consume
+space concurrently.
+
 `store verify --quick` checks structural data; a full verification additionally
 decompresses every record and validates ContentIds and repository-scoped native
 aliases. Cache corruption is quarantined or deleted and regenerated. Btrfs
@@ -126,4 +137,3 @@ These contracts do not provide:
   promise that cache deletion immediately returns host filesystem space.
 * Booting arbitrary imported commits without a separately verified deployment
   and trust policy.
-

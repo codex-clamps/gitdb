@@ -9,6 +9,7 @@ use std::{
     ffi::{CString, OsStr},
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
+    mem::MaybeUninit,
     os::{
         fd::AsRawFd,
         unix::{
@@ -215,6 +216,278 @@ impl std::fmt::Display for AdmissionError {
 }
 
 impl std::error::Error for AdmissionError {}
+
+impl AdmissionError {
+    /// The minimum logical cache reclamation to attempt before taking a new
+    /// measurement. A cache entry may share extents or be compressed, so this
+    /// is deliberately only an eviction target, not a claim about physical
+    /// space that will be returned.
+    pub const fn required_reclaim_bytes(self) -> u64 {
+        match self {
+            Self::HostReserve(host) => host.shortfall_bytes,
+            Self::GuestReserve(guest) => guest.shortfall_bytes,
+            Self::HostAndGuestReserve { host, guest } => {
+                if host.shortfall_bytes > guest.shortfall_bytes {
+                    host.shortfall_bytes
+                } else {
+                    guest.shortfall_bytes
+                }
+            }
+        }
+    }
+}
+
+/// A host/guest free-space measurement used for cache admission.
+///
+/// `host_available_bytes` should measure the filesystem containing the sparse
+/// image or other cold/hot backing allocation. `guest_available_bytes` should
+/// measure the mounted Btrfs clone domain. They may be the same filesystem,
+/// but they are kept distinct because sparse-image allocation can exhaust
+/// either domain first.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CapacitySnapshot {
+    pub host_available_bytes: u64,
+    pub guest_available_bytes: u64,
+}
+
+/// Source of host and guest capacity measurements.
+///
+/// Keeping this trait small makes admission decisions portable to test: a
+/// caller can inject a scripted source instead of relying on host free space.
+pub trait CapacityMeter {
+    fn measure(&self) -> io::Result<CapacitySnapshot>;
+}
+
+/// `statvfs`-based [`CapacityMeter`] for a host backing path and a mounted
+/// guest Btrfs path.
+#[derive(Clone, Debug)]
+pub struct FilesystemCapacityMeter {
+    host_path: PathBuf,
+    guest_path: PathBuf,
+}
+
+impl FilesystemCapacityMeter {
+    pub fn new(host_path: impl AsRef<Path>, guest_path: impl AsRef<Path>) -> Self {
+        Self {
+            host_path: host_path.as_ref().to_path_buf(),
+            guest_path: guest_path.as_ref().to_path_buf(),
+        }
+    }
+
+    pub fn host_path(&self) -> &Path {
+        &self.host_path
+    }
+
+    pub fn guest_path(&self) -> &Path {
+        &self.guest_path
+    }
+}
+
+impl CapacityMeter for FilesystemCapacityMeter {
+    fn measure(&self) -> io::Result<CapacitySnapshot> {
+        Ok(CapacitySnapshot {
+            host_available_bytes: statvfs_available_bytes(&self.host_path)?,
+            guest_available_bytes: statvfs_available_bytes(&self.guest_path)?,
+        })
+    }
+}
+
+/// The observable outcome of a cache capacity admission attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CapacityAdmission {
+    pub projected_allocation_bytes: u64,
+    /// Free space measured before the reserve policy was first applied.
+    pub before: CapacitySnapshot,
+    /// Free space measured after any eviction and immediately before
+    /// allocation. It equals `before` when no eviction was necessary.
+    pub admitted: CapacitySnapshot,
+    /// The deterministic eviction pass used to make room, if one was needed.
+    pub eviction: Option<CacheEviction>,
+}
+
+/// Details retained when eviction could not restore capacity reserves.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CapacityReserveFailure {
+    pub before: CapacitySnapshot,
+    pub after_eviction: CapacitySnapshot,
+    pub eviction: CacheEviction,
+    pub violation: AdmissionError,
+}
+
+/// Why a cache capacity admission could not be completed.
+#[derive(Debug)]
+pub enum CapacityAdmissionError {
+    Measurement(io::Error),
+    Cache(CacheError),
+    /// Deterministic cache eviction was attempted, but the remeasurement still
+    /// could not retain both configured reserves after allocation.
+    ReservesStillUnmet(Box<CapacityReserveFailure>),
+}
+
+impl std::fmt::Display for CapacityAdmissionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Measurement(error) => write!(f, "capacity measurement failed: {error}"),
+            Self::Cache(error) => write!(f, "cache eviction failed: {error}"),
+            Self::ReservesStillUnmet(failure) => {
+                write!(
+                    f,
+                    "cache admission refused after eviction: {}",
+                    failure.violation
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for CapacityAdmissionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Measurement(error) => Some(error),
+            Self::Cache(error) => Some(error),
+            Self::ReservesStillUnmet(failure) => Some(&failure.violation),
+        }
+    }
+}
+
+impl From<CacheError> for CapacityAdmissionError {
+    fn from(value: CacheError) -> Self {
+        Self::Cache(value)
+    }
+}
+
+/// Coordinates derived-cache allocations with host and guest reserve floors.
+///
+/// When the initial measurement fails the policy, the coordinator evicts cache
+/// leaves in [`Cache::evict_to`] order, remeasures both domains, and only then
+/// admits the allocation. The cache is derived data, so it is the only state
+/// this coordinator deletes. The operating system remains authoritative: use
+/// [`Self::with_admission`] to keep this coordinator's admission lock across
+/// the immediate cache publication, and still handle an allocation-time
+/// `ENOSPC` or quota error.
+pub struct CacheCapacityCoordinator<M> {
+    cache: Cache,
+    meter: M,
+    policy: ReservePolicy,
+    admission_lock: Mutex<()>,
+}
+
+impl<M> CacheCapacityCoordinator<M> {
+    pub fn new(cache: Cache, meter: M, policy: ReservePolicy) -> Self {
+        Self {
+            cache,
+            meter,
+            policy,
+            admission_lock: Mutex::new(()),
+        }
+    }
+
+    pub fn cache(&self) -> &Cache {
+        &self.cache
+    }
+
+    pub const fn policy(&self) -> ReservePolicy {
+        self.policy
+    }
+
+    pub fn meter(&self) -> &M {
+        &self.meter
+    }
+}
+
+impl<M: CapacityMeter> CacheCapacityCoordinator<M> {
+    /// Preflights a derived-cache allocation and, if needed, evicts toward the
+    /// exact largest reserve shortfall before remeasuring both domains.
+    ///
+    /// Prefer [`Self::with_admission`] when the allocation is a cache
+    /// operation: it keeps this coordinator's admission lock until that
+    /// operation returns.
+    pub fn admit(
+        &self,
+        projected_allocation_bytes: u64,
+    ) -> Result<CapacityAdmission, CapacityAdmissionError> {
+        let _guard = self
+            .admission_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.admit_locked(projected_allocation_bytes)
+    }
+
+    /// Runs a cache allocation only after it has passed reserve admission.
+    ///
+    /// `projected_allocation_bytes` must conservatively include the expected
+    /// new cache payload and any caller-known expansion. Allocation errors are
+    /// reported unchanged as [`CapacityAdmissionError::Cache`].
+    pub fn with_admission<T, F>(
+        &self,
+        projected_allocation_bytes: u64,
+        allocate: F,
+    ) -> Result<(CapacityAdmission, T), CapacityAdmissionError>
+    where
+        F: FnOnce(&Cache) -> Result<T, CacheError>,
+    {
+        let _guard = self
+            .admission_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let admission = self.admit_locked(projected_allocation_bytes)?;
+        let result = allocate(&self.cache)?;
+        Ok((admission, result))
+    }
+
+    fn admit_locked(
+        &self,
+        projected_allocation_bytes: u64,
+    ) -> Result<CapacityAdmission, CapacityAdmissionError> {
+        let before = self
+            .meter
+            .measure()
+            .map_err(CapacityAdmissionError::Measurement)?;
+        let initial = self.policy.admit(
+            before.host_available_bytes,
+            before.guest_available_bytes,
+            projected_allocation_bytes,
+        );
+        let Err(initial_violation) = initial else {
+            return Ok(CapacityAdmission {
+                projected_allocation_bytes,
+                before,
+                admitted: before,
+                eviction: None,
+            });
+        };
+
+        let usage = self.cache.usage()?;
+        let target_logical_bytes = usage
+            .logical_bytes
+            .saturating_sub(initial_violation.required_reclaim_bytes());
+        let eviction = self.cache.evict_to(target_logical_bytes)?;
+        let after_eviction = self
+            .meter
+            .measure()
+            .map_err(CapacityAdmissionError::Measurement)?;
+        match self.policy.admit(
+            after_eviction.host_available_bytes,
+            after_eviction.guest_available_bytes,
+            projected_allocation_bytes,
+        ) {
+            Ok(()) => Ok(CapacityAdmission {
+                projected_allocation_bytes,
+                before,
+                admitted: after_eviction,
+                eviction: Some(eviction),
+            }),
+            Err(violation) => Err(CapacityAdmissionError::ReservesStillUnmet(Box::new(
+                CapacityReserveFailure {
+                    before,
+                    after_eviction,
+                    eviction,
+                    violation,
+                },
+            ))),
+        }
+    }
+}
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CacheReconciliation {
@@ -935,6 +1208,31 @@ impl FanoutScan {
     }
 }
 
+fn statvfs_available_bytes(path: &Path) -> io::Result<u64> {
+    let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "capacity measurement path contains a NUL byte",
+        )
+    })?;
+    let mut stat = MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `path` is NUL-terminated and `stat` points to valid writable
+    // storage for one `statvfs` result.
+    if unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a successful `statvfs` initialized the result above.
+    let stat = unsafe { stat.assume_init() };
+    let fragment_size = if stat.f_frsize == 0 {
+        stat.f_bsize
+    } else {
+        stat.f_frsize
+    };
+    stat.f_bavail
+        .checked_mul(fragment_size)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "capacity measurement overflowed u64"))
+}
+
 /// Opens a directory without following a symlink in its final component.
 ///
 /// The caller derives descendants from `/proc/self/fd/<fd>`, keeping the
@@ -1227,11 +1525,12 @@ mod tests {
     };
     use reflink_forest_store::{ChunkWriter, RecordLocation};
     use std::{
+        collections::VecDeque,
         io::{Seek, SeekFrom},
         os::unix::fs::symlink,
         sync::{
-            atomic::{AtomicUsize, Ordering},
-            Arc, Barrier,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc, Barrier, Mutex,
         },
         thread,
         time::Duration,
@@ -1253,6 +1552,32 @@ mod tests {
     struct CountingCatalog {
         inner: InMemoryCatalog,
         location_reads: AtomicUsize,
+    }
+
+    struct ScriptedCapacityMeter {
+        measurements: Mutex<VecDeque<CapacitySnapshot>>,
+    }
+
+    impl ScriptedCapacityMeter {
+        fn new(measurements: impl IntoIterator<Item = CapacitySnapshot>) -> Self {
+            Self {
+                measurements: Mutex::new(measurements.into_iter().collect()),
+            }
+        }
+
+        fn remaining(&self) -> usize {
+            self.measurements.lock().unwrap().len()
+        }
+    }
+
+    impl CapacityMeter for ScriptedCapacityMeter {
+        fn measure(&self) -> io::Result<CapacitySnapshot> {
+            self.measurements
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "no measurement"))
+        }
     }
 
     impl CountingCatalog {
@@ -1510,6 +1835,127 @@ mod tests {
                     shortfall_bytes: 20,
                 },
             })
+        );
+    }
+
+    #[test]
+    fn capacity_coordinator_evicts_deterministically_then_remeasures_before_publish() {
+        let directory = directory();
+        let cache = Cache::open(&directory).unwrap();
+        cache
+            .publish_blob(
+                ContentId::for_object(ObjectKind::Blob, b"first 16 bytes!!"),
+                b"first 16 bytes!!",
+            )
+            .unwrap();
+        cache
+            .publish_blob(
+                ContentId::for_object(ObjectKind::Blob, b"second payload is longer"),
+                b"second payload is longer",
+            )
+            .unwrap();
+        let usage = cache.usage().unwrap();
+        assert!(usage.logical_bytes >= 20);
+
+        let meter = ScriptedCapacityMeter::new([
+            CapacitySnapshot {
+                host_available_bytes: 115,
+                guest_available_bytes: 80,
+            },
+            CapacitySnapshot {
+                host_available_bytes: 125,
+                guest_available_bytes: 105,
+            },
+        ]);
+        let coordinator = CacheCapacityCoordinator::new(cache, meter, ReservePolicy::new(100, 80));
+        let new_bytes = b"new derived cache blob";
+        let new_id = ContentId::for_object(ObjectKind::Blob, new_bytes);
+
+        let (admission, path) = coordinator
+            .with_admission(20, |cache| cache.publish_blob(new_id, new_bytes))
+            .unwrap();
+
+        assert_eq!(admission.before.host_available_bytes, 115);
+        assert_eq!(admission.admitted.guest_available_bytes, 105);
+        let eviction = admission
+            .eviction
+            .expect("initial reserve shortfall evicts");
+        assert_eq!(eviction.target_logical_bytes, usage.logical_bytes - 20);
+        assert!(eviction.evicted_entries >= 1);
+        assert!(eviction.target_reached());
+        assert_eq!(fs::read(path).unwrap(), new_bytes);
+        assert_eq!(coordinator.meter().remaining(), 0);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn capacity_coordinator_refuses_when_remeasurement_cannot_restore_reserves() {
+        let directory = directory();
+        let cache = Cache::open(&directory).unwrap();
+        cache
+            .publish_blob(
+                ContentId::for_object(ObjectKind::Blob, b"a cache leaf large enough to evict"),
+                b"a cache leaf large enough to evict",
+            )
+            .unwrap();
+        let usage = cache.usage().unwrap();
+        let meter = ScriptedCapacityMeter::new([
+            CapacitySnapshot {
+                host_available_bytes: 110,
+                guest_available_bytes: 100,
+            },
+            CapacitySnapshot {
+                host_available_bytes: 115,
+                guest_available_bytes: 99,
+            },
+        ]);
+        let coordinator = CacheCapacityCoordinator::new(cache, meter, ReservePolicy::new(100, 80));
+        let invoked = AtomicBool::new(false);
+
+        let error = coordinator
+            .with_admission(20, |_| {
+                invoked.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+            .unwrap_err();
+
+        assert!(!invoked.load(Ordering::SeqCst));
+        match error {
+            CapacityAdmissionError::ReservesStillUnmet(failure) => {
+                let CapacityReserveFailure {
+                    before,
+                    after_eviction,
+                    eviction,
+                    violation,
+                } = *failure;
+                let AdmissionError::HostAndGuestReserve { host, guest } = violation else {
+                    panic!("expected both reserves to remain unmet: {violation:?}");
+                };
+                assert_eq!(before.host_available_bytes, 110);
+                assert_eq!(
+                    after_eviction,
+                    CapacitySnapshot {
+                        host_available_bytes: 115,
+                        guest_available_bytes: 99,
+                    }
+                );
+                assert_eq!(eviction.target_logical_bytes, usage.logical_bytes - 10);
+                assert_eq!(host.shortfall_bytes, 5);
+                assert_eq!(guest.shortfall_bytes, 1);
+            }
+            other => panic!("unexpected admission result: {other:?}"),
+        }
+        assert_eq!(coordinator.meter().remaining(), 0);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn filesystem_capacity_meter_measures_the_supplied_paths() {
+        let meter = FilesystemCapacityMeter::new(".", ".");
+        let measured = meter.measure().unwrap();
+        assert_eq!(
+            measured.host_available_bytes,
+            measured.guest_available_bytes
         );
     }
 
