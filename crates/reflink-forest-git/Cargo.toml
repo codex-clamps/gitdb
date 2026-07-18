@@ -1,0 +1,10 @@
+[package]
+name = "reflink-forest-git"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+license = "MIT OR Apache-2.0"
+description = "System-Git repository snapshots and object traversal for Reflink Forest"
+
+[dependencies]
+reflink-forest-core = { path = "../reflink-forest-core" }

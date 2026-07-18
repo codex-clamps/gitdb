@@ -1,0 +1,7 @@
+[package]
+name = "reflink-forest-daemon"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+license = "MIT OR Apache-2.0"
+description = "Per-user local daemon primitives for Reflink Forest"

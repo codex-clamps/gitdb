@@ -1,0 +1,10 @@
+[package]
+name = "reflink-forest-backup"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+license = "MIT OR Apache-2.0"
+description = "Verified checkpoint, backup, and restore primitives for Reflink Forest"
+
+[dependencies]
+sha2 = "0.10"

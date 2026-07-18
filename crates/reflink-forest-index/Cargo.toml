@@ -9,4 +9,8 @@ description = "Versioned catalog encodings and transactional in-memory catalog"
 [dependencies]
 reflink-forest-core = { path = "../reflink-forest-core" }
 reflink-forest-format = { path = "../reflink-forest-format" }
+rocksdb = { version = "0.23", optional = true }
 
+[features]
+default = []
+rocksdb-backend = ["dep:rocksdb"]

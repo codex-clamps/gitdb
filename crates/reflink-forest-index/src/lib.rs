@@ -65,6 +65,7 @@ pub enum CatalogError {
         existing: ContentId,
         requested: ContentId,
     },
+    Backend(String),
 }
 
 /// Versioned `object_locations` key: version then ContentId.
@@ -265,6 +266,136 @@ impl Catalog for InMemoryCatalog {
     }
 }
 
+/// RocksDB column families used by the v1 catalog adapter.
+#[cfg(feature = "rocksdb-backend")]
+pub const ROCKSDB_COLUMN_FAMILIES: [&str; 3] = ["object_locations", "oid_aliases", "chunks"];
+
+/// RocksDB-backed catalog with synchronous, atomic write batches.
+///
+/// Alias conflict detection assumes the store's single-writer daemon contract.
+/// A multi-process writer implementation needs transaction/CAS semantics.
+#[cfg(feature = "rocksdb-backend")]
+pub struct RocksDbCatalog {
+    db: rocksdb::DB,
+}
+
+#[cfg(feature = "rocksdb-backend")]
+impl RocksDbCatalog {
+    pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, rocksdb::Error> {
+        let mut options = rocksdb::Options::default();
+        options.create_if_missing(true);
+        options.create_missing_column_families(true);
+        let descriptors: Vec<_> = ROCKSDB_COLUMN_FAMILIES
+            .into_iter()
+            .map(|name| rocksdb::ColumnFamilyDescriptor::new(name, rocksdb::Options::default()))
+            .collect();
+        Ok(Self {
+            db: rocksdb::DB::open_cf_descriptors(&options, path, descriptors)?,
+        })
+    }
+
+    fn cf(&self, name: &str) -> Result<&rocksdb::ColumnFamily, CatalogError> {
+        self.db
+            .cf_handle(name)
+            .ok_or_else(|| CatalogError::Backend(format!("missing RocksDB column family {name}")))
+    }
+}
+
+#[cfg(feature = "rocksdb-backend")]
+impl Catalog for RocksDbCatalog {
+    fn apply(&mut self, batch: CatalogBatch) -> Result<(), CatalogError> {
+        let object_cf = self.cf("object_locations")?;
+        let alias_cf = self.cf("oid_aliases")?;
+        let chunk_cf = self.cf("chunks")?;
+        let mut pending_aliases = HashMap::new();
+
+        // Validate all conflicts before the atomic write. A rejected batch has
+        // no preceding writes committed.
+        for operation in &batch.operations {
+            if let Operation::PutAlias(repo, oid, requested) = operation {
+                let key = encode_oid_alias_key(*repo, oid);
+                let existing = match pending_aliases.get(&(*repo, *oid)) {
+                    Some(id) => Some(*id),
+                    None => self
+                        .db
+                        .get_cf(alias_cf, key)
+                        .map_err(|error| CatalogError::Backend(error.to_string()))?
+                        .map(|value| decode_content_id_value(&value))
+                        .transpose()?,
+                };
+                if let Some(existing) = existing {
+                    if existing != *requested {
+                        return Err(CatalogError::AliasConflict {
+                            repo: *repo,
+                            oid: *oid,
+                            existing,
+                            requested: *requested,
+                        });
+                    }
+                }
+                pending_aliases.insert((*repo, *oid), *requested);
+            }
+        }
+
+        let mut writes = rocksdb::WriteBatch::default();
+        for operation in batch.operations {
+            match operation {
+                Operation::PutObject(id, location) => writes.put_cf(
+                    object_cf,
+                    encode_object_location_key(id),
+                    encode_object_location_value(location),
+                ),
+                Operation::PutAlias(repo, oid, id) => writes.put_cf(
+                    alias_cf,
+                    encode_oid_alias_key(repo, &oid),
+                    encode_content_id_value(id),
+                ),
+                Operation::PutChunk(generation, chunk_id, metadata) => writes.put_cf(
+                    chunk_cf,
+                    encode_chunk_key(generation, chunk_id),
+                    encode_chunk_value(metadata),
+                ),
+            }
+        }
+        let mut options = rocksdb::WriteOptions::default();
+        options.set_sync(true);
+        self.db
+            .write_opt(writes, &options)
+            .map_err(|error| CatalogError::Backend(error.to_string()))
+    }
+
+    fn object_location(&self, id: ContentId) -> Option<ObjectLocation> {
+        let value = self
+            .db
+            .get_cf(
+                self.cf("object_locations").ok()?,
+                encode_object_location_key(id),
+            )
+            .ok()??;
+        decode_object_location_value(&value).ok()
+    }
+    fn oid_alias(&self, repo: RepoId, oid: &GitOid) -> Option<ContentId> {
+        let value = self
+            .db
+            .get_cf(
+                self.cf("oid_aliases").ok()?,
+                encode_oid_alias_key(repo, oid),
+            )
+            .ok()??;
+        decode_content_id_value(&value).ok()
+    }
+    fn chunk(&self, generation: u32, chunk_id: u64) -> Option<ChunkMetadata> {
+        let value = self
+            .db
+            .get_cf(
+                self.cf("chunks").ok()?,
+                encode_chunk_key(generation, chunk_id),
+            )
+            .ok()??;
+        decode_chunk_value(&value).ok()
+    }
+}
+
 fn check_version(version: u8) -> Result<(), CatalogError> {
     if version == CATALOG_VERSION {
         Ok(())
@@ -405,5 +536,33 @@ mod tests {
                 record_count: 5
             })
         );
+    }
+
+    #[cfg(feature = "rocksdb-backend")]
+    #[test]
+    fn rocksdb_batch_survives_reopen() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let path = std::env::temp_dir().join(format!(
+            "reflink-forest-index-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let repo = RepoId([8; 16]);
+        let object_id = id(4);
+        {
+            let mut catalog = RocksDbCatalog::open(&path).unwrap();
+            let mut batch = CatalogBatch::new();
+            batch.put_object_location(object_id, location());
+            batch.put_oid_alias(repo, oid(), object_id);
+            catalog.apply(batch).unwrap();
+        }
+        let catalog = RocksDbCatalog::open(&path).unwrap();
+        assert_eq!(catalog.object_location(object_id), Some(location()));
+        assert_eq!(catalog.oid_alias(repo, &oid()), Some(object_id));
+        drop(catalog);
+        std::fs::remove_dir_all(path).unwrap();
     }
 }
