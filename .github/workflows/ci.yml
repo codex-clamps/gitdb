@@ -44,4 +44,4 @@ jobs:
       - name: Run isolated loopback Btrfs integration test
         env:
           REFLINK_FOREST_RUN_PRIVILEGED_BTRFS_TESTS: "1"
-        run: cargo test -p reflink-forest-btrfs --test privileged_loopback -- --ignored --exact
+        run: cargo test -p reflink-forest-btrfs --test privileged_loopback loopback_initialization_survives_reattach_and_refuses_overwrite -- --ignored --exact
