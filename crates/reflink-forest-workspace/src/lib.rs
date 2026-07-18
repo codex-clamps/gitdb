@@ -490,6 +490,106 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn regular_file_checkout_reflinks_when_the_test_domain_supports_ficlone() {
+        use reflink_forest_cache::CacheError;
+        use reflink_forest_checkout::MaterializeError;
+
+        // `current_dir` is inside the checked-out workspace. On the supported
+        // developer/production setup it is Btrfs; generic CI may use a
+        // different filesystem and is allowed to report unsupported FICLONE.
+        let root = std::env::current_dir().unwrap().join(format!(
+            ".reflink-forest-ficlone-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let chunk = root.join("1.open");
+        let cache = Cache::open(root.join("cache")).unwrap();
+        let repo = RepoId([7; 16]);
+        let commit_oid = oid(7);
+        let tree_oid = oid(8);
+        let blob_oid = oid(9);
+        let payload = b"shared extent bytes\n".to_vec();
+        let mut writer = ChunkWriter::create(
+            &chunk,
+            ChunkHeader {
+                generation: 1,
+                chunk_id: 1,
+                created_unix_secs: 0,
+                flags: 0,
+            },
+        )
+        .unwrap();
+        let mut tree = b"100644 data\0".to_vec();
+        tree.extend_from_slice(blob_oid.as_bytes());
+        let commit = format!("tree {}\n\nmessage\n", oid_hex(&tree_oid)).into_bytes();
+        let mut catalog = InMemoryCatalog::default();
+        append(
+            &mut writer,
+            &mut catalog,
+            repo,
+            blob_oid,
+            ObjectKind::Blob,
+            payload.clone(),
+        );
+        append(
+            &mut writer,
+            &mut catalog,
+            repo,
+            tree_oid,
+            ObjectKind::Tree,
+            tree,
+        );
+        append(
+            &mut writer,
+            &mut catalog,
+            repo,
+            commit_oid,
+            ObjectKind::Commit,
+            commit,
+        );
+        writer.sync_data().unwrap();
+        drop(writer);
+
+        let source = ColdWorkspaceSource::new(repo, &catalog, &cache, |_, _| chunk.clone());
+        let staging = root.join("staging/workspace");
+        let workspaces = root.join("workspaces");
+        let trash = root.join("trash");
+        fs::create_dir_all(&staging).unwrap();
+        fs::create_dir_all(&workspaces).unwrap();
+        let name = WorkspaceName::new("regular").unwrap();
+        let result = source.checkout_commit(WorkspaceCheckoutRequest {
+            commit: commit_oid,
+            limits: reflink_forest_checkout::DEFAULT_CHECKOUT_LIMITS,
+            staging: &staging,
+            workspaces: &workspaces,
+            trash: &trash,
+            name: &name,
+            gitlink_policy: GitlinkPolicy::Reject,
+            replace: ReplacePolicy::Reject,
+        });
+        match result {
+            Ok(workspace) => {
+                let destination = workspace.join("data");
+                assert_eq!(fs::read(&destination).unwrap(), payload);
+                fs::write(&destination, b"workspace mutation\n").unwrap();
+                let id = ContentId::for_object(ObjectKind::Blob, &payload);
+                assert_eq!(fs::read(cache.verified_path(id).unwrap()).unwrap(), payload);
+            }
+            Err(WorkspaceCheckoutError::Materialize(error))
+                if matches!(
+                    *error,
+                    MaterializeError::Cache(CacheError::Io(ref io_error))
+                        if matches!(io_error.raw_os_error(), Some(18) | Some(95))
+                ) => {}
+            Err(error) => panic!("regular-file checkout failed unexpectedly: {error}"),
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
     fn oid_hex(oid: &GitOid) -> String {
         let mut output = String::new();
         for byte in oid.as_bytes() {

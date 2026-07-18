@@ -326,6 +326,9 @@ dependencies = [
 [[package]]
 name = "reflink-forest-daemon"
 version = "0.1.0"
+dependencies = [
+ "reflink-forest-format",
+]
 
 [[package]]
 name = "reflink-forest-format"
