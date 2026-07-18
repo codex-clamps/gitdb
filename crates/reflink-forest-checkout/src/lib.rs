@@ -8,11 +8,27 @@
 use std::fmt;
 use std::{
     collections::{BTreeMap, BTreeSet},
-    ffi::OsString,
-    fs, io,
-    os::unix::{ffi::OsStringExt, fs::PermissionsExt},
+    ffi::{CString, OsString},
+    fs::{self, File},
+    io,
+    os::unix::{
+        ffi::{OsStrExt, OsStringExt},
+        fs::PermissionsExt,
+    },
     path::{Path, PathBuf},
 };
+
+const AT_FDCWD: std::ffi::c_int = -100;
+const RENAME_EXCHANGE: u32 = 2;
+unsafe extern "C" {
+    fn renameat2(
+        olddirfd: std::ffi::c_int,
+        oldpath: *const std::ffi::c_char,
+        newdirfd: std::ffi::c_int,
+        newpath: *const std::ffi::c_char,
+        flags: u32,
+    ) -> std::ffi::c_int;
+}
 
 use reflink_forest_cache::{Cache, CacheError};
 use reflink_forest_core::{ContentId, GitOid};
@@ -476,6 +492,128 @@ fn checkout_path(root: &Path, relative: &RelativePath) -> PathBuf {
     path
 }
 
+/// A workspace directory name. It is intentionally narrower than an arbitrary
+/// path so that publication never incorporates an unchecked user path.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct WorkspaceName(String);
+
+impl WorkspaceName {
+    pub fn new(name: impl Into<String>) -> Result<Self, WorkspacePublishError> {
+        let name = name.into();
+        if name.is_empty()
+            || name.len() > 128
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(WorkspacePublishError::InvalidName);
+        }
+        Ok(Self(name))
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReplacePolicy {
+    Reject,
+    ReplaceAtomically,
+}
+
+#[derive(Debug)]
+pub enum WorkspacePublishError {
+    Io(io::Error),
+    InvalidName,
+    InvalidStaging,
+    DestinationExists,
+    UnsupportedAtomicReplace,
+}
+impl fmt::Display for WorkspacePublishError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(error) => write!(f, "workspace publication I/O error: {error}"),
+            Self::InvalidName => write!(
+                f,
+                "workspace name must be 1–128 ASCII letters, digits, hyphens, or underscores"
+            ),
+            Self::InvalidStaging => write!(f, "staging workspace must be an existing directory"),
+            Self::DestinationExists => write!(f, "workspace name is already published"),
+            Self::UnsupportedAtomicReplace => write!(
+                f,
+                "kernel/filesystem does not support atomic workspace replacement"
+            ),
+        }
+    }
+}
+impl std::error::Error for WorkspacePublishError {}
+impl From<io::Error> for WorkspacePublishError {
+    fn from(value: io::Error) -> Self {
+        Self::Io(value)
+    }
+}
+
+/// Atomically makes a complete private staging directory visible as a
+/// workspace. `ReplaceAtomically` exchanges directories first, avoiding a
+/// window in which the workspace name is absent, then moves the retired tree
+/// into `trash` for asynchronous cleanup.
+pub fn publish_workspace(
+    staging: impl AsRef<Path>,
+    workspaces: impl AsRef<Path>,
+    trash: impl AsRef<Path>,
+    name: &WorkspaceName,
+    replace: ReplacePolicy,
+) -> Result<PathBuf, WorkspacePublishError> {
+    let staging = staging.as_ref();
+    let workspaces = workspaces.as_ref();
+    let trash = trash.as_ref();
+    if !staging.is_dir() || !workspaces.is_dir() {
+        return Err(WorkspacePublishError::InvalidStaging);
+    }
+    let destination = workspaces.join(name.as_str());
+    if !destination.exists() {
+        fs::rename(staging, &destination)?;
+        File::open(workspaces)?.sync_all()?;
+        return Ok(destination);
+    }
+    if replace == ReplacePolicy::Reject {
+        return Err(WorkspacePublishError::DestinationExists);
+    }
+    fs::create_dir_all(trash)?;
+    let staging_c = c_path(staging)?;
+    let destination_c = c_path(&destination)?;
+    // SAFETY: both C strings remain alive for the syscall and refer to paths
+    // beneath caller-controlled service roots.
+    if unsafe {
+        renameat2(
+            AT_FDCWD,
+            staging_c.as_ptr(),
+            AT_FDCWD,
+            destination_c.as_ptr(),
+            RENAME_EXCHANGE,
+        )
+    } != 0
+    {
+        let error = io::Error::last_os_error();
+        if matches!(error.raw_os_error(), Some(38) | Some(95)) {
+            return Err(WorkspacePublishError::UnsupportedAtomicReplace);
+        }
+        return Err(error.into());
+    }
+    let retired = trash.join(format!("{}-retired", name.as_str()));
+    if retired.exists() {
+        return Err(WorkspacePublishError::DestinationExists);
+    }
+    fs::rename(staging, retired)?;
+    File::open(workspaces)?.sync_all()?;
+    File::open(trash)?.sync_all()?;
+    Ok(destination)
+}
+
+fn c_path(path: &Path) -> Result<CString, WorkspacePublishError> {
+    CString::new(path.as_os_str().as_bytes()).map_err(|_| WorkspacePublishError::InvalidStaging)
+}
+
 impl CheckoutPlan {
     pub fn directories(&self) -> &[RelativePath] {
         &self.directories
@@ -744,5 +882,31 @@ mod tests {
                 limit: 5
             })
         ));
+    }
+
+    #[test]
+    fn publication_is_invisible_until_the_staging_tree_is_renamed() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let root = std::env::temp_dir().join(format!(
+            "reflink-forest-publication-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let staging = root.join("staging/workspace");
+        let workspaces = root.join("workspaces");
+        let trash = root.join("trash");
+        fs::create_dir_all(&staging).unwrap();
+        fs::create_dir_all(&workspaces).unwrap();
+        fs::write(staging.join("ready"), b"complete").unwrap();
+        let name = WorkspaceName::new("demo_workspace").unwrap();
+        assert!(!workspaces.join(name.as_str()).exists());
+        let published =
+            publish_workspace(&staging, &workspaces, &trash, &name, ReplacePolicy::Reject).unwrap();
+        assert_eq!(fs::read(published.join("ready")).unwrap(), b"complete");
+        assert!(!staging.exists());
+        fs::remove_dir_all(root).unwrap();
     }
 }

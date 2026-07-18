@@ -28,6 +28,7 @@ pub enum StoreError {
     Format(FormatError),
     NotAnOpenChunk,
     OffsetOverflow,
+    LocationMismatch(&'static str),
     Catalog(CatalogError),
 }
 
@@ -38,6 +39,12 @@ impl std::fmt::Display for StoreError {
             Self::Format(error) => write!(f, "cold-store format error: {error}"),
             Self::NotAnOpenChunk => write!(f, "chunk path must use the .open suffix"),
             Self::OffsetOverflow => write!(f, "chunk offset does not fit in u64"),
+            Self::LocationMismatch(field) => {
+                write!(
+                    f,
+                    "catalog location does not match chunk record field {field}"
+                )
+            }
             Self::Catalog(error) => write!(f, "cold-store catalog error: {error:?}"),
         }
     }
@@ -273,6 +280,81 @@ pub fn verify_chunk(path: impl AsRef<Path>) -> Result<u64, StoreError> {
         count = count.checked_add(1).ok_or(StoreError::OffsetOverflow)?;
     }
     Ok(count)
+}
+
+/// Reads exactly one catalog-addressed record from a cold chunk.
+///
+/// The chunk header, byte range, complete record encoding, and every record
+/// property duplicated in [`ObjectLocation`] are validated before the record
+/// is returned.  This deliberately does not trust a path, offset, or length
+/// merely because it came from the catalog.  Callers still need to verify the
+/// returned record's `ContentId` against the key used to find `location`.
+pub fn read_record_at(
+    path: impl AsRef<Path>,
+    location: ObjectLocation,
+) -> Result<ObjectRecord, StoreError> {
+    let mut file = OpenOptions::new().read(true).open(path)?;
+    let file_length = file.metadata()?.len();
+    if location.offset < CHUNK_HEADER_LEN as u64 {
+        return Err(StoreError::LocationMismatch("offset"));
+    }
+    let record_end = location
+        .offset
+        .checked_add(location.record_length)
+        .ok_or(StoreError::OffsetOverflow)?;
+    if record_end > file_length {
+        return Err(StoreError::LocationMismatch("record_length"));
+    }
+
+    let mut chunk_header = [0_u8; CHUNK_HEADER_LEN];
+    file.seek(SeekFrom::Start(0))?;
+    file.read_exact(&mut chunk_header)?;
+    let chunk_header = ChunkHeader::decode(&chunk_header)?;
+    if chunk_header.generation != location.generation {
+        return Err(StoreError::LocationMismatch("generation"));
+    }
+    if chunk_header.chunk_id != location.chunk_id {
+        return Err(StoreError::LocationMismatch("chunk_id"));
+    }
+
+    let mut record_header = [0_u8; RECORD_HEADER_LEN];
+    file.seek(SeekFrom::Start(location.offset))?;
+    file.read_exact(&mut record_header)?;
+    let encoded_length = encoded_record_len_from_header(&record_header)?;
+    let catalog_length = usize::try_from(location.record_length)
+        .map_err(|_| StoreError::LocationMismatch("record_length"))?;
+    if encoded_length != catalog_length {
+        return Err(StoreError::LocationMismatch("record_length"));
+    }
+
+    let mut encoded = vec![0_u8; encoded_length];
+    file.seek(SeekFrom::Start(location.offset))?;
+    file.read_exact(&mut encoded)?;
+    let (record, consumed) = decode_record(&encoded)?;
+    if consumed != encoded_length {
+        return Err(StoreError::LocationMismatch("record_length"));
+    }
+    if u64::try_from(record.payload.len()).map_err(|_| StoreError::OffsetOverflow)?
+        != location.stored_length
+    {
+        return Err(StoreError::LocationMismatch("stored_length"));
+    }
+    if record.raw_length != location.raw_length {
+        return Err(StoreError::LocationMismatch("raw_length"));
+    }
+    if record.kind != location.kind {
+        return Err(StoreError::LocationMismatch("kind"));
+    }
+    if record.codec != location.codec {
+        return Err(StoreError::LocationMismatch("codec"));
+    }
+    if record.flags != location.flags {
+        return Err(StoreError::LocationMismatch("flags"));
+    }
+    if crc32c(&record.payload) != location.payload_crc32c {
+        return Err(StoreError::LocationMismatch("payload_crc32c"));
+    }
+    Ok(record)
 }
 
 #[cfg(test)]

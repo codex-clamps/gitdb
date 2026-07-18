@@ -1,13 +1,16 @@
 [package]
-name = "reflink-forest-cache"
+name = "reflink-forest-workspace"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.70"
 license = "MIT OR Apache-2.0"
-description = "Atomic content-addressed hot cache for Reflink Forest"
+description = "Cold-store backed raw workspace planning and materialization"
 
 [dependencies]
+reflink-forest-cache = { path = "../reflink-forest-cache" }
+reflink-forest-checkout = { path = "../reflink-forest-checkout" }
 reflink-forest-core = { path = "../reflink-forest-core" }
 reflink-forest-format = { path = "../reflink-forest-format" }
+reflink-forest-git = { path = "../reflink-forest-git" }
 reflink-forest-index = { path = "../reflink-forest-index" }
 reflink-forest-store = { path = "../reflink-forest-store" }

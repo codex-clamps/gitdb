@@ -302,6 +302,9 @@ name = "reflink-forest-cache"
 version = "0.1.0"
 dependencies = [
  "reflink-forest-core",
+ "reflink-forest-format",
+ "reflink-forest-index",
+ "reflink-forest-store",
 ]
 
 [[package]]
@@ -372,6 +375,19 @@ dependencies = [
  "reflink-forest-core",
  "reflink-forest-format",
  "reflink-forest-index",
+]
+
+[[package]]
+name = "reflink-forest-workspace"
+version = "0.1.0"
+dependencies = [
+ "reflink-forest-cache",
+ "reflink-forest-checkout",
+ "reflink-forest-core",
+ "reflink-forest-format",
+ "reflink-forest-git",
+ "reflink-forest-index",
+ "reflink-forest-store",
 ]
 
 [[package]]

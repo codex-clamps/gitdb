@@ -16,12 +16,22 @@ use std::{
 pub enum MaintenanceError {
     Io(io::Error),
     InvalidGenerationPointer,
+    ActiveReaders(u32),
+    DestinationExists(PathBuf),
 }
 impl std::fmt::Display for MaintenanceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(error) => write!(f, "maintenance I/O error: {error}"),
             Self::InvalidGenerationPointer => write!(f, "invalid active-generation pointer"),
+            Self::ActiveReaders(generation) => {
+                write!(f, "generation {generation} still has active readers")
+            }
+            Self::DestinationExists(path) => write!(
+                f,
+                "maintenance destination already exists: {}",
+                path.display()
+            ),
         }
     }
 }
@@ -115,6 +125,30 @@ impl GenerationManager {
             Err(error) => Err(error.into()),
         }
     }
+
+    /// Moves an unleased retired generation out of the live chunk namespace.
+    /// The caller may remove the returned trash path asynchronously; existing
+    /// readers are protected because the operation refuses active leases.
+    pub fn retire_generation(
+        &self,
+        generation: u32,
+        generation_path: impl AsRef<Path>,
+        trash_root: impl AsRef<Path>,
+    ) -> Result<PathBuf, MaintenanceError> {
+        if !self.may_reclaim(generation)? {
+            return Err(MaintenanceError::ActiveReaders(generation));
+        }
+        let generation_path = generation_path.as_ref();
+        let trash_root = trash_root.as_ref();
+        fs::create_dir_all(trash_root)?;
+        let destination = trash_root.join(format!("generation-{generation}-retired"));
+        if destination.exists() {
+            return Err(MaintenanceError::DestinationExists(destination));
+        }
+        fs::rename(generation_path, &destination)?;
+        File::open(trash_root)?.sync_all()?;
+        Ok(destination)
+    }
 }
 fn nonce() -> u128 {
     SystemTime::now()
@@ -140,6 +174,25 @@ mod tests {
         assert!(!manager.may_reclaim(6).unwrap());
         drop(lease);
         assert!(manager.may_reclaim(6).unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn generations_move_to_trash_only_after_last_lease() {
+        let root = root();
+        let manager = GenerationManager::open(&root).unwrap();
+        let generation = root.join("generation-4");
+        let trash = root.join("trash");
+        fs::create_dir(&generation).unwrap();
+        let lease = manager.lease(4).unwrap();
+        assert!(matches!(
+            manager.retire_generation(4, &generation, &trash),
+            Err(MaintenanceError::ActiveReaders(4))
+        ));
+        drop(lease);
+        let retired = manager.retire_generation(4, &generation, &trash).unwrap();
+        assert!(retired.is_dir());
+        assert!(!generation.exists());
         fs::remove_dir_all(root).unwrap();
     }
 }

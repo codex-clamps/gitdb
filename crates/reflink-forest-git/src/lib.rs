@@ -87,6 +87,76 @@ pub struct GitObject {
     pub data: Vec<u8>,
 }
 
+/// One decoded entry in an immutable raw Git tree object. The `name` bytes are
+/// preserved exactly; callers must still apply checkout policy and limits.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitTreeEntry {
+    pub mode: u32,
+    pub name: Vec<u8>,
+    pub oid: GitOid,
+}
+
+/// Returns a commit's root-tree ID without walking its parents.
+pub fn commit_tree_oid(object: &GitObject) -> Result<GitOid, GitBackendError> {
+    if object.kind != ObjectKind::Commit {
+        return Err(malformed(object, "expected a commit object"));
+    }
+    let header = object_header(&object.data);
+    let mut tree = None;
+    for line in header.split(|byte| *byte == b'\n') {
+        if let Some(value) = line.strip_prefix(b"tree ") {
+            if tree.is_some() {
+                return Err(malformed(object, "commit has more than one tree header"));
+            }
+            tree = Some(parse_hex_oid(object.oid.algorithm(), value)?);
+        }
+    }
+    tree.ok_or_else(|| malformed(object, "commit has no tree header"))
+}
+
+/// Decodes every entry in a raw Git tree object with checked boundaries.
+pub fn parse_tree_entries(object: &GitObject) -> Result<Vec<GitTreeEntry>, GitBackendError> {
+    if object.kind != ObjectKind::Tree {
+        return Err(malformed(object, "expected a tree object"));
+    }
+    let oid_len = usize::from(object.oid.algorithm().oid_len());
+    let mut remaining = object.data.as_slice();
+    let mut entries = Vec::new();
+    while !remaining.is_empty() {
+        let nul = remaining
+            .iter()
+            .position(|byte| *byte == 0)
+            .ok_or_else(|| malformed(object, "tree entry is missing its NUL separator"))?;
+        let header = &remaining[..nul];
+        let separator = header
+            .iter()
+            .position(|byte| *byte == b' ')
+            .ok_or_else(|| malformed(object, "tree entry is missing mode/name separator"))?;
+        let name = &header[separator + 1..];
+        if name.is_empty() || name.contains(&b'/') {
+            return Err(malformed(object, "tree entry has an invalid name"));
+        }
+        let mode = parse_tree_mode(&header[..separator])
+            .ok_or_else(|| malformed(object, "tree entry has an invalid mode"))?;
+        let after_name = nul
+            .checked_add(1)
+            .ok_or_else(|| malformed(object, "tree entry length overflow"))?;
+        let after_oid = after_name
+            .checked_add(oid_len)
+            .ok_or_else(|| malformed(object, "tree entry length overflow"))?;
+        if remaining.len() < after_oid {
+            return Err(malformed(object, "tree entry is missing object ID bytes"));
+        }
+        entries.push(GitTreeEntry {
+            mode,
+            name: name.to_vec(),
+            oid: GitOid::new(object.oid.algorithm(), &remaining[after_name..after_oid])?,
+        });
+        remaining = &remaining[after_oid..];
+    }
+    Ok(entries)
+}
+
 /// Errors from invoking or parsing system Git.
 #[derive(Debug)]
 pub enum GitBackendError {
@@ -474,19 +544,13 @@ fn referenced_oids(object: &GitObject) -> Result<Vec<GitOid>, GitBackendError> {
 
 fn parse_commit_references(object: &GitObject) -> Result<Vec<GitOid>, GitBackendError> {
     let header = object_header(&object.data);
-    let mut tree = None;
     let mut parents = Vec::new();
     for line in header.split(|byte| *byte == b'\n') {
-        if let Some(value) = line.strip_prefix(b"tree ") {
-            if tree.is_some() {
-                return Err(malformed(object, "commit has more than one tree header"));
-            }
-            tree = Some(parse_hex_oid(object.oid.algorithm(), value)?);
-        } else if let Some(value) = line.strip_prefix(b"parent ") {
+        if let Some(value) = line.strip_prefix(b"parent ") {
             parents.push(parse_hex_oid(object.oid.algorithm(), value)?);
         }
     }
-    let tree = tree.ok_or_else(|| malformed(object, "commit has no tree header"))?;
+    let tree = commit_tree_oid(object)?;
     let mut references = Vec::with_capacity(1 + parents.len());
     references.push(tree);
     references.extend(parents);
@@ -510,37 +574,24 @@ fn parse_tag_references(object: &GitObject) -> Result<Vec<GitOid>, GitBackendErr
 }
 
 fn parse_tree_references(object: &GitObject) -> Result<Vec<GitOid>, GitBackendError> {
-    let oid_len = usize::from(object.oid.algorithm().oid_len());
-    let mut remaining = object.data.as_slice();
-    let mut references = Vec::new();
-    while !remaining.is_empty() {
-        let nul = remaining
-            .iter()
-            .position(|byte| *byte == 0)
-            .ok_or_else(|| malformed(object, "tree entry is missing its NUL separator"))?;
-        let header = &remaining[..nul];
-        if !header.contains(&b' ') {
-            return Err(malformed(
-                object,
-                "tree entry is missing mode/name separator",
-            ));
-        }
-        let after_name = nul
-            .checked_add(1)
-            .ok_or_else(|| malformed(object, "tree entry length overflow"))?;
-        let after_oid = after_name
-            .checked_add(oid_len)
-            .ok_or_else(|| malformed(object, "tree entry length overflow"))?;
-        if remaining.len() < after_oid {
-            return Err(malformed(object, "tree entry is missing object ID bytes"));
-        }
-        references.push(GitOid::new(
-            object.oid.algorithm(),
-            &remaining[after_name..after_oid],
-        )?);
-        remaining = &remaining[after_oid..];
+    Ok(parse_tree_entries(object)?
+        .into_iter()
+        .map(|entry| entry.oid)
+        .collect())
+}
+
+fn parse_tree_mode(bytes: &[u8]) -> Option<u32> {
+    if bytes.is_empty() || bytes.len() > 6 {
+        return None;
     }
-    Ok(references)
+    let mut mode = 0_u32;
+    for &byte in bytes {
+        if !(b'0'..=b'7').contains(&byte) {
+            return None;
+        }
+        mode = mode.checked_mul(8)?.checked_add(u32::from(byte - b'0'))?;
+    }
+    matches!(mode, 0o040000 | 0o100644 | 0o100755 | 0o120000 | 0o160000).then_some(mode)
 }
 
 fn object_header(data: &[u8]) -> &[u8] {
@@ -746,5 +797,21 @@ mod tests {
             parse_hex_oid(HashAlgorithm::Sha1, &invalid),
             Err(GitBackendError::InvalidHexOid)
         ));
+    }
+
+    #[test]
+    fn tree_entries_decode_modes_names_and_native_oid_width() {
+        let mut data = b"100755 script\0".to_vec();
+        data.extend([0x5a; 20]);
+        let tree = GitObject {
+            oid: GitOid::new(HashAlgorithm::Sha1, &[0x11; 20]).unwrap(),
+            kind: ObjectKind::Tree,
+            data,
+        };
+        let entries = parse_tree_entries(&tree).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].mode, 0o100755);
+        assert_eq!(entries[0].name, b"script");
+        assert_eq!(entries[0].oid.as_bytes(), &[0x5a; 20]);
     }
 }
